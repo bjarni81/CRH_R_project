@@ -1,0 +1,351 @@
+---
+title: "PC Access Metrics Pre-Post First PC CRH Month"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#===================
+# PC CRH Encounters
+pc_crh_encounters <- dbGetQuery(oabi_con,
+                             "select * from [PACT_CC].[CRH].[crh_full_utilization_final_fy20_21]") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  left_join(., vast, by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  rename(sta5a = spoke_sta5a_combined_cdw) %>%
+  filter(fy %in% c(2020, 2021) 
+         & care_type == "Primary Care")
+#====================================================================================
+pc_crh_sta5a_month <- pc_crh_encounters %>%
+  group_by(sta5a, crh_month) %>%
+  summarise(pc_crh_encounters = n())
+#==
+#vector of pc crh sta5as
+pc_crh_sta5a <- pc_crh_sta5a_month %>%
+  select(sta5a) %>% distinct %>% pull
+#------------------
+# first PC CRH encounter-month
+first_pc_crh_month <- pc_crh_sta5a_month %>%
+  group_by(sta5a) %>%
+  summarise(first_pc_crh_month = first(crh_month))
+#-----
+# first month with > 5 PC CRH encounters
+first_gt5_pc_crh_month <- pc_crh_sta5a_month %>%
+  filter(pc_crh_encounters > 5) %>%
+  group_by(sta5a) %>%
+  summarise(first_gt5_pc_crh_month = first(crh_month))
+#-----
+# first month with > 25 PC CRH encounters
+first_gt25_pc_crh_month <- pc_crh_sta5a_month %>%
+  filter(pc_crh_encounters > 25) %>%
+  group_by(sta5a) %>%
+  summarise(first_gt25_pc_crh_month = first(crh_month))
+#----
+first_dates <- as_tibble(pc_crh_sta5a) %>%
+  rename(sta5a = value) %>%
+  left_join(., first_pc_crh_month) %>%
+  left_join(., first_gt5_pc_crh_month) %>%
+  left_join(., first_gt25_pc_crh_month)
+# ======--------
+sta5a_month_summary <- pc_crh_sta5a_month %>%
+  mutate(month_w_lt6 = if_else(pc_crh_encounters < 6, 1, 0),
+         month_w_gt5 = if_else(pc_crh_encounters > 5, 1, 0),
+         month_w_lt20 = if_else(pc_crh_encounters < 20, 1, 0),
+         month_w_gt19 = if_else(pc_crh_encounters > 19, 1, 0),
+         month_w_lt50 = if_else(pc_crh_encounters < 50, 1, 0),
+         month_w_gt49 = if_else(pc_crh_encounters > 49, 1, 0)) %>%
+  group_by(sta5a) %>%
+  summarise(lt6 = sum(month_w_lt6),
+            gt5 = sum(month_w_gt5),
+            both_lt6_and_gt5 = if_else(lt6 > 0 & gt5 > 0, 1, 0),
+            only_lt6 = if_else(lt6 > 0 & gt5 == 0, 1, 0),
+            only_gt5 = if_else(lt6 == 0 & gt5 > 0, 1, 0),
+            has_both = sum(both_lt6_and_gt5),
+            only_lt6 = sum(only_lt6),
+            only_gt5 = sum(only_gt5),
+            #
+            lt20 = sum(month_w_lt20),
+            gt19 = sum(month_w_gt19),
+            both_lt20_and_gt19 = if_else(lt20 > 0 & gt19 > 0, 1, 0),
+            only_lt20 = if_else(lt20 > 0 & gt19 == 0, 1, 0),
+            only_gt19 = if_else(lt20 == 0 & gt19 > 0, 1, 0),
+            has_both_19_20 = sum(both_lt20_and_gt19),
+            only_lt20 = sum(only_lt20),
+            only_gt19 = sum(only_gt19),
+            #
+            lt50 = sum(month_w_lt50),
+            gt49 = sum(month_w_gt49),
+            both_lt50_and_gt49 = if_else(lt50 > 0 & gt49 > 0, 1, 0),
+            only_lt50 = if_else(lt50 > 0 & gt49 == 0, 1, 0),
+            only_gt49 = if_else(lt50 == 0 & gt49 > 0, 1, 0),
+            has_both_49_50 = sum(both_lt50_and_gt49),
+            only_lt50 = sum(only_lt50),
+            only_gt49 = sum(only_gt49))
+#  
+pc_crh_sta5a_month_1 <- pc_crh_sta5a_month %>%
+  left_join(., sta5a_month_summary) %>%
+  left_join(., vast) %>%
+  left_join(., first_dates)
+#=============================
+# access metrics
+access_metrics_sta5a <- read_csv(here("Input", "Data", "pc_access_metrics.csv")) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop) %>%
+  filter(sta5a %in% pc_crh_sta5a)
+```
+
+```{r}
+only_gt5_sta5a <- pc_crh_sta5a_month_1 %>%
+  filter(only_gt5 == T) %>%
+  select(sta5a, first_pc_crh_month) %>%
+  distinct
+#
+only_gt5_df <- access_metrics_sta5a %>%
+  left_join(., only_gt5_sta5a) %>%
+  filter(vssc_month <= c(first_pc_crh_month %m+% months(6)) & vssc_month >= c(first_pc_crh_month %m-% months(6))) %>%
+  group_by(sta5a) %>%
+  mutate(rowNum = row_number())
+#--
+only_gt19_sta5a <- pc_crh_sta5a_month_1 %>%
+  filter(only_gt19 == T) %>%
+  select(sta5a, first_pc_crh_month) %>%
+  distinct
+#
+only_gt19_df <- access_metrics_sta5a %>%
+  left_join(., only_gt19_sta5a) %>%
+  filter(vssc_month <= c(first_pc_crh_month %m+% months(6)) & vssc_month >= c(first_pc_crh_month %m-% months(6))) %>%
+  group_by(sta5a) %>%
+  mutate(rowNum = row_number())
+```
+
+# Sta5as Having Only Months With > 5 PC CRH Encounters per Month  
+
+* There are `r nrow(only_gt5_sta5a)` unique sta5as having only months with > 5 PC CRH Encounters per month
+* The vertical line is plotted on the first month with any PC CRH encounters (in this case > 5)
+* I plotted 6 months on either side of this month, for a total of 13 months plotted
+
+## Established Patient Wait Time  
+
+```{r}
+ggplot(data = only_gt5_df,
+       aes(x = rowNum, y = established_pt_waitTime, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Established Patient Wait Time (days)")
+```
+
+
+## New Patient Wait Time  
+
+```{r}
+ggplot(data = only_gt5_df,
+       aes(x = rowNum, y = new_pt_waitTime, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "New Patient Wait Time (days)")
+```
+
+## Observed to Expected Panel Size Ratio    
+
+```{r}
+ggplot(data = only_gt5_df,
+       aes(x = rowNum, y = obs_expected_panel_size_ratio, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Observed to Expected Panel Size Ratio")
+```
+
+## Core Teamlet PC Staff Ratio    
+
+```{r}
+ggplot(data = only_gt5_df,
+       aes(x = rowNum, y = pc_staff_ratio, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Core Teamlet PC Staff Ratio")
+```
+
+
+## Same Day Appointments with PC Provider Ratio      
+
+```{r}
+ggplot(data = only_gt5_df,
+       aes(x = rowNum, y = same_day_appts_wPC_provider_ratio, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Same Day Appointments with PC Provider Ratio")
+```
+
+## Timely Care Success Rate          
+
+```{r}
+ggplot(data = only_gt5_df,
+       aes(x = rowNum, y = tc_pc_success_prop, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Timely Care Success Rate")
+```
+
+---
+
+
+# Sta5as Having Only Months With > 19 PC CRH Encounters per Month  
+
+* There are `r nrow(only_gt19_sta5a)` unique sta5as having only months with > 19 PC CRH Encounters per month
+* The vertical line is plotted on the first month with any PC CRH encounters (in this case > 19)
+* I plotted 6 months on either side of this month, for a total of 13 months plotted
+
+## Established Patient Wait Time  
+
+```{r}
+ggplot(data = only_gt19_df,
+       aes(x = rowNum, y = established_pt_waitTime, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Established Patient Wait Time (days)")
+```
+
+
+## New Patient Wait Time  
+
+```{r}
+ggplot(data = only_gt19_df,
+       aes(x = rowNum, y = new_pt_waitTime, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "New Patient Wait Time (days)")
+```
+
+## Observed to Expected Panel Size Ratio    
+
+```{r}
+ggplot(data = only_gt19_df,
+       aes(x = rowNum, y = obs_expected_panel_size_ratio, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Observed to Expected Panel Size Ratio")
+```
+
+## Core Teamlet PC Staff Ratio    
+
+```{r}
+ggplot(data = only_gt19_df,
+       aes(x = rowNum, y = pc_staff_ratio, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Core Teamlet PC Staff Ratio")
+```
+
+
+## Same Day Appointments with PC Provider Ratio      
+
+```{r}
+ggplot(data = only_gt19_df,
+       aes(x = rowNum, y = same_day_appts_wPC_provider_ratio, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Same Day Appointments with PC Provider Ratio")
+```
+
+## Timely Care Success Rate          
+
+```{r}
+ggplot(data = only_gt19_df,
+       aes(x = rowNum, y = tc_pc_success_prop, group = sta5a, color = sta5a)) +
+ geom_line(size = 1) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  geom_vline(xintercept = 7,
+             lty = 2) +
+  labs(x = "Month",
+       y = "Timely Care Success Rate")
+```

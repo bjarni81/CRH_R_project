@@ -1,0 +1,355 @@
+---
+title: "CITS - Matched, No covariates"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: false
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data","ps_matched_sta5as_v3_1.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- access_metrics %>%
+  filter(vssc_month < ymd("2020-03-01") & vssc_month > ymd("2018-09-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#
+sta5as_to_include <- ps_matched %>% 
+  filter(sta5a %in% crh_sta5as) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a, at_least_10_pc_crh_flag) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH"),
+                           ordered = TRUE,
+                           levels = c("PC CRH", "No PC CRH")))
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      inner_join(., dates) %>%#add time column
+      left_join(., vast %>% select(sta5a, s_abbr)) %>%
+      left_join(., crh_flag %>% select(sta5a, first_mo_w_mt9_pc_crh)) %>%
+  group_by(sta5a) %>%
+  mutate(treat = factor(case_when(
+    sta5a %in% crh_sta5as ~ "PC CRH",
+    TRUE ~ "No PC CRH")),
+         post = factor(if_else(vssc_month > ymd("2019-09-01"), 
+                               "Post Intervention (i.e., FY20)",
+                               "Pre-Intervention (i.e., FY19)")),
+    tx_fe = if_else(treat == "PC CRH", 1, 0),
+    post_fe = if_else(post == "Post Intervention (i.e., FY20)", 1, 0)) %>%
+  ungroup
+#
+analytic_df$post <- relevel(analytic_df$post, ref = "Pre-Intervention (i.e., FY19)")
+analytic_df$treat <- relevel(analytic_df$treat, ref = 'No PC CRH')
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This report describes a Comparative Interrupted Time-Series (CITS) analysis of outcomes over time
+    + This analyses is the first in a series, and does not include any covariates 
+
+## Decision Points  
+
+* This is the first report generated after meeting on November 9th and getting the green light to move forward with our PS matching scheme (version 3.1)
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, crh_flag) %>% distinct() %>% summarise(tot = sum(crh_flag == "PC CRH"))` of these met our criteria for PC CRH before March, 2020
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+    + Each row is a sta5a-month
+    
+* Description of _Propensity Score_ matching
+    + This analysis uses Propensity Score Matching model version 3.1
+    + PS model 3.1 consisted of 
+        + Covariates matched on their average values in FY18 Q4
+        + Outcomes matched on their average values over FY19
+
+* Description of analyses  
+    + This analysis is a Comparative Interrupted Time Series without covariates
+    + We will use a mixed-effects model
+    + On the LHS of the model we have our 3 outcomes (New & Established Patient Wait Time, TNA)
+    + On the RHS of the model we have:
+        + Time (1-17)
+        + Treatment (PC CRH, No PC CRH)
+        + Post Intervention (1/0)
+        + Different models will have different interactions between these
+
+
+
+# CITS Analysis  
+
+* The inspiration for this analysis is the 2018 paper [Short Comparative Interrupted Time Series Using Aggregate School-Level Data in Education Research](https://files.eric.ed.gov/fulltext/EJ1185011.pdf) by Hallberg et al.
+* We are not including any adjustment covariates, only the outcome and: 
+    + Time (1-17) 
+    + Treatment (PC CRH, No PC CRH)
+    + Post Intervention (1 if FY20, 0 if FY19)
+    + Different models will have different interactions between these
+* The paper outlined 3 models (baseline mean, baseline linear-trend, baseline nonlinear-trend, and school and year fixed effects), of which I am including the first 2:
+* __Baseline Mean__: $y_{jt}=\beta_{0}+\beta_{1}post_{t} + \beta_{2}trt_{j}+\beta_{3}post_{t}trt_{j} + v_{j}+u_{jt}$
+    + $\beta_{1}$ is the difference in average outcomes between the preintervention time period and each postintervention period __t__ 
+    + $\beta_{2}$ is the average difference in outcome between treatment and comparison sta5as in the preintervention period
+    + $\beta_{3}$ is the change in the average outcome between treatment sta5as and comparison sta5as at each time __t__ after the intervention was implemented
+* __Baseline Linear-Trend__: $y_{jt}=\beta_{0}+\beta_{1}time_{t} + \beta_{2}post_{t}+\beta_{3}trt_{j}+\beta_{4}time_{t}trt_{j}+\beta_{5}post_{t}trt_{j} + v_{j}+u_{jt}$
+    + $\beta_{1}$ is the preintervention slope in the control group, while $\beta_{1} +\beta_{4}$ is the preintervention slope in the treatment group
+    + $\beta_{2}$ is the difference in average outcomes between the preintervention time period and each postintervention period __t__ 
+    + $\beta_{3}$ is the average difference in outcome between treatment and comparison sta5as in the preintervention period
+    + $\beta_{4}$, with $\beta_{1}$, is the preintervention slope in the treatment group
+    + $\beta_{5}$ is the difference in the actual posttreatment outcome from the projected posttreatment outcome in the treatment sta5as, less this same difference in the comparison sta5as, which serves as the estimated treatment effect
+    
+* Below is a sample of the analytic dataset, with the addition of sta5a and a date column for reference
+
+```{r}
+analytic_df %>%
+  select(sta5a, time, vssc_month, new_pc_pt_wt, treat, post) %>%
+  slice_sample(., prop = .005) %>%
+  mutate(new_pc_pt_wt = round(new_pc_pt_wt, 2)) %>%
+  kbl(col.names = c("sta5a", "time", "Month", "New Patient Wait Time", "trt", "post")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## New Patient Wait Time  
+### Plot of Outcome (plot ignores values > 60)  
+
+```{r}
+ggplot(data = subset(analytic_df, new_pc_pt_wt < 60),
+       aes(x = vssc_month, y = new_pc_pt_wt, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(data = subset(analytic_df, vssc_month < ymd("2019-10-01")),
+              aes(x = vssc_month, y = new_pc_pt_wt, group = crh_flag, color = crh_flag),
+              inherit.aes = F,
+              method = lm, se = F) +
+  geom_smooth(data = subset(analytic_df, vssc_month > ymd("2019-09-01")),
+              aes(x = vssc_month, y = new_pc_pt_wt, group = crh_flag, color = crh_flag),
+              inherit.aes = F,
+              method = lm, se = F) +
+  ggsci::scale_color_aaas() +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time (days)")
+```
+
+### Baseline mean model  
+$$y_{jt}=\beta_{0}+\beta_{1}post_{t} + \beta_{2}trt_{j}+\beta_{3}post_{t}trt_{j} + v_{j}+u_{jt}$$
+
+```{r}
+bline_mean_1 <- lmer(new_pc_pt_wt ~ treat * post + (1|sta5a),
+                     data = analytic_df)
+#
+summary(bline_mean_1)
+#
+gtsummary::tbl_regression(bline_mean_1)
+```
+
+### Baseline trend model   
+$$y_{jt}=\beta_{0}+\beta_{1}time_{t} + \beta_{2}post_{t}+\beta_{3}trt_{j}+\beta_{4}time_{t}trt_{j}+\beta_{5}post_{t}trt_{j} + v_{j}+u_{jt}$$
+
+```{r}
+bline_trend_1 <- lmer(new_pc_pt_wt ~ treat * post + treat * time + (1|sta5a),
+                     data = analytic_df)
+#
+summary(bline_trend_1)
+#
+gtsummary::tbl_regression(bline_trend_1)
+```
+
+
+## Established Patient Wait Time  
+### Plot of Outcome   
+
+```{r}
+ggplot(data = analytic_df,
+       aes(x = vssc_month, y = est_pc_pt_wt, group = sta5a)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(data = subset(analytic_df, vssc_month < ymd("2019-10-01")),
+              aes(x = vssc_month, y = est_pc_pt_wt, group = crh_flag, color = crh_flag),
+              inherit.aes = F,
+              method = lm, se = F) +
+  geom_smooth(data = subset(analytic_df, vssc_month > ymd("2019-09-01")),
+              aes(x = vssc_month, y = est_pc_pt_wt, group = crh_flag, color = crh_flag),
+              inherit.aes = F,
+              method = lm, se = F) +
+  ggsci::scale_color_aaas() +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Established Patient Wait Time (days)")
+```
+
+### Baseline mean model  
+$$y_{jt}=\beta_{0}+\beta_{1}post_{t} + \beta_{2}trt_{j}+\beta_{3}post_{t}trt_{j} + v_{j}+u_{jt}$$
+
+```{r}
+bline_mean_2 <- lmer(est_pc_pt_wt ~ treat * post + (1|sta5a),
+                     data = analytic_df)
+#
+summary(bline_mean_2)
+#
+gtsummary::tbl_regression(bline_mean_2)
+```
+
+### Baseline trend model  
+
+$$y_{jt}=\beta_{0}+\beta_{1}time_{t} + \beta_{2}post_{t}+\beta_{3}trt_{j}+\beta_{4}time_{t}trt_{j}+\beta_{5}post_{t}trt_{j} + v_{j}+u_{jt}$$
+
+```{r}
+bline_trend_2 <- lmer(est_pc_pt_wt ~ treat * post + treat * time + (1|sta5a),
+                     data = analytic_df)
+#
+summary(bline_trend_2)
+#
+gtsummary::tbl_regression(bline_trend_2)
+```
+
+## Third Next Available    
+### Plot of Outcome   
+
+```{r}
+ggplot(data = analytic_df,
+       aes(x = vssc_month, y = third_next_avail, group = sta5a)) +
+  scale_y_continuous(limits = c(0, NA)) +
+  geom_line(alpha = 0.3) +
+  geom_smooth(data = subset(analytic_df, vssc_month < ymd("2019-10-01")),
+              aes(x = vssc_month, y = third_next_avail, group = crh_flag, color = crh_flag),
+              inherit.aes = F,
+              method = lm, se = F) +
+  geom_smooth(data = subset(analytic_df, vssc_month > ymd("2019-09-01")),
+              aes(x = vssc_month, y = third_next_avail, group = crh_flag, color = crh_flag),
+              inherit.aes = F,
+              method = lm, se = F) +
+  ggsci::scale_color_aaas() +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Third Next Available (days)")
+```
+
+### Baseline mean model  
+$$y_{jt}=\beta_{0}+\beta_{1}post_{t} + \beta_{2}trt_{j}+\beta_{3}post_{t}trt_{j} + v_{j}+u_{jt}$$
+
+```{r}
+bline_mean_3 <- lmer(third_next_avail ~ treat * post + (1|sta5a),
+                     data = analytic_df)
+#
+summary(bline_mean_3)
+#
+gtsummary::tbl_regression(bline_mean_3)
+```
+
+### Baseline trend model  
+
+$$y_{jt}=\beta_{0}+\beta_{1}time_{t} + \beta_{2}post_{t}+\beta_{3}trt_{j}+\beta_{4}time_{t}trt_{j}+\beta_{5}post_{t}trt_{j} + v_{j}+u_{jt}$$
+
+```{r}
+bline_trend_3 <- lmer(third_next_avail ~ treat * post + treat * time + (1|sta5a),
+                     data = analytic_df)
+#
+summary(bline_trend_3)
+#
+gtsummary::tbl_regression(bline_trend_3)
+```
+

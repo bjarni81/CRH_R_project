@@ -1,0 +1,123 @@
+---
+title: "PCAT Penetration Rate"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 8, fig.height = 8)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+#--
+colorize <- function(x, color) {
+  if (knitr::is_latex_output()) {
+    sprintf("\\textcolor{%s}{%s}", color, x)
+  } else if (knitr::is_html_output()) {
+    sprintf("<span style='color: %s;'>%s</span>", color,
+      x)
+  } else x
+}
+```
+
+```{r}
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+penRate_month <- dbGetQuery(oabi_con,
+                          "select * from [OABI_MyVAAccess].[crh_eval].crh_penRate_month") %>%
+  left_join(., vast) %>%
+  filter(is.na(parent_visn) == F & crh_encounter_count > 5)
+#
+crh_only <- penRate_month %>%
+  filter(pc_crh_flag == 1) %>%
+  select(sta5a, crh_month, parent_visn, 5:9, short_name) %>%
+  mutate(crh_enc_over_pc_enc_1k = crh_encounter_count / pc_encounter_count * 1000,
+         #
+         crh_scrssn_over_pcmm_scrssn_1k = crh_scrssn_count / pcmm_scrssn_count * 1000)
+```
+
+* Note that I have excluded sta5a-months with < 6 PC CRH Encounters  
+
+
+## PC CRH Encounters per 1,000 PC Encounters     
+```{r}
+ggplot(data = crh_only,
+       aes(x = crh_month, y = crh_enc_over_pc_enc_1k, group = sta5a)) +
+  geom_line(color = "red") +
+  facet_wrap(~parent_visn)
+#
+ggplot(data = crh_only,
+       aes(x = crh_enc_over_pc_enc_1k)) +
+  geom_histogram(color = "black",
+                 fill = "forestgreen",
+                 bins = 50) +
+  facet_wrap(~parent_visn)
+#
+ggplot(data = crh_only,
+       aes(y = crh_enc_over_pc_enc_1k)) +
+  geom_boxplot(color = "black",
+                 fill = "darkorchid") +
+  theme(axis.text.x = element_blank()) +
+  facet_wrap(~parent_visn)
+```
+
+
+## PC CRH ScrSSNs per 1,000 ScrSSNs in PCMM   
+```{r}
+ggplot(data = crh_only,
+       aes(x = crh_month, y = crh_scrssn_over_pcmm_scrssn_1k, group = sta5a)) +
+  geom_line(color = "red") +
+  facet_wrap(~parent_visn)
+#
+ggplot(data = crh_only,
+       aes(x = crh_scrssn_over_pcmm_scrssn_1k)) +
+  geom_histogram(color = "black",
+                 fill = "forestgreen",
+                 bins = 50) +
+  facet_wrap(~parent_visn)
+#
+ggplot(data = crh_only,
+       aes(y = crh_scrssn_over_pcmm_scrssn_1k)) +
+  geom_boxplot(color = "black",
+                 fill = "darkorchid") +
+  theme(axis.text.x = element_blank()) +
+  facet_wrap(~parent_visn)
+```

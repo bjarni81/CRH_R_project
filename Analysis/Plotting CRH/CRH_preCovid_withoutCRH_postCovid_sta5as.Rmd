@@ -1,0 +1,198 @@
+---
+title: "Sta5as with CRH pre-COVID, but not after March 2020"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v5.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- access_metrics %>%
+  filter(vssc_month > ymd("2020-02-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(crh_10_flag == 1) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include <- access_metrics %>%#1: must have Access metrics
+  select(sta5a) %>%
+  inner_join(ps_matched) %>%
+  inner_join(., vast %>% select(sta5a, s_abbr)) %>%#2: must be in VAST
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, 
+                            "PC CRH", "No PC CRH")) %>%#making the crh_flag
+  left_join(., scrssn_count) %>%
+  filter(scrssn_count_cat != "< 450")#3: must have scrssn_count_avg_fy18 >= 450
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+     # filter(vssc_month > ymd("2019-09-01")) %>%#restrict to our timeframe
+      left_join(., dates)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a report on the `r crh_flag %>% filter(crh_10_flag == 1 & had_pcCRH_after_march20 == 0) %>% nrow()` sta5as that met PC CRH inclusion criteria before March 2020, but didn't meet those criteria after March 2020
+
+## Decision Points  
+
+* As part of our effort to move forward with the post-COVID analysis I am asking whether we should re-visit our propensity score matching scheme
+    
+# Which sta5as are these?  
+
+
+```{r}
+sta5as_didnt_have_pccrh_after_march20 <-crh_flag %>% 
+  filter(crh_10_flag == 1 & had_pcCRH_after_march20 == 0) %>%
+  select(sta5a) %>%
+  pull
+#
+pen_rate_month <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  mutate(crh_month = ymd(crh_month)) %>%
+  filter(sta5a %in% sta5as_didnt_have_pccrh_after_march20)
+#--
+total_after <- pen_rate_month %>%
+  group_by(sta5a) %>%
+  filter(crh_month > ymd("2020-03-01")) %>%
+  summarise(total_crh_after = sum(crh_encounter_count, na.rm = T))
+#--
+total_before <- pen_rate_month %>%
+  group_by(sta5a) %>%
+  filter(crh_month <= ymd("2020-03-01")) %>%
+  summarise(total_crh_before = sum(crh_encounter_count, na.rm = T))
+#---
+pen_rate_month %>%
+  select(sta5a) %>%
+  distinct %>%
+  left_join(., total_before) %>%
+  left_join(., total_after) %>%
+  left_join(., vast %>% select(sta5a, short_name, state, parent_visn, s_abbr)) %>%
+  left_join(., crh_flag %>% select(sta5a, first_mo_w_mt9_pc_crh)) %>%
+  select(parent_visn, sta5a, short_name, state, s_abbr, first_mo_w_mt9_pc_crh, starts_with("total")) %>%
+  mutate(total_crh_before = comma(total_crh_before),
+         short_name = str_remove(short_name, ", Iowa")) %>%
+  kbl(col.names = c("VISN", "Sta5a", "Name", "State", "Type", 
+                    "First month meeting inclusion", "Total PC CRH before 3/20", 
+                    "Total PC CRH After 3/20"),
+      align = c(rep("l", 6), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+  
+```
+
+

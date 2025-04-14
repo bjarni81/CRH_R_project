@@ -1,0 +1,239 @@
+---
+title: "PC CRH Analysis: Random effects"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+pactcc_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         initiated_pc_crh_b4_march_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-03-01"), TRUE, FALSE),
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#
+pilot_sites <- dbGetQuery(pactcc_con,
+                          "select distinct spoke_sta5a, vimpact_pilot
+                          from PACT_CC.CRH.CRH_sites_FY20_working 
+                          UNION
+                          select distinct spoke_sta5a, vimpact_pilot
+                          from PACT_CC.CRH.CRH_sites_FY21_working ") %>%
+  filter(vimpact_pilot == 1) %>%
+  select(sta5a = spoke_sta5a)
+#
+ps_matched <- read_csv(here::here("Input", "Data", "ps_matched_sta5as.csv"))
+#==
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#
+dates <- access_metrics %>%
+  filter(vssc_month >= ymd("2019-09-01") & vssc_month <= ymd("2020-02-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+```
+
+# Model 1A  
+
+## All Together  
+
+```{r}
+sta5as_model_1a <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  inner_join(., ps_matched) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a, at_least_10_pc_crh_flag)
+#----------------------------------------------------------
+est_pt_wt_model_1a <- access_metrics %>%
+  select(sta5a, vssc_month, est_pc_pt_wt) %>%
+  inner_join(., sta5as_model_1a) %>%
+  filter(vssc_month >= ymd("2019-09-01") & vssc_month <= ymd("2020-02-01")) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH"))) %>%
+  left_join(., dates)
+#
+glm_model_1a <- lmer(est_pc_pt_wt ~ time + (time | sta5a),
+                     data = est_pt_wt_model_1a) 
+summary(glm_model_1a)
+plot_model(glm_model_1a, type = "re")
+#---
+bar <- est_pt_wt_model_1a %>% select(sta5a) %>% distinct %>% pull %>%
+  toString()
+terms_var <- paste0("sta5a [", bar, "]")
+plot_model(glm_model_1a, 
+           type = "pred", 
+           pred.type = "re", 
+           terms = c("time", terms_var),
+           se = F,
+           colors = "bw",
+           ci.lvl = NA,
+           dodge = 0.75) +
+  theme(legend.position = "none")
+#-----
+model_1a_data <- get_model_data(glm_model_1a, 
+                                type = "pred", 
+                                pred.type = "re", 
+                                terms = c("time", terms_var)) %>%
+  left_join(., est_pt_wt_model_1a %>% select(group = sta5a, crh_flag))
+#
+ggplot(data = model_1a_data,
+       aes(x = x, y = predicted, group = group, color = crh_flag)) +
+  geom_line(alpha = 0.75) +
+  labs(x = "Time",
+       y = "Predicted Established Patient Wait Time",
+       title = "All Sta5as") + 
+  guides(color = guide_legend(override.aes = list(size = 2))) +
+  theme(legend.title = element_blank()) +
+  ggsci::scale_color_nejm()
+```
+
+### Distribution of Predicted at t = 1  
+```{r}
+model_1a_intercepts <- model_1a_data %>%
+  filter(x == 1)
+
+ggplot(data = model_1a_intercepts,
+       aes(x = predicted, fill = crh_flag)) +
+  geom_histogram(bins = 25, color = "black") +
+  facet_wrap(~crh_flag) +
+  theme(legend.position = "none") +
+  labs(x = "Predicted Established Patient Wait Time at t = 1",
+       y = "Count")
+#
+ggplot(data = model_1a_intercepts,
+       aes(x = crh_flag, y = predicted, fill = crh_flag)) +
+  geom_boxplot() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "Predicted Established Patient Wait Time at t = 1")
+```
+
+## PC CRH Only    
+
+```{r}
+est_pt_wt_model_1a_crh <- est_pt_wt_model_1a %>% filter(crh_flag == "PC CRH")
+#
+glm_model_1a_crh <- lmer(est_pc_pt_wt ~ time + (time | sta5a),
+                     data = est_pt_wt_model_1a_crh)
+summary(glm_model_1a_crh)
+plot_model(glm_model_1a_crh, type = "re")
+foo <- get_model_data(glm_model_1a_crh, type = "re")
+#---
+bar <- foo %>% select(term) %>% slice_sample(., n = 35) %>% pull %>%
+  toString()
+terms_var <- paste0("sta5a [", bar, "]")
+plot_model(glm_model_1a_crh, 
+           type = "pred", 
+           pred.type = "re", 
+           terms = c("time", terms_var),
+           show.legend = FALSE,
+           se = F,
+           colors = "bw",
+           ci.lvl = NA)
+#-----
+model_1a_crh_data <- get_model_data(glm_model_1a_crh, 
+                                type = "pred", 
+                                pred.type = "re", 
+                                terms = c("time", terms_var))
+ggplot(data = model_1a_crh_data,
+       aes(x = x, y = predicted, group = group)) +
+  geom_line(alpha = 0.75) +
+  labs(x = "Time",
+       y = "Predicted Established Patient Wait Time",
+       "PC CRH Sta5as Only")
+```
+
+## No PC CRH Only    
+
+```{r}
+est_pt_wt_model_1a_noCrh <- est_pt_wt_model_1a %>% filter(crh_flag != "PC CRH")
+#
+glm_model_1a_noCrh <- lmer(est_pc_pt_wt ~ time + (time | sta5a),
+                         data = est_pt_wt_model_1a_noCrh)
+summary(glm_model_1a_noCrh)
+plot_model(glm_model_1a_noCrh, type = "re")
+foo <- get_model_data(glm_model_1a_noCrh, type = "re")
+#---
+bar <- foo %>% select(term) %>% slice_sample(., n = 35) %>% pull %>%
+  toString()
+terms_var <- paste0("sta5a [", bar, "]")
+plot_model(glm_model_1a_noCrh, 
+           type = "pred", 
+           pred.type = "re", 
+           terms = c("time", terms_var),
+           show.legend = FALSE,
+           se = F,
+           colors = "bw",
+           ci.lvl = NA)
+#-----
+model_1a_noCrh_data <- get_model_data(glm_model_1a_noCrh, 
+                                type = "pred", 
+                                pred.type = "re", 
+                                terms = c("time", terms_var))
+ggplot(data = model_1a_noCrh_data,
+       aes(x = x, y = predicted, group = group)) +
+  geom_line(alpha = 0.75) +
+  labs(x = "Time",
+       y = "Predicted Established Patient Wait Time",
+       "No PC CRH Sta5as Only")
+```

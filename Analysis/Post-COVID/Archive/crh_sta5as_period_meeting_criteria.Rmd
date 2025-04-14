@@ -1,0 +1,354 @@
+---
+title: "PC CRH Inclusion in 3 Periods"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             plot.title = element_text(size = 24),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2018-09-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This report is a description of how many stations meet our inclusion criteria during our 3 periods of consideration: Before March 2020, Between March and September 2020, and After September 2020
+
+# How The Flag Gets Made  
+
+* Below is the code chunk where I create a flag for each sta5a-month determining whether it meets our inclusion criteria
+
+```{r class.source = 'fold-show'}
+months_meeting_inclusion_criteria <- pen_rate %>%
+  arrange(sta5a, vssc_month) %>%#ordering by station and month
+  group_by(sta5a) %>%#grouping by station
+  mutate(this_mo_mt9_pc_crh = if_else(crh_encounter_count > 9, 1, 0),#flag for this month meeting criteria 
+         last_mo_mt9_pc_crh = if_else(lag(crh_encounter_count) > 9, 1, 0),#flag for last month
+         next_mo_mt9_pc_crh = if_else(lead(crh_encounter_count) > 9, 1, 0),#flag for next month
+         meets_inc_crit = if_else(this_mo_mt9_pc_crh == 1 & # IF this month meets criteria
+                                    (last_mo_mt9_pc_crh == 1 | next_mo_mt9_pc_crh == 1),#AND either this or last month
+                                  1, 0),#THEN 1, ELSE 0
+         meets_inc_crit = replace_na(meets_inc_crit, 0))#replacing NA with 0
+```
+
+* The code chunk below is where I combine that criteria with our 3 periods to make a flag designating each sta5a-month-inclusion by the period in which it occurred 
+
+```{r class.source = 'fold-show'}
+months_meeting_inclusion_criteria <- months_meeting_inclusion_criteria %>%
+  mutate(
+    period_meeting_citeria = factor(case_when(
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month < ymd("2020-03-01") #AND month < march 2020
+      ~ "Before March 2020",#label
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month >= ymd("2020-03-01")#AND month between March 2020
+      & vssc_month <= ymd("2020-09-01") #AND September 2020
+      ~ "Between March and September 2020",#label
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month > ymd("2020-09-01") #AND month > Setember 2020
+      ~ "After September 2020",#label
+      TRUE ~ "Not Enough PC CRH"),#ELSE
+      ordered = TRUE,
+      levels = c("Before March 2020", 
+                 "Between March and September 2020",
+                 "After September 2020",
+                 "Not Enough PC CRH")))
+```
+
+* This final code chunk contains the last bit of logic 
+
+```{r class.source = 'fold-show'}
+sta5a_period_table <- months_meeting_inclusion_criteria %>%
+  group_by(sta5a, period_meeting_citeria) %>%#group by station and period
+  summarise(sta5a_period_count = n()) %>%#count of each
+  mutate(
+    include_me = if_else(sta5a_period_count > 1, 1, 0)) %>%#if a sta5a-period had > 1 counts in a period then 1 else 0
+  group_by(period_meeting_citeria) %>%# group by period
+  summarise(count = sum(include_me))#sum(include_me) by period gives us the final table
+```
+
+
+```{r}
+sta5a_period_table %>%
+  kbl(col.names = c("", "Sta5as")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+# Visulizing Months Meeting Inclusion  
+
+
+## Before March 2020  
+```{r}
+cbbPalette <- c("#000000", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+#
+months_meeting_inclusion_criteria %>%
+  filter(vssc_month < ymd("2020-03-01")
+         & vssc_month > ymd("2018-09-01")
+         & meets_inc_crit == 1) %>%
+  ggplot(data = .,
+         aes(x = vssc_month)) +
+  geom_histogram(bins = 17,
+                 color = "black",
+                 fill = cbbPalette[2]) +
+  labs(x = "Month", 
+       y = "Sta5as Meeting Inclusion Criteria",
+       title = "Before March 2020")
+```
+
+## Between March and September 2020  
+```{r}
+months_meeting_inclusion_criteria %>%
+  filter(vssc_month >= ymd("2020-03-01")
+         & vssc_month <= ymd("2020-09-01")
+         & meets_inc_crit == 1) %>%
+  ggplot(data = .,
+         aes(x = vssc_month)) +
+  geom_histogram(bins = 7,
+                 color = "black",
+                 fill = cbbPalette[3]) +
+  labs(x = "Month", 
+       y = "Sta5as Meeting Inclusion Criteria",
+       title = "Between March and September 2020")
+```
+
+## After September 2020    
+```{r}
+months_meeting_inclusion_criteria %>%
+  filter(vssc_month > ymd("2020-09-01")
+         & meets_inc_crit == 1) %>%
+  ggplot(data = .,
+         aes(x = vssc_month)) +
+  geom_histogram(bins = 36,
+                 color = "black",
+                 fill = cbbPalette[4]) +
+  labs(x = "Month", 
+       y = "Sta5as Meeting Inclusion Criteria",
+       title = "After September 2020")
+```
+
+## All 35 Months  
+```{r}
+months_meeting_inclusion_criteria %>%
+  filter(meets_inc_crit == 1) %>%
+  ggplot(data = .,
+         aes(x = vssc_month)) +
+  geom_histogram(bins = 61,
+                 color = "black",
+                 fill = cbbPalette[8]) +
+  labs(x = "Month", 
+       y = "Sta5as Meeting Inclusion Criteria",
+       title = "All 35 Months")
+```
+
+## Do CRH Encounters Over Time Look Like This Too?    
+
+```{r}
+pen_rate %>% 
+  filter(vssc_month > ymd("2018-09-01")) %>%
+  group_by(vssc_month) %>%
+  summarise(tot_crh = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = tot_crh)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = comma_format(accuracy = 1)) +
+  labs(x = "Month",
+       y = "Total PC CRH")
+```
+
+### By Type   
+```{r}
+all_encounters_by_type <- dbGetQuery(oabi_con,
+                                     "with CTE as (
+	select *,
+		vizMonth = DATEFROMPARTS(year(visitdate), month(visitdate), '01')
+	from [PACT_CC].[CRH].C_crh_utilization_final
+)
+select vizMonth, care_type, count(*) as encounter_count
+from CTE
+group by vizMonth, care_type") %>%
+  mutate(vizMonth = as.Date(vizMonth)) %>%
+  filter(vizMonth > ymd("2018-09-01"))
+#----
+ggplot(data = all_encounters_by_type,
+       aes(x = vizMonth, y = encounter_count, color = care_type, group = care_type)) + 
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_date(date_breaks = "6 months",
+               date_labels = "%b-%y") +
+  labs(x = "Month",
+       y = "CRH Encounters") +
+  theme(legend.position = "right")
+```
+
+### PC As a Table  
+
+```{r}
+pen_rate %>% 
+  filter(vssc_month > ymd("2021-12-01")) %>%
+  group_by(vssc_month) %>%
+  summarise(total_crh = sum(crh_encounter_count, na.rm = T)) %>%
+  arrange(vssc_month) %>%
+  mutate(total_crh = comma(total_crh)) %>%
+  kbl(col.names = c("Month", "Total CRH"),
+      align = c("c", "r")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+### VISNs 20 & 23  
+
+```{r}
+all_encounters_type_visn <- dbGetQuery(oabi_con,
+                                       "with CTE as (
+	select *,
+		vizMonth = DATEFROMPARTS(year(visitdate), month(visitdate), '01')
+	from [PACT_CC].[CRH].C_crh_utilization_final
+)
+select vizMonth, care_type, count(*) as encounter_count, b.parent_visn
+from CTE as a
+left join [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06 as b
+on a.spoke_sta5a_combined_cdw = b.sta5a
+group by vizMonth, care_type, parent_visn") %>%
+  mutate(vizMonth = as.Date(vizMonth)) %>%
+  filter(vizMonth > ymd("2018-09-01"))
+```
+
+```{r}
+all_encounters_type_visn %>%
+  filter(parent_visn == "20") %>%
+  ggplot(data = .,
+         aes(x = vizMonth, y = encounter_count, group = care_type, color = care_type)) + 
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_date(date_breaks = "6 months",
+               date_labels = "%b-%y") +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       title = "VISN 20") +
+  theme(legend.position = "right")
+```
+
+```{r}
+all_encounters_type_visn %>%
+  filter(parent_visn == "23") %>%
+  ggplot(data = .,
+         aes(x = vizMonth, y = encounter_count, group = care_type, color = care_type)) + 
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_date(date_breaks = "6 months",
+               date_labels = "%b-%y") +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       title = "VISN 23") +
+  theme(legend.position = "right")
+```
+
+
+```{r}
+library(plotly)
+all_encounters_type_visn %>%
+  filter(care_type == "Primary Care") %>%
+  plot_ly(data = .,
+               x = ~vizMonth,
+               y = ~encounter_count,
+               color = ~parent_visn) %>%
+  add_lines() %>%
+  layout(showlegend = FALSE,
+         xaxis = list(
+           title = "Month"
+         ),
+         yaxis = list(
+           title = "PC CRH Encounters"
+         ))
+```

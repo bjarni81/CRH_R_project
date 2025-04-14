@@ -1,0 +1,470 @@
+---
+title: "Pre-COVID Plots and Tables - TNA PS Match"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(s_abbr2 = case_when(s_abbr %in% c("MSCBOC", "PCCBOC") ~ "CBOC",
+                             s_abbr %in% c("HCC", "VAMC") ~ "VAMC/HCC",
+                             TRUE ~ s_abbr))
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v5_1_noCRH_among_controls.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(vssc_month = seq.Date(ymd("2018-10-01"),
+                                      ymd("2020-02-03"),
+                                      "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#=========
+pc_encounters <- dbGetQuery(oabi_con,
+                            "select *
+                            from [OABI_MyVAAccess].[crh_eval].[A1_pc_enc_scrssn_count]") %>%
+  mutate(visitMonth = ymd(visitMonth))%>%
+  rename(sta5a = Sta6a,
+         vssc_month = visitMonth)
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+#--------
+pc_cons <- dbGetQuery(oabi_con,
+                      "with CTE as(
+select count(*) as total_cons, sum(non_va) as non_va_cons, sta6a
+	, DATEFROMPARTS(year(activityDateTime), month(activityDateTime), '01') as activityMonth
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+where stopCode_group = 'Primary Care'
+	AND year(activityDateTime) > 2017 AND year(activityDateTime) < 2020
+group by Sta6a, DATEFROMPARTS(year(activityDateTime), month(activityDateTime), '01'))
+select a.sta6a as sta5a, total_cons, non_va_cons
+, pcmm_scrssn_count
+, activityMonth as vssc_month
+from CTE as a
+left join [OABI_MyVAAccess].[crh_eval].F2_pcmm_scrssn_count as b
+	on a.Sta6a = b.sta5a") %>%
+  mutate(non_va_cons_per_10k_pcmm = non_va_cons / pcmm_scrssn_count * 10000,
+         vssc_month = ymd(vssc_month))
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include <- ps_matched %>%
+  select(sta5a, at_least_10_pc_crh_flag) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH"),
+                           ordered = TRUE,
+                           levels = c("PC CRH", "No PC CRH")))
+#=================
+#making the analytic dataset
+analytic_df_matched <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      filter(vssc_month < ymd("2020-03-01") 
+             & vssc_month > ymd("2018-06-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%
+      left_join(., vast %>% select(sta5a, s_abbr2)) %>%
+  left_join(., covariates) %>%
+  left_join(., pc_encounters %>% select(sta5a, pc_encounter_total, vssc_month)) %>%
+  left_join(., scrssn_count) %>%
+  left_join(., pc_cons %>% select(vssc_month, sta5a, non_va_cons_per_10k_pcmm)) %>%
+  select(crh_flag
+         , vssc_month
+         , sta5a
+         , pc_encounter_total
+         , scrssn_count_avg_fy18
+         , s_abbr2
+         , team_pcp_ap_fte_total
+         , obs_exp_panel_ratio
+         , non_va_cons_per_10k_pcmm
+         , nosos_risk_score
+         , adi_natRnk_avg
+         , pct_rural
+         , est_pc_pt_wt
+         , new_pc_pt_wt
+         , third_next_avail)
+```
+
+```{r}
+source(here("Input", "Analytic df", "F2_propensity_score_matching","propensity_score_matching_v5_1_noCRH_among_controls.R"))
+#
+analytic_df_noMatch <- sta5a_demog_no_missing %>%
+  select(sta5a, at_least_10_pc_crh_flag) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH"),
+                           ordered = TRUE,
+                           levels = c("PC CRH", "No PC CRH"))) %>%
+  left_join(., dates, by = character()) %>%
+  left_join(., vast %>% select(sta5a, s_abbr2)) %>%
+  left_join(., covariates) %>%
+  left_join(., pc_encounters %>% select(sta5a, pc_encounter_total, vssc_month)) %>%
+  left_join(., scrssn_count) %>%
+  left_join(., access_metrics) %>%
+  left_join(., pc_cons %>% select(vssc_month, sta5a, non_va_cons_per_10k_pcmm)) %>%
+  filter(vssc_month < ymd("2020-03-01") 
+         & vssc_month > ymd("2018-06-01")) %>%
+  select(crh_flag
+         , vssc_month
+         , sta5a
+         , pc_encounter_total
+         , scrssn_count_avg_fy18
+         , s_abbr2
+         , team_pcp_ap_fte_total
+         , obs_exp_panel_ratio
+         , non_va_cons_per_10k_pcmm
+         , nosos_risk_score
+         , adi_natRnk_avg
+         , pct_rural
+         , est_pc_pt_wt
+         , new_pc_pt_wt
+         , third_next_avail)
+```
+
+
+```{r}
+# source(here("Input", "Analytic df", "F2_propensity_score_matching","propensity_score_matching_v5_2_tna_only.R"))
+tna_match_sta5as <- read_csv(here("Input", "Data", "ps_matched_sta5as_v5_2.csv"))
+#
+analytic_df_tnaMatch <- tna_match_sta5as %>%
+  select(sta5a, at_least_10_pc_crh_flag) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH"),
+                           ordered = TRUE,
+                           levels = c("PC CRH", "No PC CRH"))) %>%
+  left_join(., dates, by = character()) %>%
+  left_join(., vast %>% select(sta5a, s_abbr2)) %>%
+  left_join(., covariates) %>%
+  left_join(., pc_encounters %>% select(sta5a, pc_encounter_total, vssc_month)) %>%
+  left_join(., scrssn_count) %>%
+  left_join(., access_metrics) %>%
+  left_join(., pc_cons %>% select(vssc_month, sta5a, non_va_cons_per_10k_pcmm)) %>%
+  filter(vssc_month < ymd("2020-03-01") 
+         & vssc_month > ymd("2018-06-01")) %>%
+  select(crh_flag
+         , vssc_month
+         , sta5a
+         , pc_encounter_total
+         , scrssn_count_avg_fy18
+         , s_abbr2
+         , team_pcp_ap_fte_total
+         , obs_exp_panel_ratio
+         , non_va_cons_per_10k_pcmm
+         , nosos_risk_score
+         , adi_natRnk_avg
+         , pct_rural
+         , est_pc_pt_wt
+         , new_pc_pt_wt
+         , third_next_avail)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a collection of tables and plots for the pre-COVID paper 
+
+## Decision Points  
+
+* Detail any specific questions being answered or decisions being made
+    
+## Analytic details  
+
+    
+* Description of _Propensity Score_ matching
+    + This report uses a variation of __Propensity Score v5.1__
+    + PS model v5.1 consists of 
+        + Covariates matched on their average values in FY18 Q4
+        + Outcomes matched on their average values over FY19
+        + Removed ADI and NOSOS
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+        + VISN - Exact
+    + __This version restricted the pool of potential controls to those sta5as that have never had a PC CRH encounter__
+
+# Table 1  
+```{r}
+ttest_fxn <- function(df, variable, covar_name){
+  accuracy_val <- if(covar_name %in% c("NOSOS", "Obs:Exp"))
+  {0.01}
+  else if(str_detect(covar_name, "Encounters|ScrSSN")){1}
+  else{0.1}
+  #--
+  start_month <- if(str_detect(covar_name, "PWT|TNA|10k|Encounters")){ymd("2018-10-01")}
+  else if(str_detect(covar_name, "ScrSSN")){ymd("2019-10-01")}
+  else{ymd("2018-10-01")}
+  #--
+  end_month <- if(str_detect(covar_name, "PWT|TNA|10k|Encounters")){ymd("2019-09-01")}
+  else if(str_detect(covar_name, "ScrSSN")){ymd("2019-10-01")}
+  else{ymd("2019-09-01")}
+  #--
+  df %>%
+    select(crh_flag, {{variable}}, vssc_month, sta5a) %>%
+    filter(vssc_month >= start_month
+           & vssc_month <= end_month) %>%
+    pivot_wider(names_from = crh_flag, values_from = {{variable}}) %>%
+    summarise(mean_crh = mean(`PC CRH`, na.rm = T),
+              sd_crh = sd(`PC CRH`, na.rm = T),
+              mean_ctrl = mean(`No PC CRH`, na.rm = T),
+              sd_ctrl = sd(`No PC CRH`, na.rm = T),
+              crh_val = paste0(comma(mean_crh, accuracy = accuracy_val),
+                               " (",
+                               comma(sd_crh, accuracy = accuracy_val),
+                               ")"),
+              ctrl_val = paste0(comma(mean_ctrl, accuracy = accuracy_val),
+                               " (",
+                               comma(sd_ctrl, accuracy = accuracy_val),
+                               ")"),
+              t_test_p = if_else(t.test(`No PC CRH`, `PC CRH`)$p.value < 0.001,
+                                 "< 0.001",
+                                 comma(t.test(`No PC CRH`, `PC CRH`)$p.value,
+                                       accuracy = 0.001))) %>%
+    mutate(covar_name = {{covar_name}},
+           start_month = as.character(start_month),
+           end_month = as.character(end_month)) %>%
+    select(covar_name, crh_val, ctrl_val, t_test_p, start_month, end_month)
+}
+```
+
+## Un Matched
+```{r}
+noMatch_s_abbr <- analytic_df_noMatch %>%
+  filter(vssc_month == ymd("2019-10-01")) %>%
+  group_by(crh_flag, s_abbr2) %>%
+  summarise(count = n()) %>%
+  pivot_wider(names_from = crh_flag, values_from = count) %>%
+  mutate(t_test_p = "NA", 
+         start_month = "2019-10-01",
+         end_month = "2019-10-01") %>%
+  rename(crh_val = `PC CRH`,
+         ctrl_val = `No PC CRH`,
+         covar_name = s_abbr2) %>%
+  janitor::adorn_totals() %>%
+  mutate(crh_val = as.character(crh_val),
+         ctrl_val = as.character(ctrl_val))
+#--
+noMatch_encounter_tot <- analytic_df_noMatch %>%
+  group_by(crh_flag) %>%
+  summarise(pc_enc_tot = comma(sum(pc_encounter_total, na.rm = T), accuracy = 1)) %>%
+  mutate(covar_name = "Total PC Encounters") %>%
+  pivot_wider(names_from = crh_flag, values_from = pc_enc_tot) %>%
+  mutate(t_test_p = "NA",
+         start_month = "2018-10-01",
+         end_month = "2020-02-01") %>%
+  rename(crh_val = `PC CRH`,
+         ctrl_val = `No PC CRH`)
+#--
+noMatch_encounter_tot %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, pc_encounter_total, "PC Encounters per month")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, scrssn_count_avg_fy18, "Unique ScrSSNs")) %>%
+  bind_rows(., noMatch_s_abbr) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, team_pcp_ap_fte_total, "PCP/AP FTE")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, obs_exp_panel_ratio, "Obs:Exp")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, non_va_cons_per_10k_pcmm, 
+                      "Non-VA Consults per 10k Uniques")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, nosos_risk_score, "NOSOS")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, adi_natRnk_avg, "ADI")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, pct_rural, "% Rural")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, est_pc_pt_wt, "EPWT")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, new_pc_pt_wt, "NPWT")) %>%
+  bind_rows(ttest_fxn(analytic_df_noMatch, third_next_avail, "TNA")) %>%
+  kbl(col.names = c("Variable", "CRH Value (SD)", "Control Value (SD)", "p for difference",
+                    "Start Month", "End Month")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+## Matched
+```{r}
+match_s_abbr <- analytic_df_matched %>%
+  filter(vssc_month == ymd("2019-10-01")) %>%
+  group_by(crh_flag, s_abbr2) %>%
+  summarise(count = n()) %>%
+  pivot_wider(names_from = crh_flag, values_from = count) %>%
+  mutate(t_test_p = "NA", 
+         start_month = "2019-10-01",
+         end_month = "2019-10-01") %>%
+  rename(crh_val = `PC CRH`,
+         ctrl_val = `No PC CRH`,
+         covar_name = s_abbr2) %>%
+  janitor::adorn_totals() %>%
+  mutate(crh_val = as.character(crh_val),
+         ctrl_val = as.character(ctrl_val))
+#--
+matched_encounter_tot <- analytic_df_matched %>%
+  group_by(crh_flag) %>%
+  summarise(pc_enc_tot = comma(sum(pc_encounter_total, na.rm = T), accuracy = 1)) %>%
+  mutate(covar_name = "Total PC Encounters") %>%
+  pivot_wider(names_from = crh_flag, values_from = pc_enc_tot) %>%
+  mutate(t_test_p = "NA",
+         start_month = "2018-10-01",
+         end_month = "2020-02-01") %>%
+  rename(crh_val = `PC CRH`,
+         ctrl_val = `No PC CRH`)
+#--
+matched_encounter_tot %>%
+  bind_rows(ttest_fxn(analytic_df_matched, pc_encounter_total, "PC Encounters per month")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, scrssn_count_avg_fy18, "Unique ScrSSNs")) %>%
+  bind_rows(., match_s_abbr) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, team_pcp_ap_fte_total, "PCP/AP FTE")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, obs_exp_panel_ratio, "Obs:Exp")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, non_va_cons_per_10k_pcmm, 
+                      "Non-VA Consults per 10k Uniques")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, nosos_risk_score, "NOSOS")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, adi_natRnk_avg, "ADI")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, pct_rural, "% Rural")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, est_pc_pt_wt, "EPWT")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, new_pc_pt_wt, "NPWT")) %>%
+  bind_rows(ttest_fxn(analytic_df_matched, third_next_avail, "TNA")) %>%
+  kbl(col.names = c("Variable", "CRH Value (SD)", "Control Value (SD)", "p for difference",
+                    "Start Month", "End Month")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+## Matched - TNA Only  
+```{r}
+tnaMatch_s_abbr <- analytic_df_tnaMatch %>%
+  filter(vssc_month == ymd("2019-10-01")) %>%
+  group_by(crh_flag, s_abbr2) %>%
+  summarise(count = n()) %>%
+  pivot_wider(names_from = crh_flag, values_from = count) %>%
+  mutate(t_test_p = "NA", 
+         start_month = "2019-10-01",
+         end_month = "2019-10-01") %>%
+  rename(crh_val = `PC CRH`,
+         ctrl_val = `No PC CRH`,
+         covar_name = s_abbr2) %>%
+  janitor::adorn_totals() %>%
+  mutate(crh_val = as.character(crh_val),
+         ctrl_val = as.character(ctrl_val))
+#--
+tnaMatched_encounter_tot <- analytic_df_tnaMatch %>%
+  group_by(crh_flag) %>%
+  summarise(pc_enc_tot = comma(sum(pc_encounter_total, na.rm = T), accuracy = 1)) %>%
+  mutate(covar_name = "Total PC Encounters") %>%
+  pivot_wider(names_from = crh_flag, values_from = pc_enc_tot) %>%
+  mutate(t_test_p = "NA",
+         start_month = "2018-10-01",
+         end_month = "2020-02-01") %>%
+  rename(crh_val = `PC CRH`,
+         ctrl_val = `No PC CRH`)
+#--
+tnaMatched_encounter_tot %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, pc_encounter_total, "PC Encounters per month")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, scrssn_count_avg_fy18, "Unique ScrSSNs")) %>%
+  bind_rows(., tnaMatch_s_abbr) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, team_pcp_ap_fte_total, "PCP/AP FTE")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, obs_exp_panel_ratio, "Obs:Exp")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, non_va_cons_per_10k_pcmm, 
+                      "Non-VA Consults per 10k Uniques")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, nosos_risk_score, "NOSOS")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, adi_natRnk_avg, "ADI")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, pct_rural, "% Rural")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, est_pc_pt_wt, "EPWT")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, new_pc_pt_wt, "NPWT")) %>%
+  bind_rows(ttest_fxn(analytic_df_tnaMatch, third_next_avail, "TNA")) %>%
+  kbl(col.names = c("Variable", "CRH Value (SD)", "Control Value (SD)", "p for difference",
+                    "Start Month", "End Month")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```

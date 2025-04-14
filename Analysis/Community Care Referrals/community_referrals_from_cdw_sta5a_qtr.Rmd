@@ -1,0 +1,723 @@
+---
+title: "CDW PC Community Care Referrals"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+pactcc_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#
+every_nth = function(n) {
+  return(function(x) {x[c(TRUE, rep(FALSE, n - 1))]})
+}
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+# setting flag for initiated_pc_crh_b4_feb_2020
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         initiated_pc_crh_b4_march_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-03-01"), TRUE, FALSE),
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#identifying sta5as that had at least 10 PC CRH encounters per month from October, 2019 through March, 2020
+sta5as_w_gt9 <- crh_flag %>%
+  filter(first_6_mos_w_10_flag == 1) %>%
+  select(sta5a) %>% pull
+# identifying sta5as that initiated PC CRH before February, 2020
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+# identifying pilot sta5as
+pilot_sites <- dbGetQuery(pactcc_con,
+                          "select distinct spoke_sta5a, vimpact_pilot
+                          from PACT_CC.CRH.CRH_sites_FY20_working 
+                          UNION
+                          select distinct spoke_sta5a, vimpact_pilot
+                          from PACT_CC.CRH.CRH_sites_FY21_working ") %>%
+  filter(vimpact_pilot == 1) %>%
+  select(sta5a = spoke_sta5a)
+# propensity score-matched sta5as
+ps_matched <- read_csv("H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/CRH_r_project/Input/Data/ps_matched_sta5as.csv")
+# identifying ps-matched sta5as 
+ps_groups_w_gt9 <- ps_matched %>%
+  filter(at_least_10_pc_crh_flag == 1
+         & sta5a %in% sta5as_w_gt9) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a) %>%
+  pull
+# timely care success rate
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#VSSC access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#make dataframe of all dates and a column for time
+dates <- access_metrics %>%
+  filter(vssc_month <= ymd("2020-02-01")) %>%#this is where we DO NOT drop October, 2019
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#Uniques in PCMM, categorized
+scrssn_count <- dbGetQuery(pactcc_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2019
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy19, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy19 < 450 ~ "< 450",
+    scrssn_count_avg_fy19 >= 450 & scrssn_count_avg_fy19 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy19 >= 2400 & scrssn_count_avg_fy19 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy19 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#scrssn count at parent-sta5a
+pcmm_parent_sta5a <- dbGetQuery(pactcc_con,
+                                "with CTE as(
+                                	select a.*, b.parent_station_sta5a
+                                	from [PACT_CC].[econ].PatientPCP as a
+                                	inner join [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06 as b
+                                	on a.Sta5a = b.sta5a
+                                	where fy > 2018
+                                	)
+                                select count(distinct ScrSSN_num) as scrssn_count, parent_station_sta5a, fy, qtr
+                                from CTE
+                                group by parent_station_sta5a, fy, qtr")
+#==
+pcmm_sta5a_qtr <- dbGetQuery(oabi_con,
+                             "select count(distinct scrssn_char) as scrssn_count
+                              	, sta5a, fy, qtr
+                              from [PACT_CC].[econ].PatientPCP
+                              where fy > 2018
+                              group by sta5a, fy, qtr") %>%
+  mutate(fy_qtr = str_c(fy, qtr, sep = "_")) %>%
+  inner_join(., vast %>% select(sta5a)) %>%
+  filter(scrssn_count > 450)
+#x intercept at October, 2019
+vline_xint <- as.numeric(ymd("2019-10-01"))
+#####
+sta5as_to_include <- scrssn_count %>% filter(scrssn_count_cat != "< 450")
+```
+
+ 
+
+```{r cdw_cc_refs}
+cc_refs_cdw <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].G_pc_communityCare_referrals
+                          where non_va = 1") %>%
+  mutate(ActivityDateTime = ymd_hms(ActivityDateTime),
+         month_n = month(ActivityDateTime),
+         qtr = case_when(month_n %in% c(10, 11, 12) ~ 1,
+                         month_n %in% c(1, 2, 3) ~ 2,
+                         month_n %in% c(4, 5, 6) ~ 3,
+                         month_n %in% c(7, 8, 9) ~ 4),
+         fy = if_else(qtr == 1, year(ActivityDateTime) + 1, year(ActivityDateTime)),
+         fy_qtr = str_c(fy, qtr, sep = "_")) %>%
+  rename(sta5a = Sta6a) %>% 
+  filter(fy_qtr != "2022_4") %>%
+  inner_join(., vast %>% select(sta5a))
+#
+cdw_refs_sta5a_qtr <- cc_refs_cdw %>%
+  group_by(fy_qtr, sta5a) %>%
+  summarise(pc_referral_count = n()) %>%
+  inner_join(., sta5as_to_include %>% select(sta5a))
+```
+
+
+# As a rate per 10,000 in PCMM  
+## VISN 2  
+
+```{r}
+pccc_rate_visn_2 <- cdw_refs_sta5a_qtr %>%
+  left_join(., vast %>% select(sta5a, parent_visn, short_name)) %>%
+  filter(parent_visn == "02") %>%
+  group_by(fy_qtr, sta5a, short_name) %>%
+  summarise(pc_refs_total = sum(pc_referral_count)) %>%
+  mutate(short_name = str_remove(short_name, ", New York|, New Jersey")) %>%
+  left_join(., pcmm_sta5a_qtr) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000) %>%
+  ungroup()  %>%
+  mutate(short_name = fct_reorder(short_name, pc_refs_per_10k_pcmm_uniques, tail, n = 1, .desc = TRUE))
+```
+
+```{r}
+ggplot(data = pccc_rate_visn_2,
+       aes(x = fy_qtr, y = pc_refs_per_10k_pcmm_uniques, group = short_name, color = short_name)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = comma_format(accuracy = 0.1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270,
+                                   vjust = 0.4)) +
+  scale_x_discrete(breaks = every_nth(n = 2))
+#
+ggplot(data = pccc_rate_visn_2,
+       aes(y = pc_refs_per_10k_pcmm_uniques, x = "a")) +
+  geom_boxplot(fill = "red") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM")
+```
+
+## VISN 6  
+
+```{r}
+pccc_rate_visn_6 <- cdw_refs_sta5a_qtr %>%
+  left_join(., vast %>% select(sta5a, parent_visn, short_name)) %>%
+  filter(parent_visn == "06") %>%
+  group_by(fy_qtr, sta5a, short_name) %>%
+  summarise(pc_refs_total = sum(pc_referral_count)) %>%
+  mutate(short_name = str_remove(short_name, ", North Carolina|, Virginia|, North Carolina 2")) %>%
+  inner_join(., pcmm_sta5a_qtr) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000) %>%
+  ungroup()  %>%
+  mutate(short_name = fct_reorder(short_name, pc_refs_per_10k_pcmm_uniques, tail, n = 1, .desc = TRUE))
+```
+
+```{r}
+ggplot(data = pccc_rate_visn_6,
+       aes(x = fy_qtr, y = pc_refs_per_10k_pcmm_uniques, group = short_name, color = short_name)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270,
+                                   vjust = 0.4)) +
+  scale_x_discrete(breaks = every_nth(n = 2))
+#
+ggplot(data = pccc_rate_visn_6,
+       aes(y = pc_refs_per_10k_pcmm_uniques, x = "a")) +
+  geom_boxplot(fill = "red") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM")
+```
+
+## VISN 20  
+
+```{r}
+pccc_rate_visn_20 <- cdw_refs_sta5a_qtr %>%
+  left_join(., vast %>% select(sta5a, parent_visn, short_name)) %>%
+  filter(parent_visn == "20") %>%
+  group_by(fy_qtr, sta5a, short_name) %>%
+  summarise(pc_refs_total = sum(pc_referral_count)) %>%
+  mutate(short_name = str_remove(short_name, ", Idaho|, Oregon")) %>%
+  inner_join(., pcmm_sta5a_qtr) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000) %>%
+  ungroup()  %>%
+  mutate(short_name = fct_reorder(short_name, pc_refs_per_10k_pcmm_uniques, tail, n = 1, .desc = TRUE))
+```
+
+```{r}
+ggplot(data = pccc_rate_visn_20,
+       aes(x = fy_qtr, y = pc_refs_per_10k_pcmm_uniques, group = short_name, color = short_name)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270,
+                                   vjust = 0.4)) +
+  scale_x_discrete(breaks = every_nth(n = 2))
+#
+ggplot(data = pccc_rate_visn_20,
+       aes(y = pc_refs_per_10k_pcmm_uniques, x = "a")) +
+  geom_boxplot(fill = "red") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM")
+```
+
+## VISN 23 I          
+
+```{r}
+pccc_rate_visn_23 <- cdw_refs_sta5a_qtr %>%
+  left_join(., vast %>% select(sta5a, parent_visn, short_name)) %>%
+  filter(parent_visn == "23") %>%
+  group_by(fy_qtr, sta5a, short_name) %>%
+  summarise(pc_refs_total = sum(pc_referral_count)) %>%
+  mutate(short_name = str_remove(short_name, ", Iowa|, Minnesota|, Nebraska|, South Dakota|, Illinois|, North Dakota| Minnesota")) %>%
+  inner_join(., pcmm_sta5a_qtr) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000) %>%
+  ungroup()  %>%
+  mutate(short_name = fct_reorder(short_name, pc_refs_per_10k_pcmm_uniques, tail, n = 1, .desc = TRUE))
+#
+cdw_visn_23_max <- pccc_rate_visn_23 %>%
+  group_by(sta5a) %>% summarise(max_value = max(pc_refs_per_10k_pcmm_uniques)) %>%
+  select(sta5a) %>%
+  pull
+```
+
+```{r}
+ggplot(data = subset(pccc_rate_visn_23, sta5a %in% cdw_visn_23_max[1:20]),
+       aes(x = fy_qtr, y = pc_refs_per_10k_pcmm_uniques, group = short_name, color = short_name)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270,
+                                   vjust = 0.4)) +
+  scale_x_discrete(breaks = every_nth(n = 2))
+```
+
+### VISN 23 II  
+
+```{r}
+ggplot(data = subset(pccc_rate_visn_23, sta5a %in% cdw_visn_23_max[21:45]),
+       aes(x = fy_qtr, y = pc_refs_per_10k_pcmm_uniques, group = short_name, color = short_name)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270,
+                                   vjust = 0.4)) +
+  scale_x_discrete(breaks = every_nth(n = 2))
+```
+
+### VISN 23 III  
+
+```{r}
+ggplot(data = subset(pccc_rate_visn_23, sta5a %in% cdw_visn_23_max[46:70]),
+       aes(x = fy_qtr, y = pc_refs_per_10k_pcmm_uniques, group = short_name, color = short_name)) +
+  geom_line() +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270,
+                                   vjust = 0.4)) +
+  scale_x_discrete(breaks = every_nth(n = 2))
+```
+
+
+```{r}
+ggplot(data = pccc_rate_visn_23,
+       aes(y = pc_refs_per_10k_pcmm_uniques, x = "a")) +
+  geom_boxplot(fill = "red") +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "PC CC Referrals per 10,000 in PCMM")
+```
+
+# A couple of t-tests for funsies  
+```{r}
+pccc_rate <- cdw_refs_sta5a_qtr %>%
+  group_by(fy_qtr, sta5a) %>%
+  summarise(pc_refs_total = sum(pc_referral_count)) %>%
+  left_join(., pcmm_sta5a_qtr) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000) %>%
+  left_join(., vast) %>%
+  mutate(urh_2 = if_else(urh_vast == "R", "R", "U")) %>%
+  left_join(., crh_flag %>% select(sta5a, crh_10_flag)) %>%
+  mutate(crh_flag = if_else(crh_10_flag == 0 | is.na(crh_10_flag), 0, 1))
+```
+
+## Rurality of Sta5a  
+```{r}
+t.test(pc_refs_per_10k_pcmm_uniques ~ urh_2, data = pccc_rate)
+```
+
+## CRH Flag  
+```{r}
+t.test(pc_refs_per_10k_pcmm_uniques ~ crh_flag, data = pccc_rate)
+```
+
+# Plotting PC Community Care Referrals/10,000 X CRH Encounters/1,000  
+
+```{r}
+pc_crh_penRate <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  mutate(crh_month = ymd(crh_month),
+         month = month(crh_month),
+         fy = if_else(month > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month %in% c(10, 11, 12) ~ 1,
+                         month %in% c(1, 2, 3) ~ 2,
+                         month %in% c(4, 5, 6) ~ 3,
+                         month %in% c(7, 8, 9) ~ 4),
+         fy_qtr = str_c(fy, qtr, sep = "_")) %>%
+  inner_join(., crh_flag %>% filter(crh_10_flag == 1) %>% select(sta5a)) %>%
+  filter(sta5a %in% sta5as_to_include$sta5a)
+#
+cdw_refs_sta5a_month <- cc_refs_cdw %>%
+  mutate(cc_ref_month = ymd(str_c(year(ActivityDateTime), month_n, "01", sep = "-"))) %>%
+  group_by(cc_ref_month, fy_qtr, sta5a) %>%
+  summarise(pc_refs_total = n()) %>%
+  left_join(., pc_crh_penRate %>% select(sta5a, cc_ref_month = crh_month, crh_encounter_count)) %>%
+  left_join(., pcmm_sta5a_qtr) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000,
+         pc_crh_per_1k_pcmm_uniques = (crh_encounter_count / scrssn_count) * 1000,
+         has_both = if_else(is.na(pc_crh_per_1k_pcmm_uniques) == F 
+                            & pc_crh_per_1k_pcmm_uniques > 0 
+                            & is.na(pc_refs_per_10k_pcmm_uniques) == F, TRUE, FALSE)) %>%
+  inner_join(., crh_flag %>% filter(crh_10_flag == 1) %>% select(sta5a)) %>%
+  filter(fy > 2019 & has_both == T) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+```
+
+## Aggregated to the Sta5a-Month  
+* These are the `r nrow(cdw_refs_sta5a_month) %>% comma(accuracy = 1)` sta5a-months with at least 1 PC CRH Encounter and 1 PC Community Care Referral  
+
+```{r}
+color_pal <- ggsci::pal_lancet(palette = "lanonc")(5)
+#
+cdw_refs_sta5a_month %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_1k_pcmm_uniques)) +
+  geom_point(alpha = 0.4,
+             color = color_pal[2]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 1,000 Uniques")
+#
+cdw_refs_sta5a_month %>%
+  lm(pc_crh_per_1k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+### CBOCs Only  
+* These are the `r cdw_refs_sta5a_month %>% filter(str_detect(s_abbr, "CBOC") == T) %>% nrow() %>% comma(accuracy = 1)` sta5a-months with at least 1 PC CRH Encounter and 1 PC Community Care Referral 
+
+```{r}
+cdw_refs_sta5a_month %>%
+  filter(str_detect(s_abbr, "CBOC") == T) %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_1k_pcmm_uniques)) +
+  geom_point(alpha = 0.65,
+             color = color_pal[3]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 1,000 Uniques")
+#
+cdw_refs_sta5a_month %>%
+  filter(str_detect(s_abbr, "CBOC") == T) %>%
+  lm(pc_crh_per_1k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+### Before March 2020 Only      
+* These are the `r cdw_refs_sta5a_month %>% filter(cc_ref_month < ymd("2020-03-01")) %>% nrow() %>% comma(accuracy = 1)` sta5a-months with at least 1 PC CRH Encounter and 1 PC Community Care Referral
+
+```{r}
+cdw_refs_sta5a_month %>%
+  filter(cc_ref_month < ymd("2020-03-01")) %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_1k_pcmm_uniques)) +
+  geom_point(alpha = 0.65,
+             color = color_pal[4]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 1,000 Uniques")
+#
+cdw_refs_sta5a_month %>%
+  filter(cc_ref_month < ymd("2020-03-01")) %>%
+  lm(pc_crh_per_1k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+
+```{r pc_crh_sta5a_qtr}
+pc_crh_per_qtr <- pc_crh_penRate %>%
+  group_by(sta5a, fy_qtr) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T))
+#
+cdw_refs_sta5a_qtr <- cc_refs_cdw %>%
+  mutate(cc_ref_month = ymd(str_c(year(ActivityDateTime), month_n, "01", sep = "-"))) %>%
+  group_by(fy_qtr, sta5a) %>%
+  summarise(pc_refs_total = n()) %>%
+  left_join(., pc_crh_per_qtr) %>%
+  left_join(., pcmm_sta5a_qtr) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000,
+         pc_crh_per_1k_pcmm_uniques = (crh_encounter_count / scrssn_count) * 1000,
+         has_both = if_else(is.na(pc_crh_per_1k_pcmm_uniques) == F 
+                            & pc_crh_per_1k_pcmm_uniques > 0
+                            & is.na(pc_refs_per_10k_pcmm_uniques) == F, TRUE, FALSE)) %>%
+  inner_join(., crh_flag %>% filter(crh_10_flag == 1) %>% select(sta5a)) %>%
+  filter(fy > 2019 & has_both == T) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+```
+
+## Aggregated to the Sta5a-Quarter  
+* These are the `r nrow(cdw_refs_sta5a_qtr) %>% comma(accuracy = 1)` sta5a-quarters with at least 1 PC CRH Encounter and 1 PC Community Care Referral  
+
+```{r}
+color_pal <- ggsci::pal_jco("default")(5)
+#
+cdw_refs_sta5a_qtr %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_1k_pcmm_uniques)) +
+  geom_point(alpha = 0.4,
+             color = color_pal[3]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 1,000 Uniques")
+#
+cdw_refs_sta5a_qtr %>%
+  lm(pc_crh_per_1k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+### CBOCs Only  
+* These are the `r cdw_refs_sta5a_qtr %>% filter(str_detect(s_abbr, "CBOC") == T) %>% nrow() %>% comma(accuracy = 1)` sta5a-quarters with at least 1 PC CRH Encounter and 1 PC Community Care Referral
+
+```{r}
+cdw_refs_sta5a_qtr %>%
+  filter(str_detect(s_abbr, "CBOC") == T) %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_1k_pcmm_uniques)) +
+  geom_point(alpha = 0.45,
+             color = color_pal[4]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 1,000 Uniques")
+#
+cdw_refs_sta5a_qtr %>%
+  filter(str_detect(s_abbr, "CBOC") == T) %>%
+  lm(pc_crh_per_1k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+### First 3 Quarters of FY20 Only        
+* These are the `r cdw_refs_sta5a_qtr %>% filter(fy_qtr %in% c("2020_1", "2020_2", "2020_3")) %>% nrow() %>% comma(accuracy = 1)` sta5a-quarters with at least 1 PC CRH Encounter and 1 PC Community Care Referral 
+
+```{r}
+cdw_refs_sta5a_qtr %>%
+  filter(fy_qtr %in% c("2020_1", "2020_2", "2020_3")) %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_1k_pcmm_uniques)) +
+  geom_point(alpha = 0.65,
+             color = color_pal[5]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 1,000 Uniques")
+#
+cdw_refs_sta5a_qtr %>%
+  filter(fy_qtr %in% c("2020_1", "2020_2", "2020_3")) %>%
+  lm(pc_crh_per_1k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+
+## Aggregated to the Parent-Month   
+```{r}
+color_pal <- ggsci::pal_jco("default")(5)
+#
+pc_crh_penRate_parent_month <- pc_crh_penRate %>%
+  left_join(., vast %>% select(sta5a, parent_station_sta5a)) %>%
+  mutate(qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fy = if_else(qtr == 1, year(crh_month) + 1, year(crh_month)),
+         fy_qtr = str_c(fy, qtr, sep = "_")) %>%
+  group_by(parent_station_sta5a, crh_month, fy_qtr) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T))
+#--
+cdw_refs_parent_month <- cc_refs_cdw %>%
+  mutate(cc_ref_month = ymd(str_c(year(ActivityDateTime), month_n, "01", sep = "-"))) %>%
+  left_join(., vast %>% select(sta5a, parent_station_sta5a)) %>%
+  group_by(cc_ref_month, fy_qtr, parent_station_sta5a) %>%
+  summarise(pc_refs_total = n()) %>%
+  left_join(., pc_crh_penRate_parent_month, by = c("parent_station_sta5a", "fy_qtr", "cc_ref_month" = "crh_month")) %>%
+  left_join(., pcmm_parent_sta5a %>% mutate(fy_qtr = str_c(fy, qtr, sep = "_"))) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000,
+         pc_crh_per_10k_pcmm_uniques = (crh_encounter_count / scrssn_count) * 10000,
+         has_both = if_else(is.na(pc_crh_per_10k_pcmm_uniques) == F 
+                            & pc_crh_per_10k_pcmm_uniques > 0 
+                            & is.na(pc_refs_per_10k_pcmm_uniques) == F, TRUE, FALSE)) %>%
+  filter(fy > 2019 & has_both == T)
+```  
+
+* These are the `r nrow(cdw_refs_parent_month) %>% comma(accuracy = 1)` parent-sta5a-months with at least 1 PC CRH Encounter and 1 PC Community Care Referral  
+
+```{r}
+color_pal <- ggsci::pal_nejm("default")(5)
+#
+cdw_refs_parent_month %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_10k_pcmm_uniques)) +
+  geom_point(alpha = 0.45,
+             color = color_pal[1]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 10,000 Uniques")
+#
+cdw_refs_parent_month %>%
+  lm(pc_crh_per_10k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+### Before March 2020 Only      
+
+* These are the `r cdw_refs_parent_month %>% filter(cc_ref_month < ymd("2020-03-01")) %>% nrow() %>% comma(accuracy = 1)` parent-sta5a-months with at least 1 PC CRH Encounter and 1 PC Community Care Referral  
+
+```{r}
+cdw_refs_parent_month %>%
+  filter(cc_ref_month < ymd("2020-03-01")) %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_10k_pcmm_uniques)) +
+  geom_point(alpha = 0.45,
+             color = color_pal[2]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 10,000 Uniques")
+#
+cdw_refs_parent_month %>%
+  filter(cc_ref_month < ymd("2020-03-01")) %>%
+  lm(pc_crh_per_10k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+## Aggregated to the Parent-Quarter     
+```{r}
+pc_crh_penRate_parent_qtr <- pc_crh_penRate %>%
+  left_join(., vast %>% select(sta5a, parent_station_sta5a)) %>%
+  mutate(qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fy = if_else(qtr == 1, year(crh_month) + 1, year(crh_month)),
+         fy_qtr = str_c(fy, qtr, sep = "_")) %>%
+  group_by(parent_station_sta5a, fy_qtr) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T))
+#--
+cdw_refs_parent_qtr <- cc_refs_cdw %>%
+  mutate(cc_ref_month = ymd(str_c(year(ActivityDateTime), month_n, "01", sep = "-"))) %>%
+  left_join(., vast %>% select(sta5a, parent_station_sta5a)) %>%
+  group_by(fy_qtr, parent_station_sta5a) %>%
+  summarise(pc_refs_total = n()) %>%
+  left_join(., pc_crh_penRate_parent_qtr, by = c("parent_station_sta5a", "fy_qtr")) %>%
+  left_join(., pcmm_parent_sta5a %>% mutate(fy_qtr = str_c(fy, qtr, sep = "_"))) %>%
+  mutate(pc_refs_per_10k_pcmm_uniques = (pc_refs_total / scrssn_count) * 10000,
+         pc_crh_per_10k_pcmm_uniques = (crh_encounter_count / scrssn_count) * 10000,
+         has_both = if_else(is.na(pc_crh_per_10k_pcmm_uniques) == F 
+                            & pc_crh_per_10k_pcmm_uniques > 0 
+                            & is.na(pc_refs_per_10k_pcmm_uniques) == F, TRUE, FALSE)) %>%
+  filter(fy > 2019 & has_both == T)
+```  
+
+* These are the `r nrow(cdw_refs_parent_qtr) %>% comma(accuracy = 1)` parent-sta5a-quarters with at least 1 PC CRH Encounter and 1 PC Community Care Referral  
+
+```{r}
+cdw_refs_parent_qtr %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_10k_pcmm_uniques)) +
+  geom_point(alpha = 0.45,
+             color = color_pal[3]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 10,000 Uniques")
+#
+cdw_refs_parent_qtr %>%
+  lm(pc_crh_per_10k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```
+
+
+### First 3 Quarters of FY20 Only   
+
+* These are the `r cdw_refs_parent_qtr %>% filter(fy_qtr %in% c("2020_1", "2020_2", "2020_3")) %>% nrow() %>% comma(accuracy = 1)` parent-sta5a-months with at least 1 PC CRH Encounter and 1 PC Community Care Referral  
+
+```{r}
+cdw_refs_parent_qtr %>%
+  filter(fy_qtr %in% c("2020_1", "2020_2", "2020_3")) %>%
+  ggplot(data = .,
+       aes(x = pc_refs_per_10k_pcmm_uniques, y = pc_crh_per_10k_pcmm_uniques)) +
+  geom_point(alpha = 0.45,
+             color = color_pal[4]) + 
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "PC CC Referrals per 10,000 Uniques",
+       y = "PC CRH Encounters per 10,000 Uniques")
+#
+cdw_refs_parent_month %>%
+  filter(fy_qtr %in% c("2020_1", "2020_2", "2020_3")) %>%
+  lm(pc_crh_per_10k_pcmm_uniques ~ pc_refs_per_10k_pcmm_uniques, data = .) %>%
+  summary()
+```

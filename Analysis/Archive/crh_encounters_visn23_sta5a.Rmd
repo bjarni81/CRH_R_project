@@ -1,0 +1,332 @@
+---
+title: "VISN 23 - CRH Encounters at Sta5a"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = TRUE,
+                      fig.width = 12, fig.height = 12)
+
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(ggthemes)
+library(kableExtra)
+library(lubridate)
+library(scales)
+library(grid)
+library(DT)
+library(RODBC)
+library(DBI)
+library(janitor)
+library(here)
+#
+source(here("Input", "Functions", "customFacetWrap.R"))
+#
+options(scipen = 999)
+###
+`%ni%` <- negate(`%in%`)
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Truested_Connection = "true")
+#=============
+theme_update(
+  strip.text = element_text(size = 20),
+  axis.text = element_text(size = 15),
+  axis.title.y = element_text(size = 18),
+  axis.title.x = element_blank(),
+  axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+  legend.text = element_text(size = 14),
+  plot.title = element_text(size = 20),
+  legend.title = element_blank()
+)
+```
+
+```{r reading-in}
+access_metrics_sta5a <- read_csv(here("Input", "Data", "pc_access_metrics.csv")) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_parent <- read_csv(here("Input", "Data", "pc_access_metrics_parent.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_visn <- read_csv(here("Input", "Data", "pc_access_metrics_visn.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_nat <- read_csv(here("Input", "Data", "pc_access_metrics_nat.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+vast <- read_csv(here("Input","Data","VAST_from_A06_11jan21.csv"))
+#
+crh_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].crh_encounters_deDup") %>%
+  mutate(crh_month = ymd(crh_month)) %>%
+  filter(crh_month > ymd("2019-09-01") & care_type != "Missing crh") %>%
+  mutate(care_type = str_remove(care_type, " crh"))
+```
+
+
+# CRH Encounters - Parent Station (618) Minneapolis, MN        
+
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "618") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = name_lab)) +
+  geom_line(size = 1, color = "red") +
+  facet_wrap(~name_lab) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#
+
+crh_encounters %>%
+  filter(parent_station_sta5a == "618") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, care_type, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  facet_wrap(~name_lab) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+```
+
+
+# CRH Encounters - Parent Station (568) Fort Meade, SD   
+
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "568") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = name_lab)) +
+  geom_line(size = 1, color = "red") +
+  facet_wrap(~name_lab) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#
+
+crh_encounters %>%
+  filter(parent_station_sta5a == "568") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, care_type, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  facet_wrap(~name_lab) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+```
+
+
+
+# CRH Encounters - Parent Station (438) Sioux Falls, SD    
+
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "438") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = name_lab)) +
+  geom_line(size = 1, color = "red") +
+  facet_wrap(~name_lab) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#
+
+crh_encounters %>%
+  filter(parent_station_sta5a == "438") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, care_type, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  facet_wrap(~name_lab) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+```
+
+
+# CRH Encounters - Parent Station (636) Omaha, NE      
+
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "636") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = name_lab)) +
+  geom_line(size = 1, color = "red") +
+  facet_wrap(~name_lab) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#
+
+crh_encounters %>%
+  filter(parent_station_sta5a == "636") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, care_type, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  facet_wrap(~name_lab) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+```
+
+
+
+# CRH Encounters - Parent Station (636A6) Des Moines, IA        
+
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "636A6") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = name_lab)) +
+  geom_line(size = 1, color = "red") +
+  facet_wrap(~name_lab) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#
+
+crh_encounters %>%
+  filter(parent_station_sta5a == "636A6") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, care_type, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  facet_wrap(~name_lab) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+```
+
+
+# CRH Encounters - Parent Station (636A8) Iowa City, IA        
+
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "636A8") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = name_lab)) +
+  geom_line(size = 1, color = "red") +
+  facet_wrap(~name_lab) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#
+
+crh_encounters %>%
+  filter(parent_station_sta5a == "636A8") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, care_type, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  facet_wrap(~name_lab) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+```
+
+
+# CRH Encounters - Parent Station (656) St. Cloud, MN        
+
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "656") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = name_lab)) +
+  geom_line(size = 1, color = "red") +
+  facet_wrap(~name_lab) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#
+
+crh_encounters %>%
+  filter(parent_station_sta5a == "656") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, care_type, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  facet_wrap(~name_lab) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+```
+
+
+# CRH Encounters - Parent Station (437) Fargo, ND        
+
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "437") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = name_lab)) +
+  geom_line(size = 1, color = "red") +
+  facet_wrap(~name_lab) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#
+
+crh_encounters %>%
+  filter(parent_station_sta5a == "437") %>%
+  mutate(name_lab = paste0("(", spoke_sta5a, ") ", short_name)) %>%
+  group_by(crh_month, care_type, name_lab) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  facet_wrap(~name_lab) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+```

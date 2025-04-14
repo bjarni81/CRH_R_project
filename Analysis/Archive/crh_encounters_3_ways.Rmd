@@ -1,0 +1,427 @@
+---
+title: "CRH Encounters: 3 Versions"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = '-')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(ggrepel)
+#---------
+theme_update(axis.title = element_text(size = 24),
+             axis.text.y = element_text(size = 18),
+             axis.text.x = element_text(size = 18, angle = 270, hjust = 0.3, vjust = 0.3),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+```
+
+```{r reading-in}
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#=========================
+`%ni%` <- negate(`%in%`)
+#---- Instutution name lookup table
+institution_lookup <- dbGetQuery(oabi_con,
+                                 "select distinct a.InstitutionName, b.Sta6a
+                                  from [CDWWork].[Dim].Institution as a
+                                  left join [CDWWork].[Dim].Division as b
+                                  	on a.InstitutionSID = b.InstitutionSID
+                                  where b.Sta6a IS NOT NULL and a.InstitutionName <> '*Missing*'") %>%
+  rename_all(tolower)
+#== Hub sites
+hubs <- dbGetQuery(oabi_con,
+                   "select distinct hub_sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY20_working]
+                    UNION 
+                    select distinct Hub_Sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY21_working]") %>%
+  pull
+#== Spoke sites
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#== spoke sites - vector
+spokes_v <- spokes %>% pull
+#== vast file
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#== limiting to spokes only
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#== all 24 months for filling-in
+all_months <- seq.Date(ymd('2019-10-01'),ymd('2021-09-01'), by = 'month')
+#-- total encounters
+all_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].encounter_counts") %>%
+  select(-contains("Vax")) %>%
+  mutate(vizMonth = ymd(vizMonth)) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name),
+         spoke_flag = if_else(sta6a %in% spokes_v, TRUE, FALSE),
+         fy = if_else(month(vizMonth) > 9, year(vizMonth) + 1, year(vizMonth)),
+         qtr = case_when(month(vizMonth) %in% c(10, 11, 12) ~ 1,
+                         month(vizMonth) %in% c(1, 2, 3) ~ 2,
+                         month(vizMonth) %in% c(4, 5, 6) ~ 3,
+                         month(vizMonth) %in% c(7, 8, 9) ~ 4)) %>%
+  filter(is.na(parent_visn) == F & fy %in% c(2020, 2021)) %>%
+  rename("Primary Care" = pc_encounters,
+         "Mental Health" = mh_encounters,
+         "Pharmacy" = pharmacy_encounters,
+         "PCMHI" = pcmhi_encounters)
+#Limiting to spokes only
+spoke_encounters <- all_encounters %>% filter(spoke_flag == T)
+#== Version 1
+crh_encounters_v1 <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].crh_encounters_deDup") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(visitdate) > 9, year(visitdate) + 1, year(visitdate))) %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing"))
+#== Version 2
+crh_encounters_v2 <- dbGetQuery(oabi_con,
+                                "select * from [OABI_MyVAAccess].[crh_eval].crh_encounters_deDup_v2") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(visitdate) > 9, year(visitdate) + 1, year(visitdate))) %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  left_join(., vast, by = c("spoke_sta5a" = "sta5a"))
+##------------ data from VISN 23
+v23_dina_check <- read_xlsx("H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/CRH_r_project/Input/Data/CRH_PCAT_Check.xlsx") %>%
+  rename_all(tolower) %>%
+  left_join(., institution_lookup) %>%
+  mutate(psc = as.numeric(str_sub(stopcodename, start = 2, end = 4)),
+         ssc = if_else(creditstopname == "NULL", NA_real_, as.numeric(str_sub(creditstopname, start = 2, end = 4))),
+         care_type = 
+           case_when(
+             (psc %in% c(156, 176, 177, 178, 301, 322, 323, 338, 348) 
+              & (ssc != 160 | is.na(ssc) == T)) 
+             | (psc != 160 
+                & ssc %in% c(156, 176, 177, 178, 301, 322, 323, 338, 348))    ~ "Primary Care",
+             (psc %in% c(502, 509, 510, 513, 516, 527, 538, 545, 550, 562, 576, 579, 586, 587) 
+              & (ssc %ni% c(160, 534) | is.na(ssc) == T)) 
+             | (psc %ni% c(160, 534)
+                & ssc %in% c(502, 509, 510, 513, 516, 527, 538, 545, 550, 
+                                    562, 576, 579, 586, 587))                  ~ "Mental Health",
+             (psc %in% c(534, 539) 
+              & (ssc != 160 | is.na(ssc) == T)) 
+             | (psc != 160 & ssc %in% c(534, 539)) ~ "PCMHI",
+             psc == 160 | ssc == 160  ~ "Pharmacy",
+             is.na(psc) == T ~ "Missing",
+             TRUE                                                                          ~ "Specialty"),
+         visitdate = as_date(visitdatetime),
+         hub_flag = if_else(sta6a %in% hubs, 2, 1),
+         visit_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(visitdate) > 9, year(visitdate) + 1, year(visitdate)),
+         qtr = case_when(month(visitdate) %in% c(10, 11, 12) ~ 1,
+                         month(visitdate) %in% c(1, 2, 3) ~ 2,
+                         month(visitdate) %in% c(4, 5, 6) ~ 3,
+                         month(visitdate) %in% c(7, 8, 9) ~ 4)) %>%
+  arrange(`pat id`, visitdatetime, hub_flag) %>%
+  group_by(`pat id`, visitdatetime, care_type) %>%
+  mutate(rowNum = row_number()) %>%
+  ungroup
+```
+
+# National   
+
+```{r national-data}
+nat_tot_crh_v1 <- crh_encounters_v1 %>%
+  group_by(crh_month) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "Version 1")
+#
+nat_tot_crh_v2 <- crh_encounters_v2 %>%
+  group_by(crh_month) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "Version 2")
+#--
+nat_tot_df <- nat_tot_crh_v1 %>%
+  bind_rows(., nat_tot_crh_v2)
+#------------
+nat_type_crh_v1 <- crh_encounters_v1 %>%
+  group_by(crh_month, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "Version 1")
+#
+nat_type_crh_v2 <- crh_encounters_v2 %>%
+  group_by(crh_month, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "Version 2")
+#--
+nat_type_df <- nat_type_crh_v1 %>%
+  bind_rows(., nat_type_crh_v2)
+```
+
+## Total  
+
+```{r national-total-plot}
+ggplot(data = nat_tot_df,
+       aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+## By Care Type   
+```{r national-care-type-plot}
+ggplot(data = nat_type_df,
+       aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~care_type)
+  
+```
+
+# All VISNs 
+```{r visn_data}
+visn_tot_crh_v1 <- crh_encounters_v1 %>%
+  group_by(crh_month, parent_visn) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "Version 1")
+#
+visn_tot_crh_v2 <- crh_encounters_v2 %>%
+  group_by(crh_month, parent_visn) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "Version 2")
+#--
+visn_tot_df <- visn_tot_crh_v1 %>%
+  bind_rows(., visn_tot_crh_v2)
+#--========
+visn_type_crh_v1 <- crh_encounters_v1 %>%
+  group_by(crh_month, parent_visn, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "Version 1")
+#
+visn_type_crh_v2 <- crh_encounters_v2 %>%
+  group_by(crh_month, parent_visn, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "Version 2")
+#--
+visn_type_df <- visn_type_crh_v1 %>%
+  bind_rows(., visn_type_crh_v2)
+```
+
+## Total  
+
+```{r}
+visn_tot_df %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_d3() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+```
+
+## By Care Type  
+### Mental Health  
+```{r}
+visn_type_df %>%
+  filter(is.na(parent_visn) == F & care_type == "Mental Health") %>%
+  ggplot(data = ., 
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+```
+
+  
+### Primary Care    
+```{r}
+visn_type_df %>%
+  filter(is.na(parent_visn) == F & care_type == "Primary Care") %>%
+  ggplot(data = ., 
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_igv() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+```
+
+### Pharmacy      
+```{r}
+visn_type_df %>%
+  filter(is.na(parent_visn) == F & care_type == "Pharmacy") %>%
+  ggplot(data = ., 
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_lancet() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+```
+
+### PCMHI        
+```{r}
+visn_type_df %>%
+  filter(is.na(parent_visn) == F & care_type == "PCMHI") %>%
+  ggplot(data = ., 
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_simpsons() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+```
+
+
+# VISN 20  
+
+## Total  
+```{r visn-20-total-plot}
+visn_tot_df %>%
+  filter(parent_visn == 20) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_jco() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+## By Care Type  
+```{r visn-20-type-plot}
+visn_type_df %>%
+  filter(parent_visn == 20) %>%
+  ggplot(data = ., 
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~care_type)
+```
+
+# VISN 23   
+```{r visn-23-data}
+dina_nat_tot <- v23_dina_check %>%
+  filter(rowNum == 1 & care_type %ni% c("Missing", "Specialty")) %>%
+  rename(crh_month = visit_month) %>%
+  group_by(crh_month) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "VISN 23")
+#
+dina_nat_type <- v23_dina_check %>%
+  filter(rowNum == 1 & care_type %ni% c("Missing", "Specialty")) %>%
+  rename(crh_month = visit_month) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(version = "VISN 23") 
+```
+
+## Total  
+```{r visn-23-total-plot}
+visn_tot_df %>%
+  filter(parent_visn == 23) %>%
+  select(-parent_visn) %>%
+  bind_rows(., dina_nat_tot) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_lancet() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+## By Care Type  
+```{r visn-23-type-plot}
+visn_type_df %>%
+  filter(parent_visn == 23) %>%
+  select(-parent_visn) %>%
+  bind_rows(., dina_nat_type) %>%
+  ggplot(data = ., 
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~care_type)
+```

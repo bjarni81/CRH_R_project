@@ -1,0 +1,520 @@
+---
+title: "CRH Encounters per 1,000 Total Encounters"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = '-')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 15),
+             strip.text = element_text(size = 15),
+             legend.text = element_text(size = 14),
+             legend.title = element_text(size = 16),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#==
+all_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].encounter_counts") %>%
+  select(-contains("Vax")) %>%
+  mutate(vizMonth = ymd(vizMonth)) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name),
+         spoke_flag = if_else(sta6a %in% spokes_v, TRUE, FALSE),
+         fy = if_else(month(vizMonth) > 9, year(vizMonth) + 1, year(vizMonth)),
+         qtr = case_when(month(vizMonth) %in% c(10, 11, 12) ~ 1,
+                         month(vizMonth) %in% c(1, 2, 3) ~ 2,
+                         month(vizMonth) %in% c(4, 5, 6) ~ 3,
+                         month(vizMonth) %in% c(7, 8, 9) ~ 4)) %>%
+  filter(is.na(parent_visn) == F & fy %in% c(2020, 2021)) %>%
+  rename("Primary Care" = pc_encounters,
+         "Mental Health" = mh_encounters,
+         "Pharmacy" = pharmacy_encounters,
+         "PCMHI" = pcmhi_encounters)
+#
+spoke_encounters <- all_encounters %>% filter(spoke_flag == T)
+#==
+crh_encounters <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].crh_encounters_deDup") %>%
+  rename_all(tolower) %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  mutate(crh_month = ymd(crh_month))
+```
+
+
+# National - Total    
+```{r}
+crh_nat_total <- crh_encounters %>%
+  group_by(crh_month) %>%
+  summarise(crh_encounters = n())
+#
+all_nat_total <- spoke_encounters %>%
+  select(2:6) %>%
+  pivot_longer(-vizMonth) %>%
+  group_by(vizMonth) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+total_df <- crh_nat_total %>%
+  left_join(., all_nat_total, by = c("crh_month" = "vizMonth")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000)
+#
+tot_1 <- ggplot(data = total_df,
+         aes(x = crh_month, y = crh_per_1k_total, color = "1")) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+#
+tot_2 <- crh_nat_total %>%
+  left_join(., all_nat_total, by = c("crh_month" = "vizMonth")) %>%
+  pivot_longer(., -crh_month) %>%
+  mutate(name_lab = if_else(name == "total", "Total", "CRH")) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  labs(x = "Month", 
+       y = "Encounters") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(legend.title = element_blank())
+#--
+multiplot(tot_1, tot_2, cols = 2)
+```
+
+
+# National - By Type      
+```{r}
+crh_nat_type <- crh_encounters %>%
+  group_by(crh_month, care_type) %>%
+  summarise(crh_encounters = n())
+#
+all_nat_type <- spoke_encounters %>%
+  select(2:6) %>%
+  pivot_longer(-vizMonth) %>%
+  group_by(vizMonth, name) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+type_nat_df <- crh_nat_type %>%
+  left_join(., all_nat_type, by = c("crh_month" = "vizMonth", "care_type" = "name")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000)
+#
+noPCMHI_1 <- ggplot(data = subset(type_nat_df, care_type != "PCMHI"),
+         aes(x = crh_month, y = crh_per_1k_total, group = care_type, color = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  ggsci::scale_color_aaas() +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters") +
+  facet_wrap(~care_type) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+#
+noPCMHI_2 <- type_nat_df %>%
+  select(-crh_per_1k_total) %>%
+  filter(care_type != "PCMHI") %>%
+  pivot_longer(-c(crh_month, care_type)) %>%
+  mutate(name_lab = if_else(name == "total", "Total", "CRH")) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  labs(x = "Month",
+       y = "Encounters") +
+  facet_wrap(~care_type) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = scales::comma_format())
+#
+multiplot(noPCMHI_1, noPCMHI_2, cols = 2)
+#
+ggplot(data = subset(type_nat_df, care_type == "PCMHI"),
+         aes(x = crh_month, y = crh_per_1k_total, group = care_type, color = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  ggsci::scale_color_aaas() +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters") +
+  facet_wrap(~care_type) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+
+# VISN - Total  
+```{r}
+crh_visn_total <- crh_encounters %>%
+  group_by(crh_month, parent_visn) %>%
+  summarise(crh_encounters = n())
+#
+all_visn_total <- spoke_encounters %>%
+  select(2:6, parent_visn) %>%
+  pivot_longer(-c(vizMonth, parent_visn)) %>%
+  group_by(vizMonth, parent_visn) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+total_visn_df <- crh_visn_total %>%
+  left_join(., all_visn_total, by = c("crh_month" = "vizMonth", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F)
+#
+ggplot(data = total_visn_df,
+         aes(x = crh_month, y = crh_per_1k_total, group = parent_visn, color = "1")) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.5)) +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+# VISN - By Type      
+```{r}
+crh_visn_type <- crh_encounters %>%
+  group_by(crh_month, parent_visn, care_type) %>%
+  summarise(crh_encounters = n())
+#
+all_visn_type <- spoke_encounters %>%
+  select(2:6, parent_visn) %>%
+  pivot_longer(-c(vizMonth, parent_visn)) %>%
+  group_by(vizMonth, parent_visn, name) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+type_visn_df <- crh_visn_type %>%
+  left_join(., all_visn_type, by = c("crh_month" = "vizMonth", "care_type" = "name", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F)
+#
+ggplot(data = subset(type_visn_df, care_type != "PCMHI"),
+         aes(x = crh_month, y = crh_per_1k_total, group = care_type, color = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.5)) +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+#
+ggplot(data = subset(type_visn_df, care_type == "PCMHI"),
+         aes(x = crh_month, y = crh_per_1k_total, group = care_type, color = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.5)) +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+# Parent Stations, CRH/1,000 total - Caterpillar Plot  
+```{r, fig.width = 7, fig.height = 7}
+all_parent_total <- spoke_encounters %>%
+  select(vizMonth, 3:6, parent_station_sta5a) %>%
+  pivot_longer(-c(vizMonth, parent_station_sta5a)) %>%
+  group_by(vizMonth, parent_station_sta5a) %>%
+  summarise(total_encounters = sum(value, na.rm = T))
+#
+crh_parent_total <- crh_encounters %>%
+  group_by(crh_month, parent_station_sta5a) %>%
+  summarise(crh_encounters = n())
+#--
+parent_total_summary_df <- crh_parent_total %>%
+  left_join(., all_parent_total, by = c("crh_month" = "vizMonth", "parent_station_sta5a" = "parent_station_sta5a")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total_encounters * 1000) %>%
+  group_by(parent_station_sta5a) %>%
+  summarise(mean_crh_per_1k_tot = mean(crh_per_1k_total, na.rm = T),
+            sd_crh_per_1k_tot = sd(crh_per_1k_total, na.rm = T)) %>%
+  left_join(., vast %>% select(sta5a, short_name, parent_visn), by = c("parent_station_sta5a" = "sta5a")) %>%
+  mutate(VISN = str_pad(parent_visn, side = "left", width = 2, pad = "0"),
+         sta5a_lab = paste0("(", "V", VISN, "-", parent_station_sta5a, ") ", short_name)) %>%
+  filter(is.na(parent_visn) == F & mean_crh_per_1k_tot < 100 & mean_crh_per_1k_tot > 1)
+#---
+#==
+crh_parent_total %>%
+  left_join(., all_parent_total, by = c("crh_month" = "vizMonth", "parent_station_sta5a" = "parent_station_sta5a")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total_encounters * 1000) %>%
+  group_by(parent_station_sta5a) %>%
+  summarise(mean_crh_per_1k_tot = mean(crh_per_1k_total, na.rm = T),
+            sd_crh_per_1k_tot = sd(crh_per_1k_total, na.rm = T)) %>%
+  left_join(., vast %>% select(sta5a, short_name, parent_visn), by = c("parent_station_sta5a" = "sta5a")) %>%
+  mutate(VISN = str_pad(parent_visn, side = "left", width = 2, pad = "0"),
+         sta5a_lab = paste0("(", "V", VISN, "-", parent_station_sta5a, ") ", short_name)) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  geom_hline(yintercept = 100, lty = 3) +
+  scale_y_continuous(labels = scales::comma_format(),
+                     breaks = c(0, 100, 500, 1000, 1500)) +
+  theme(axis.text.x = element_blank()) +
+  labs(x = "Parent Station",
+       y = "Mean CRH/1,000 Total, +/- SD",
+       title = "All Observations")
+```
+
+```{r}
+#==
+ggplot(data = subset(parent_total_summary_df, mean_crh_per_1k_tot < 100 & mean_crh_per_1k_tot > 1),
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_blank()) +
+  labs(x = "Parent Station",
+       y = "Mean CRH/1,000 Total, +/- SD",
+       caption = "*Removed 5 observations with > 100 and 6 with < 1",
+       title = "All Together")
+#==
+ggplot(data = subset(parent_total_summary_df, mean_crh_per_1k_tot < 100 & mean_crh_per_1k_tot > 1),
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_blank()) +
+  labs(x = "Parent Station",
+       y = "Mean CRH/1,000 Total, +/- SD",
+       caption = "*Removed 5 observations with > 100 and 6 with < 1",
+       title = "Faceted by VISN") +
+  facet_wrap(~VISN)
+```
+
+## Top 25  
+```{r}
+parent_total_summary_df %>%
+  slice_max(., order_by = mean_crh_per_1k_tot, n = 25) %>%
+  ggplot(data = .,
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "Mean CRH/1,000 Total, +/- SD",
+       caption = "*Removed 5 observations with > 100")
+```
+
+## Bottom 25  
+```{r}
+parent_total_summary_df %>%
+  slice_min(., order_by = mean_crh_per_1k_tot, n = 25) %>%
+  ggplot(data = .,
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "Mean CRH/1,000 Total, +/- SD",
+       caption = "*Removed 6 observations with < 1")
+```
+
+# Parent Stations, Mental Health CRH/1,000 Mental Health total - Caterpillar Plot  
+```{r}
+all_parent_type <- spoke_encounters %>%
+  select(vizMonth, 3:6, parent_station_sta5a) %>%
+  pivot_longer(-c(vizMonth, parent_station_sta5a)) %>%
+  group_by(vizMonth, parent_station_sta5a, name) %>%
+  summarise(total_encounters = sum(value, na.rm = T))
+#
+crh_parent_type <- crh_encounters %>%
+  group_by(crh_month, parent_station_sta5a, care_type) %>%
+  summarise(crh_encounters = n())
+#--
+parent_type_summary_df <- crh_parent_type %>%
+  left_join(., all_parent_type, by = c("crh_month" = "vizMonth", 
+                                       "parent_station_sta5a" = "parent_station_sta5a",
+                                       "care_type" = "name")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total_encounters * 1000) %>%
+  group_by(parent_station_sta5a, care_type) %>%
+  summarise(mean_crh_per_1k_tot = mean(crh_per_1k_total, na.rm = T),
+            sd_crh_per_1k_tot = sd(crh_per_1k_total, na.rm = T)) %>%
+  left_join(., vast %>% select(sta5a, short_name, parent_visn), by = c("parent_station_sta5a" = "sta5a")) %>%
+  mutate(VISN = str_pad(parent_visn, side = "left", width = 2, pad = "0"),
+         sta5a_lab = paste0("(", "V", VISN, "-", parent_station_sta5a, ") ", short_name)) %>%
+  filter(is.na(parent_visn) == F & mean_crh_per_1k_tot < 100 & mean_crh_per_1k_tot > 1)
+#===
+
+#==
+ggplot(data = subset(parent_type_summary_df, care_type == "Mental Health"),
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_blank()) +
+  labs(x = "Parent Station",
+       y = "Mean MH CRH/1,000 MH Total, +/- SD",
+       title = "All Together")
+#==
+ggplot(data = subset(parent_type_summary_df, care_type == "Mental Health"),
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_blank()) +
+  labs(x = "Parent Station",
+       y = "Mean MH CRH/1,000 MH Total, +/- SD",
+       title = "Faceted by VISN") +
+  facet_wrap(~VISN)
+```
+
+## Top 25  
+```{r}
+parent_type_summary_df %>%
+  filter(care_type == "Mental Health") %>% ungroup %>%
+  slice_max(., order_by = mean_crh_per_1k_tot, n = 25) %>%
+  ggplot(data = .,
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "Mean MH CRH/1,000 MH Total, +/- SD")
+```
+
+## Bottom 25  
+```{r}
+parent_type_summary_df %>%
+  filter(care_type == "Mental Health") %>% ungroup %>%
+  slice_min(., order_by = mean_crh_per_1k_tot, n = 25) %>%
+  ggplot(data = .,
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "Mean MH CRH/1,000 MH Total, +/- SD")
+```
+
+
+# Parent Stations, Primary Care CRH/1,000 Primary Care total - Caterpillar Plot  
+```{r}
+#==
+ggplot(data = subset(parent_type_summary_df, care_type == "Primary Care"),
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_blank()) +
+  labs(x = "Parent Station",
+       y = "Mean PC CRH/1,000 PC Total, +/- SD",
+       title = "All Together")
+#==
+ggplot(data = subset(parent_type_summary_df, care_type == "Primary Care"),
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_blank()) +
+  labs(x = "Parent Station",
+       y = "Mean PC CRH/1,000 PC Total, +/- SD",
+       title = "Faceted by VISN") +
+  facet_wrap(~VISN)
+```
+
+## Top 25  
+```{r}
+parent_type_summary_df %>%
+  filter(care_type == "Primary Care") %>% ungroup %>%
+  slice_max(., order_by = mean_crh_per_1k_tot, n = 25) %>%
+  ggplot(data = .,
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "Mean PC CRH/1,000 PC Total, +/- SD")
+```
+
+## Bottom 25  
+```{r}
+parent_type_summary_df %>%
+  filter(care_type == "Primary Care") %>% ungroup %>%
+  slice_min(., order_by = mean_crh_per_1k_tot, n = 25) %>%
+  ggplot(data = .,
+       aes(x = reorder(sta5a_lab, mean_crh_per_1k_tot), y = mean_crh_per_1k_tot,
+           ymin = mean_crh_per_1k_tot - sd_crh_per_1k_tot, ymax = mean_crh_per_1k_tot + sd_crh_per_1k_tot,
+           color = VISN)) +
+  geom_point() +
+  geom_errorbar() +
+  theme(axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "Mean PC CRH/1,000 PC Total, +/- SD")
+```

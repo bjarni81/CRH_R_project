@@ -1,0 +1,456 @@
+---
+title: "Pre-COVID Analysis: Contrasting 3 models"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v5_noCRH_among_controls.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(vssc_month = seq.Date(ymd("2018-10-01"), ymd("2020-02-01"), "1 month")) %>%
+  rowid_to_column(., var = "time") %>%
+  mutate(time2 = time - 13)
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include <- ps_matched %>% 
+  filter(sta5a %in% crh_sta5as) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a, at_least_10_pc_crh_flag) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH"),
+                           ordered = TRUE,
+                           levels = c("PC CRH", "No PC CRH")))
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      filter(vssc_month < ymd("2020-03-01") 
+             & vssc_month > ymd("2018-09-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%#add time column
+  group_by(sta5a) %>%
+  mutate(treat = factor(case_when(
+    sta5a %in% crh_sta5as ~ "PC CRH",
+    TRUE ~ "Control")),
+         post = factor(if_else(vssc_month > ymd("2019-09-01"), 
+                               "Post Intervention (i.e., FY20)",
+                               "Pre-Intervention (i.e., FY19)")),
+    tx_fe = if_else(treat == "PC CRH", 1, 0),
+    post_fe = if_else(post == "Post Intervention (i.e., FY20)", 1, 0)) %>%
+  ungroup %>%
+  left_join(., covariates) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#
+analytic_df$post <- relevel(analytic_df$post, ref = "Pre-Intervention (i.e., FY19)")
+analytic_df$treat <- relevel(analytic_df$treat, ref = 'Control')
+```
+
+```{r}
+#propensity score matched sta5as if being used
+ps_matched2 <- read_csv(here("Input","Data", "ps_matched_sta5as_v5.csv"))
+#
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include2 <- ps_matched2 %>% 
+  filter(sta5a %in% crh_sta5as) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched2) %>%
+  select(sta5a, at_least_10_pc_crh_flag) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH"),
+                           ordered = TRUE,
+                           levels = c("PC CRH", "No PC CRH")))
+#=================
+#making the analytic dataset
+analytic_df2 <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include2) %>%#restrict to our table from above
+      filter(vssc_month < ymd("2020-03-01") 
+             & vssc_month > ymd("2018-09-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%#add time column
+  group_by(sta5a) %>%
+  mutate(treat = factor(case_when(
+    sta5a %in% crh_sta5as ~ "PC CRH",
+    TRUE ~ "Control")),
+         post = factor(if_else(vssc_month > ymd("2019-09-01"), 
+                               "Post Intervention (i.e., FY20)",
+                               "Pre-Intervention (i.e., FY19)")),
+    tx_fe = if_else(treat == "PC CRH", 1, 0),
+    post_fe = if_else(post == "Post Intervention (i.e., FY20)", 1, 0)) %>%
+  ungroup %>%
+  left_join(., covariates) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#
+analytic_df2$post <- relevel(analytic_df2$post, ref = "Pre-Intervention (i.e., FY19)")
+analytic_df2$treat <- relevel(analytic_df2$treat, ref = 'Control')
+```
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a comparison of 3 pre-COVID analyses: the original analysis and two sensitivity analyses
+
+## Decision Points  
+
+* Per our discussion on 5/4 I have generated a document to contrast the three pre-COVID analyses we have been discussing:
+    + The original analysis with two 2-way interactions
+    + A restricted analysis with two 2-way interactions
+    + A restricted analysis with a 3-way interaction
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + There are two analytic datasets 
+    + The original dataset has `r analytic_df2 %>% select(sta5a) %>% n_distinct` sta5as
+        + I am not sure where or when I lost 6 sta5as
+    + The restricted dataset has `r analytic_df %>% select(sta5a) %>% n_distinct` sta5as
+    
+* Description of _Propensity Score_ matching
+    + This report uses two varieties of __Propensity Score v5.0__
+    + The original PS model v5.0 consists of 
+        + Covariates matched on their average values in FY18 Q4
+        + Outcomes matched on their average values over FY19
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+        + VISN - Exact
+    + The restricted version restricts the pool of potential controls to those sta5as that have never had a PC CRH encounter
+
+
+# Established Patient Wait Time, 3-Ways  
+
+```{r}
+bline_trend_est <- lmer(est_pc_pt_wt ~ treat * post    
+                     + time2 * treat 
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df2,
+                     REML = TRUE)
+#
+bline_trend_est2 <- lmer(est_pc_pt_wt ~ treat * post    
+                     + time2 * treat 
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+bline_trend_est3 <- lmer(est_pc_pt_wt ~ treat * post * time2  
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+```
+
+```{r}
+est1_pred <- ggeffects::ggpredict(bline_trend_est,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Original")
+#
+est2_pred <- ggeffects::ggpredict(bline_trend_est2,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Restricted")
+#
+est3_pred <- ggeffects::ggpredict(bline_trend_est3,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Restricted, 3-way")
+#--
+pred_est <- est1_pred %>%
+  bind_rows(., est2_pred) %>%
+  bind_rows(., est3_pred)
+#--
+ggplot(data = pred_est,
+         aes(x = vssc_month, y = predicted, group = facet, color = facet)) +
+  geom_line(data = subset(pred_est, vssc_month < ymd("2019-10-01") & group == "Pre-Intervention (i.e., FY19)"),
+            size = 1) +
+  geom_line(data = subset(pred_est, vssc_month > ymd("2019-09-01") & group != "Pre-Intervention (i.e., FY19)"),
+            size = 1) +
+  scale_y_continuous(limits = c(0, NA)) +
+  ggthemes::scale_color_colorblind() +
+  theme(legend.position = "bottom",
+        axis.title = element_blank()) +
+  labs(y = "Predicted Value") +
+  facet_wrap(~analysis)
+```
+
+```{r}
+tab_model(bline_trend_est, bline_trend_est2, bline_trend_est3,
+          dv.labels = c("Original", "Restricted", "Restricted, 3-way"),
+          show.se = TRUE,
+          show.ci = FALSE)
+```
+
+
+# New Patient Wait Time, 3-Ways  
+
+```{r}
+bline_trend_new <- lmer(new_pc_pt_wt ~ treat * post    
+                     + time2 * treat 
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df2,
+                     REML = TRUE)
+#
+bline_trend_new2 <- lmer(new_pc_pt_wt ~ treat * post    
+                     + time2 * treat 
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+bline_trend_new3 <- lmer(new_pc_pt_wt ~ treat * post * time2  
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+```
+
+```{r}
+new1_pred <- ggeffects::ggpredict(bline_trend_new,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Original")
+#
+new2_pred <- ggeffects::ggpredict(bline_trend_new2,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Restricted")
+#
+new3_pred <- ggeffects::ggpredict(bline_trend_new3,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Restricted, 3-way")
+#--
+pred_new <- new1_pred %>%
+  bind_rows(., new2_pred) %>%
+  bind_rows(., new3_pred)
+#--
+ggplot(data = pred_new,
+         aes(x = vssc_month, y = predicted, group = facet, color = facet)) +
+  geom_line(data = subset(pred_new, vssc_month < ymd("2019-10-01") & group == "Pre-Intervention (i.e., FY19)"),
+            size = 1) +
+  geom_line(data = subset(pred_new, vssc_month > ymd("2019-09-01") & group != "Pre-Intervention (i.e., FY19)"),
+            size = 1) +
+  scale_y_continuous(limits = c(0, NA)) +
+  ggthemes::scale_color_colorblind() +
+  theme(legend.position = "bottom",
+        axis.title = element_blank()) +
+  labs(y = "Predicted Value") +
+  facet_wrap(~analysis)
+```
+
+```{r}
+tab_model(bline_trend_new, bline_trend_new2, bline_trend_new3,
+          dv.labels = c("Original", "Restricted", "Restricted, 3-way"),
+          show.se = TRUE,
+          show.ci = FALSE)
+```
+
+# Third Next Available, 3-Ways  
+
+```{r}
+bline_trend_tna <- lmer(third_next_avail ~ treat * post    
+                     + time2 * treat 
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df2,
+                     REML = TRUE)
+#
+bline_trend_tna2 <- lmer(third_next_avail ~ treat * post    
+                     + time2 * treat 
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+bline_trend_tna3 <- lmer(third_next_avail ~ treat * post * time2  
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+```
+
+```{r}
+tna1_pred <- ggeffects::ggpredict(bline_trend_tna,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Original")
+#
+tna2_pred <- ggeffects::ggpredict(bline_trend_tna2,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Restricted")
+#
+tna3_pred <- ggeffects::ggpredict(bline_trend_tna3,
+                                  terms = c("time2 [-12:5]", "post", "treat")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2")) %>%
+  mutate(analysis = "Restricted, 3-way")
+#--
+pred_tna <- tna1_pred %>%
+  bind_rows(., tna2_pred) %>%
+  bind_rows(., tna3_pred)
+#--
+ggplot(data = pred_tna,
+         aes(x = vssc_month, y = predicted, group = facet, color = facet)) +
+  geom_line(data = subset(pred_tna, vssc_month < ymd("2019-10-01") & group == "Pre-Intervention (i.e., FY19)"),
+            size = 1) +
+  geom_line(data = subset(pred_tna, vssc_month > ymd("2019-09-01") & group != "Pre-Intervention (i.e., FY19)"),
+            size = 1) +
+  scale_y_continuous(limits = c(0, NA)) +
+  ggthemes::scale_color_colorblind() +
+  theme(legend.position = "bottom",
+        axis.title = element_blank()) +
+  labs(y = "Predicted Value") +
+  facet_wrap(~analysis)
+```
+
+```{r}
+tab_model(bline_trend_tna, bline_trend_tna2, bline_trend_tna3,
+          dv.labels = c("Original", "Restricted", "Restricted, 3-way"),
+          show.se = TRUE,
+          show.ci = FALSE)
+```

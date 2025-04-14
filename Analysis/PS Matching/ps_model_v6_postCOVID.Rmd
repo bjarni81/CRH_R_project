@@ -1,0 +1,373 @@
+---
+title: "PS Matching post-COVID"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+#Input\Analytic df\F2_propensity_score_matching\propensity_score_matching_v3_1.R"
+
+source(here("Input", "Analytic df",
+            "F2_propensity_score_matching","propensity_score_matching_v6_postCOVID.R"))
+```
+
+
+
+
+# Dropped stations  
+* From a starting set of `r sta5a_demog %>% nrow() %>% comma()` candidate sta5as, we drop  `r sta5a_demog %>% nrow() - sta5a_demog_no_missing %>% nrow()` sta5as that:
+    + Have fewer than 450 uniques in PCMM (`r sta5a_demog %>% drop_na() %>% filter(pcmm_scrssn_count <= 450) %>% nrow()`)
+    + Had more than 0 PC CRH encounters before October 2021 but not enough to meet our inclusion criteria (`r sta5a_demog %>% drop_na() %>% filter(not_enough_crh_before_oct_21 == 1) %>% nrow()`)
+
+# Propensity Score "Optimal" Matching
+
+
+## Final Model    
+
+-   Using [Optimal Matching](https://cran.r-project.org/web/packages/MatchIt/vignettes/matching-methods.html#optimal-pair-matching-method-optimal) we get `r nrow(opt_matches_pcmm_wVISN) / 2` pairs from a starting set of `r sum(sta5a_demog_no_missing$pc_crh_criteria_met_after_sept_21)` __Treated__ sta5as (`r ((nrow(opt_matches_pcmm_wVISN) / 2) / sum(sta5a_demog_no_missing$pc_crh_criteria_met_after_sept_21)) %>% percent(accuracy = 0.1)`)
+
+-   Model: Treatment (i.e., at least two consecutive months after September 2021 with \>9 PC CRH encounters) =
+
+    -   NOSOS (FY21 Q2 Avg)
+    -   Observed:Expected PC Panel Size (FY21 Q2 Avg)
+    -   Team PCP/AP FTE (FY21 Q2 Avg)
+    -   Uniques in PCMM (FY21 Avg)
+    -   ADI (FY21 Q2)
+    -   Proportion rural (FY21 Q2)
+    -   (Non-VA PCCC Consults / Total PCCC Consults) X (uniques in PCMM) X 10,000 (FY21 Q2 Avg)
+    -   Third Next Available PC Appointment (October 2020 - March 2021 Avg)
+    -   Established Patient Waittime __from PID__ (October 2020 - March 2021 Avg)
+    -   New Patient Waittime __from create__ (October 2020 - March 2021 Avg)
+    -   Site Type (i.e., CBOC, VAMC/HCC, or OOS) - (Exact)
+    -   VISN (Exact)
+
+```{r fig.width = 16.18, fig.height = 10}
+tibble(
+  month_outcomes = c(
+    ymd("2020-10-01"), ymd("2021-01-01"), ymd("2021-03-01")
+  ),
+  `Outcomes` = rep(1.5, 3),
+  `Covariates` = c(NA_real_, 0.5, 0.5)
+) %>%
+  pivot_longer(-month_outcomes) %>%
+  mutate(name = factor(name, ordered = T, levels = c("Outcomes", "Covariates"))) %>%
+  ggplot(data = .,
+         aes(y = value, x = month_outcomes, group = name, color = name)) +
+  geom_line(linewidth = 2) +
+  scale_y_continuous(limits = c(0, 2)) +
+  scale_x_date(date_labels = "%b-%Y") +
+  theme(axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 20),
+        axis.text.x = element_text(size = 18)) +
+  ggsci::scale_color_jama()
+```
+
+-   We estimate the propensity score with logistic regression (i.e., GLM and logit link)
+- [Absolute standardized mean difference:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) `r round(summary(opt_match_pcmm_wVISN)$sum.matched[1,3], 3)` 
+- [Variance ratio:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) `r round(summary(opt_match_pcmm_wVISN)$sum.matched[1,4], 3)`
+- [Empirical CDF:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) 
+    - Mean: `r round(summary(opt_match_pcmm_wVISN)$sum.matched[1,5], 2)`
+    - Max: `r round(summary(opt_match_pcmm_wVISN)$sum.matched[1,6], 2)`
+
+```{r}
+plot(opt_match_pcmm_wVISN, type = "jitter", interactive = FALSE)
+```
+
+
+
+```{r}
+ps_plot_df_pcmm <- tibble(
+  covariate = attributes(summary(opt_match_pcmm_wVISN)$sum.all)$dimnames[[1]], 
+  smd_matched = summary(opt_match_pcmm_wVISN)$sum.matched[,3], 
+  smd_preMatch = summary(opt_match_pcmm_wVISN)$sum.all[,3]) %>%
+  mutate(covariate = str_remove(covariate, "s_abbr2|census_division|pilot_visn_flag"),
+         covariate = str_replace(covariate, "parent_visn", "V"),
+         covar_lab = factor(case_when(
+           covariate == "distance" ~ "Distance",
+           #str_detect(covariate, "PCCBOC") == TRUE ~ "PCCBOC",
+           str_detect(covariate, "HCC") == TRUE ~ "VAMC/HCC",
+           #str_detect(covariate, "VAMC") == TRUE ~ "VAMC",
+           #str_detect(covariate, "MSCBOC") == TRUE ~ "MSCBOC",
+           str_detect(covariate, "CBOC") == TRUE ~ "CBOC",
+           str_detect(covariate, "OOS") == TRUE ~ "OOS",
+           str_detect(covariate, "nosos") == TRUE ~ "NOSOS",
+           str_detect(covariate, "obs_exp") == TRUE ~ "Obs:Exp",
+           str_detect(covariate, "team") == TRUE ~ "PCP/AP FTE",
+           str_detect(covariate, "pcmm_") == TRUE ~ "PCMM ScrSSN Count",
+           str_detect(covariate, "est_") == TRUE ~ "Established Patient WT",
+           str_detect(covariate, "new_") == TRUE ~ "New Patient WT",
+           str_detect(covariate, "third_") == TRUE ~ "Third-Next Available",
+           str_detect(covariate, "adi") == TRUE ~ "ADI, Avg",
+           str_detect(covariate, "age") == TRUE ~ "Age, Avg",
+           str_detect(covariate, "male") == TRUE ~ "Male %",
+           str_detect(covariate, "white") == TRUE ~ "White %",
+           str_detect(covariate, "rural") == TRUE ~ "Rural %",
+           str_detect(covariate, "gap") == TRUE ~ "Gap Metric",
+           str_detect(covariate, "non_va") == TRUE ~ "Non-VA Consults per 10,000 in PCMM",
+           TRUE ~ covariate
+         ), ordered = TRUE, levels = rev(c("Distance","Not a Pilot VISN",
+                                       "Pilot VISN","NOSOS","Obs:Exp","PCP/AP FTE",
+                                       "PCMM ScrSSN Count", "Rural %", "ADI, Avg",
+                                       "Non-VA Consults per 10,000 in PCMM",
+                                       "Third-Next Available", "New Patient WT", 
+                                       "Established Patient WT", "VAMC/HCC", "CBOC",
+                                       "HCC", "VAMC", "OOS",
+                                       "MSCBOC", "PCCBOC")))) %>%
+  select(-covariate) %>%
+  pivot_longer(-covar_lab) %>%
+  mutate(abs_smd = abs(value),
+         name_lab = if_else(name == "smd_matched", "Matched", "Un-Matched")) %>%
+  filter(is.na(covar_lab) == F)
+#
+ggplot(data = ps_plot_df_pcmm,
+       aes(x = abs_smd, y = covar_lab, group = name_lab, fill = name_lab)) +
+  geom_point(shape = 21,
+             size = 2.25) +
+  scale_fill_manual(values = c(
+    "Matched" = "black",
+    "Un-Matched" = "white"
+  )) +
+  labs(x = "Absolute Standardized Mean Difference") +
+  theme(axis.title.y = element_blank()) +
+  geom_vline(xintercept = 0, lty = 1) +
+  geom_vline(xintercept = 0.05, lty = 2) +
+  geom_vline(xintercept = 0.1, lty = 1)
+```
+
+## Including VISN  
+
+
+```{r}
+ps_plot_df_pcmm <- tibble(
+  covariate = attributes(summary(opt_match_pcmm_wVISN)$sum.all)$dimnames[[1]], 
+  smd_matched = summary(opt_match_pcmm_wVISN)$sum.matched[,3], 
+  smd_preMatch = summary(opt_match_pcmm_wVISN)$sum.all[,3]) %>%
+  mutate(covariate = str_remove(covariate, "s_abbr2|census_division|pilot_visn_flag"),
+         covariate = str_replace(covariate, "parent_visn", "V"),
+         covar_lab = factor(case_when(
+           covariate == "distance" ~ "Distance",
+           #str_detect(covariate, "PCCBOC") == TRUE ~ "PCCBOC",
+           str_detect(covariate, "HCC") == TRUE ~ "VAMC/HCC",
+           #str_detect(covariate, "VAMC") == TRUE ~ "VAMC",
+           #str_detect(covariate, "MSCBOC") == TRUE ~ "MSCBOC",
+           str_detect(covariate, "CBOC") == TRUE ~ "CBOC",
+           str_detect(covariate, "OOS") == TRUE ~ "OOS",
+           str_detect(covariate, "nosos") == TRUE ~ "NOSOS",
+           str_detect(covariate, "obs_exp") == TRUE ~ "Obs:Exp",
+           str_detect(covariate, "team") == TRUE ~ "PCP/AP FTE",
+           str_detect(covariate, "pcmm_") == TRUE ~ "PCMM ScrSSN Count",
+           str_detect(covariate, "est_") == TRUE ~ "Established Patient WT",
+           str_detect(covariate, "new_") == TRUE ~ "New Patient WT",
+           str_detect(covariate, "third_") == TRUE ~ "Third-Next Available",
+           str_detect(covariate, "adi") == TRUE ~ "ADI, Avg",
+           str_detect(covariate, "age") == TRUE ~ "Age, Avg",
+           str_detect(covariate, "male") == TRUE ~ "Male %",
+           str_detect(covariate, "white") == TRUE ~ "White %",
+           str_detect(covariate, "rural") == TRUE ~ "Rural %",
+           str_detect(covariate, "gap") == TRUE ~ "Gap Metric",
+           str_detect(covariate, "non_va") == TRUE ~ "Non-VA Consults per 10,000 in PCMM",
+           TRUE ~ covariate
+         ), ordered = TRUE, levels = rev(c("Distance","Not a Pilot VISN",
+                                       "Pilot VISN","NOSOS","Obs:Exp","PCP/AP FTE",
+                                       "PCMM ScrSSN Count", "Rural %", "ADI, Avg",
+                                       "Non-VA Consults per 10,000 in PCMM",
+                                       "Third-Next Available", "New Patient WT", 
+                                       "Established Patient WT", "VAMC/HCC", "CBOC",
+                                       "HCC", "VAMC", "OOS",
+                                       "MSCBOC", "PCCBOC", "V01", "V02", "V04", "V05",
+                                       "V06", "V07", "V08", "V09", "V10", "V12", "V15",
+                                       "V16", "V17", "V19", "V20", "V21", "V22", "V23")))) %>%
+  select(-covariate) %>%
+  pivot_longer(-covar_lab) %>%
+  mutate(abs_smd = abs(value),
+         name_lab = if_else(name == "smd_matched", "Matched", "Un-Matched"))
+#
+ggplot(data = ps_plot_df_pcmm,
+       aes(x = abs_smd, y = covar_lab, group = name_lab, fill = name_lab)) +
+  geom_point(shape = 21,
+             size = 2.25) +
+  scale_fill_manual(values = c(
+    "Matched" = "black",
+    "Un-Matched" = "white"
+  )) +
+  labs(x = "Absolute Standardized Mean Difference") +
+  theme(axis.title.y = element_blank()) +
+  geom_vline(xintercept = 0, lty = 1) +
+  geom_vline(xintercept = 0.05, lty = 2) +
+  geom_vline(xintercept = 0.1, lty = 1)
+```
+
+# Un-Matched Sta5as  
+
+```{r}
+unmatched_sta5as <- sta5a_demog_no_missing %>%
+  filter(sta5a %ni% opt_matches_pcmm_wVISN$sta5a
+         & pc_crh_criteria_met_after_sept_21 == T)
+#
+matches <- sta5a_demog_no_missing %>%
+  filter(sta5a %ni% unmatched_sta5as$sta5a)
+```
+
+* There are `r nrow(unmatched_sta5as)` sta5as that met our inclusion criteria, but were not matched to a control site
+
+## Meaningful Differences  
+
+### Non-Matched Treated vs. All Sta5as    
+
+```{r}
+matches %>%
+  mutate(grouping = "match") %>%
+  bind_rows(., unmatched_sta5as %>% mutate(grouping = "noMatch")) %>%
+  select(-c(s_abbr2, parent_visn, not_enough_crh_before_oct_21, had_pccrh_after_sep_21,
+            pc_crh_criteria_met_after_sept_21)) %>%
+  pivot_longer(-c(sta5a, grouping)) %>%
+  group_by(grouping, name) %>%
+  nest() %>%
+  spread(key = grouping, value = data) %>%
+  mutate(t_test = map2(match, noMatch, ~{t.test(.x$value, .y$value) %>% broom::tidy()}),
+         match = map(match, nrow),
+         noMatch = map(noMatch, nrow)) %>%
+  unnest(cols = c(match, noMatch, t_test)) %>%
+  mutate(name2 = case_when(
+    name == "adi_natRnk_avg" ~ "ADI",
+    name == "est_pid_avg" ~ "Established Pt WT (PID)",
+    name == "new_create_avg" ~ "New Pt WT (Create)",
+    name == "non_va_cons_rate_per_10k_pcmm" ~ "Non-VA PC Consults per 10k in PCMM",
+    name == "obs_exp_panel_ratio_3mo_avg" ~ "Observed:Expected Panel Ratio",
+    name == "pcmm_scrssn_count" ~ "PCMM ScrSSN",
+    name == "rural_prop" ~ "Rural %",
+    name == "team_pcp_ap_fte_total_3mo_avg" ~ "Team PCP/AP FTE",
+    name == "third_next_avail_avg" ~ "Third-Next Available"
+  )) %>%
+  ungroup() %>%
+  select(name2, match, noMatch, estimate1, estimate2, estimate, p.value) %>%
+  mutate(across(contains("estimate"), ~comma(.x, accuracy = 0.1))) %>%
+  mutate(p.value = if_else(p.value < 0.001, "<0.001",
+                           comma(p.value, accuracy = 0.001))) %>%
+  kbl(col.names = c("", "N Matched", "N Un-Matched", 
+                    "Avg. Among Matched", "Avg. Among Un-Matched", "Difference", "p-value"),
+      align = c("l", rep("r", 6))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+### Is VISN a Clue?  
+
+```{r}
+matches %>%
+  group_by(parent_visn) %>%
+  summarise(count = n()) %>%
+  mutate(prop = percent(count / nrow(matches), accuracy = 0.1)) %>%
+  left_join(., by = "parent_visn",
+            unmatched_sta5as %>%
+              group_by(parent_visn) %>%
+              summarise(count = n()) %>%
+              mutate(count = replace_na(count, 0),
+                     prop = percent(count / nrow(unmatched_sta5as), accuracy = 0.1))) %>%
+  mutate(count.y = replace_na(count.y, 0),
+         prop.y = replace_na(prop.y, "0%"),
+         matched_val = paste0(count.x, " (", prop.x, ")"),
+         unMatched_val = paste0(count.y, " (", prop.y, ")")) %>%
+  select(parent_visn, contains("_val")) %>%
+  kbl(col.names = c("VISN", "N (%) Matched", "N (%) Un-Matched"),
+      align = c("c", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+* How many potential sta5as are there in VISNs 4, 10, and 20?
+
+```{r}
+sta5a_demog_no_missing %>%
+  filter(parent_visn %in% c("04", "10", "20")
+         & pc_crh_criteria_met_after_sept_21 == F) %>%
+  group_by(parent_visn) %>% 
+  summarise(count = n())
+```
+
+
+### Non-Matched Treated vs. Control Sta5as    
+
+```{r}
+matches %>%
+  mutate(grouping = "match") %>%
+  filter(pc_crh_criteria_met_after_sept_21 == 0) %>%
+  bind_rows(., unmatched_sta5as %>% mutate(grouping = "noMatch")) %>%
+  select(-c(s_abbr2, parent_visn, not_enough_crh_before_oct_21, had_pccrh_after_sep_21,
+            pc_crh_criteria_met_after_sept_21)) %>%
+  pivot_longer(-c(sta5a, grouping)) %>%
+  group_by(grouping, name) %>%
+  nest() %>%
+  spread(key = grouping, value = data) %>%
+  mutate(t_test = map2(match, noMatch, ~{t.test(.x$value, .y$value) %>% broom::tidy()}),
+         match = map(match, nrow),
+         noMatch = map(noMatch, nrow)) %>%
+  unnest(cols = c(match, noMatch, t_test)) %>%
+  mutate(name2 = case_when(
+    name == "adi_natRnk_avg" ~ "ADI",
+    name == "est_pid_avg" ~ "Established Pt WT (PID)",
+    name == "new_create_avg" ~ "New Pt WT (Create)",
+    name == "non_va_cons_rate_per_10k_pcmm" ~ "Non-VA PC Consults per 10k in PCMM",
+    name == "obs_exp_panel_ratio_3mo_avg" ~ "Observed:Expected Panel Ratio",
+    name == "pcmm_scrssn_count" ~ "PCMM ScrSSN",
+    name == "rural_prop" ~ "Rural %",
+    name == "team_pcp_ap_fte_total_3mo_avg" ~ "Team PCP/AP FTE",
+    name == "third_next_avail_avg" ~ "Third-Next Available"
+  )) %>%
+  ungroup() %>%
+  select(name2, match, noMatch, estimate1, estimate2, estimate, p.value) %>%
+  mutate(across(contains("estimate"), ~comma(.x, accuracy = 0.1))) %>%
+  mutate(p.value = if_else(p.value < 0.001, "<0.001",
+                           comma(p.value, accuracy = 0.001))) %>%
+  kbl(col.names = c("", "N Matched", "N Un-Matched", 
+                    "Avg. Among Matched", "Avg. Among Un-Matched", "Difference", "p-value"),
+      align = c("l", rep("r", 6))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```

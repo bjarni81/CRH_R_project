@@ -1,0 +1,341 @@
+---
+title: "Outcomes X Exposure & Covariates"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+library(cowplot)
+library(stargazer)
+library(starpolishr)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+```
+
+```{r reading-in}
+starting_df = dbGetQuery(oabi_con,
+                         "select *
+                         from [OABI_myVAAccess].[pccrh_eng].Z_analytic_df") %>%
+  filter(always_missing_gap == F & always_missing_pf == F) %>%
+  mutate(vssc_month = ymd(vssc_month),
+         gap_cat = factor(case_when(
+           gap_metric < 1.0 ~ "< 1.0",
+           gap_metric >= 1.0 & gap_metric <= 1.2 ~ "1.0 - 1.2",
+           gap_metric > 1.2 ~ "> 1.2",
+           TRUE ~ "Missing"
+         )),
+         pf_cat = factor(case_when(
+           panel_fullness > 1.0 ~ "> 100%",
+           panel_fullness >= 0.8 & panel_fullness <= 1.0 ~ "80% - 100%",
+           panel_fullness < 0.8 ~ "< 80%",
+           TRUE ~ "Missing"
+         )),
+         joint_def = fct_drop(factor(
+           case_when(panel_fullness > 1.0 | gap_metric < 1.0 ~ 
+                       "PF > 100% OR Gap < 1.0",
+                     panel_fullness < 0.8 | gap_metric > 1.2 ~
+                       "PF < 80% OR Gap > 1.2",
+                     (panel_fullness >= 0.8 & panel_fullness <= 1.0) | 
+                       (gap_metric <= 1.2 & gap_metric >= 1.0) ~
+                       "PF 80%-100% OR Gap 1.0-1.2",
+                     TRUE ~ "Missing")
+         )),
+         period_initiating_crh = factor(period_initiating_crh,
+                                        ordered = TRUE,
+                                        levels = c("Before March 2020", 
+                                                   "March to September 2020",
+                                                   "After September 2020")))
+#===========
+pf_avg = starting_df %>%
+  group_by(sta5a) %>%
+  summarise(pf_mean = mean(panel_fullness, na.rm = T),
+            pf_cat_mean = factor(case_when(
+              pf_mean > 1.0 ~ "> 100%",
+              pf_mean >= 0.8 & pf_mean <= 1.0 ~ "80% - 100%",
+              pf_mean < 0.8 ~ "< 80%",
+              TRUE ~ "Missing"
+            ))) %>%
+  select(sta5a, pf_cat_mean)
+#===========
+gap_avg = starting_df %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T)) %>%
+  mutate(gap_cat_mean = factor(case_when(
+    mean_gap < 1.0 ~ "< 1.0",
+    mean_gap >= 1.0 & mean_gap <= 1.2 ~ "1.0 - 1.2",
+    mean_gap > 1.2 ~ "> 1.2",
+    TRUE ~ "Missing all Gap Obs."
+  )),
+  gap_cat_mean = fct_drop(gap_cat_mean)) %>%
+  select(sta5a, gap_cat_mean)
+#===========
+joint_def_avg = starting_df %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T),
+            pf_mean = mean(panel_fullness, na.rm = T)) %>%
+  mutate(joint_def_mean = fct_drop(factor(
+    case_when(pf_mean > 1.0 | mean_gap < 1.0 ~ 
+                "PF > 100% OR Gap < 1.0",
+              pf_mean < 0.8 | mean_gap > 1.2 ~
+                "PF < 80% OR Gap > 1.2",
+              (pf_mean >= 0.8 & pf_mean <= 1.0) | 
+                (mean_gap <= 1.2 & mean_gap >= 1.0) ~
+                "PF 80%-100% OR Gap 1.0-1.2",
+              TRUE ~ "Missing")
+  ))) %>%
+  select(sta5a, joint_def_mean)
+#------------
+analytic_df = starting_df %>%
+  left_join(., gap_avg) %>%
+  left_join(., pf_avg) %>%
+  left_join(., joint_def_avg)
+#
+analytic_df = analytic_df %>%
+  mutate(joint_def_mean = relevel(joint_def_mean, ref = "PF < 80% OR Gap > 1.2"),
+         pf_cat_mean = relevel(pf_cat_mean, ref = "< 80%"),
+         gap_cat_mean = relevel(gap_cat_mean, ref = "> 1.2"),
+         joint_def = relevel(joint_def, ref = "PF < 80% OR Gap > 1.2"),
+         pf_cat = relevel(pf_cat, ref = "< 80%"),
+         gap_cat = relevel(gap_cat, ref = "> 1.2"),
+         tc_pc_success_pct = tc_pc_success_prop * 100)
+#
+vast = DBI::dbGetQuery(oabi_con,
+                       "--
+select distinct sta5a = stationno, parent_station = par_sta_no, visn = newvisn, city, st, stationname, s_abbr
+from [PACT_CC].[Dim].VAST
+where extractdate = '8-16-2022'
+	AND s_abbr IN('HCC', 'VAMC', 'MSCBOC', 'PCCBOC', 'OOS')
+	AND stationname NOT LIKE '%Mobile Clinic%'
+	AND stationno IN(select distinct sta6aid from PACT_CC.Dim.VAST_Historic where snapshotDate = '2022-07-01')") %>%
+  filter(sta5a %in% analytic_df$sta5a) %>%
+  mutate(visn = str_pad(visn, width = 2, side = "left", pad = "0"))
+```
+
+# Exposure(s) X Outcomes  
+
+```{r}
+corr = cor(analytic_df[c("panel_fullness", "gap_metric", "est_pt_wt_pid", "new_pt_wt", "tna", "tc_pc_success_pct")],
+           use = "pairwise.complete.obs")
+corr_p = corr %>% rstatix::cor_get_pval()
+#
+ggcorrplot::ggcorrplot(corr,
+                       hc.order = FALSE,
+                       type = "lower",
+                       show.legend = FALSE,
+                       lab = TRUE,
+                       lab_size = 8,
+                       tl.cex = 25,
+                       p.mat = corr_p)
+
+```
+
+## Exposure allowed to vary   
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 3px;}
+</style>
+<div class = "blue">
+### Established Patient Wait Time  
+</div>
+
+```{r, results = 'asis'}
+outcome_fxn = function(outcome, label){
+  pf_fmla = as.formula(paste0({{outcome}}, " ~ pf_cat"))
+  gap_fmla = as.formula(paste0({{outcome}}, " ~ gap_cat"))
+  joint_fmla = as.formula(paste0({{outcome}}, " ~ joint_def"))
+  #--
+  pf_lm = analytic_df %>%
+    filter(pf_cat != "Missing") %>%
+    lm(pf_fmla, data = .)
+  gap_lm = analytic_df %>%
+    filter(gap_cat != "Missing") %>%
+    lm(gap_fmla, data = .)
+  joint_lm = analytic_df %>%
+    filter(joint_def != "Missing") %>%
+    lm(joint_fmla, data = .)
+  #
+  stargazer::stargazer(pf_lm, gap_lm, joint_lm,
+                       type = "html",
+                       intercept.top = TRUE,
+                       intercept.bottom = FALSE,
+                       digits = 2,
+                       single.row = TRUE,
+                       dep.var.caption = "",
+                       covariate.labels = c(
+                         "<strong>Intercept</strong>",
+                         "<strong>Panel Fullness</strong> > 100%",
+                         "<strong>Panel Fullness</strong> 80% - 100%",
+                         "<strong>Gap</strong> < 1.0",
+                         "<strong>Gap</strong> 1.0-1.2",
+                         "<strong>Panel Fullness</strong> > 100% OR <strong>Gap</strong> < 1.0",
+                         "<strong>Panel Fullness</strong> 80%-100% OR <strong>Gap</strong> 1.0-1.2"
+                       ), 
+                       dep.var.labels = {{label}})
+}
+#
+outcome_fxn("est_pt_wt_pid", "Established Patient Wait Time")
+```
+
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 3px;}
+</style>
+<div class = "blue">
+### New Patient Wait Time  
+</div>
+
+```{r, results = 'asis'}
+outcome_fxn("new_pt_wt", "New Patient Wait Time")
+```
+
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 3px;}
+</style>
+<div class = "blue">
+### Third Next Available  
+</div>
+
+```{r, results = 'asis'}
+outcome_fxn("tna", "Third Next Available")
+```
+
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 3px;}
+</style>
+<div class = "blue">
+### Timely Care    
+</div>
+
+```{r, results = 'asis'}
+outcome_fxn("tc_pc_success_pct", "Timely Care Success %")
+```
+
+## Sta5a-Average Exposure   
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 3px;}
+</style>
+<div class = "blue">
+### Established Patient Wait Time 
+</div>
+
+```{r, results = 'asis'}
+outcome_X_mean_fxn = function(outcome, label){
+  pf_fmla = as.formula(paste0({{outcome}}, " ~ pf_cat_mean"))
+  gap_fmla = as.formula(paste0({{outcome}}, " ~ gap_cat_mean"))
+  joint_fmla = as.formula(paste0({{outcome}}, " ~ joint_def_mean"))
+  #--
+  pf_lm = lm(pf_fmla, data = analytic_df)
+  gap_lm = lm(gap_fmla, data = analytic_df)
+  joint_lm = lm(joint_fmla, data = analytic_df)
+  #
+  stargazer::stargazer(pf_lm, gap_lm, joint_lm,
+                       type = "html",
+                       intercept.top = TRUE,
+                       intercept.bottom = FALSE,
+                       single.row = TRUE,
+                       dep.var.caption = "",
+                       digits = 2,
+                       covariate.labels = c(
+                         "<strong>Intercept</strong>",
+                         "<strong>Panel Fullness</strong> > 100%",
+                         "<strong>Panel Fullness</strong> 80% - 100%",
+                         "<strong>Gap</strong> < 1.0",
+                         "<strong>Gap</strong> 1.0-1.2",
+                         "<strong>Panel Fullness</strong> > 100% OR <strong>Gap</strong> < 1.0",
+                         "<strong>Panel Fullness</strong> 80%-100% OR <strong>Gap</strong> 1.0-1.2"
+                       ), 
+                       dep.var.labels = {{label}})
+}
+#
+outcome_X_mean_fxn("est_pt_wt_pid", "Established Patient Wait Time")
+```
+
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 3px;}
+</style>
+<div class = "blue">
+### New Patient Wait Time  
+</div>
+
+```{r, results = 'asis'}
+outcome_X_mean_fxn("new_pt_wt", "New Patient Wait Time")
+```
+
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 3px;}
+</style>
+<div class = "blue">
+### Third Next Available 
+</div>
+
+```{r, results = 'asis'}
+outcome_X_mean_fxn("tna", "Third Next Available")
+```
+
+<style>
+div.blue { background-color:#e6f0ff; border-radius: 3px;}
+</style>
+<div class = "blue">
+### Timely Care    
+</div>
+
+```{r, results = 'asis'}
+outcome_X_mean_fxn("tc_pc_success_pct", "Timely Care Success %")
+```
+
+
+# Outcome(s) X Covariates   
+
+```{r}
+corr_df = analytic_df %>%
+  select(est_pt_wt_pid, new_pt_wt, tna, tc_pc_success_pct, pcp_fte_crh, crh_corr_pcp_fte, gap_metric, nosos,
+         cMort_90d_mean, cHosp_90d_mean, adi_natrank_mean, 
+         panel_fullness, teamlet_staff_ratio, scrssn_count_mean, 
+         pc_crh_per_1k_total_pc, pc_cc_refs_per_1k_tot_pc, age_jan1_mean,
+         prop_male, urban_prop)
+#
+corr1 = corr_df %>% rstatix::cor_mat()
+corr1_p = corr1 %>% rstatix::cor_get_pval()
+#
+ggcorrplot::ggcorrplot(corr1,
+                       type = "lower",
+                       lab = TRUE,
+                       lab_size = 5,
+                       tl.cex = 15,
+                       show.legend = FALSE,
+                       digits = 1,
+                       p.mat = corr1_p,
+                       sig.level = 0.01)
+```

@@ -1,0 +1,652 @@
+---
+title: "Association Between CRH Penetration and Gap Metric"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 12, fig.height = 12)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             plot.title = element_text(size = 22),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+# scrssn_count <- dbGetQuery(oabi_con,
+#                            "with CTE as(
+#                             	select count(distinct ScrSSN_num) as scrssn_count
+#                             		, sta5a, fy, qtr
+#                             	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+#                             	where fy = 2020
+#                             	group by Sta5a, fy, QTR
+#                             	)
+#                             select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+#                             from CTE
+#                             group by Sta5a") %>%
+#   mutate(scrssn_count_cat = factor(case_when(
+#     scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+#     scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+#     scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+#     scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+#   ), ordered = TRUE,
+#   levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- ps_matched %>%
+  filter(treated_num == 1) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include <- ps_matched %>%
+  inner_join(., vast %>% select(sta5a, s_abbr, parent_visn)) %>%#2: must be in VAST
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, 
+                            "PC CRH", "No PC CRH"))
+#=================
+#making the analytic dataset
+analytic_df <- sta5as_to_include %>%
+  select(sta5a) %>%
+  cross_join(., dates %>%
+              select(vssc_month)) %>%
+  left_join(., sta5as_to_include) %>%
+  select(sta5a, vssc_month, treated_num, treated, s_abbr, parent_visn) %>%
+  left_join(., gap_metric %>% 
+              select(sta5a, vssc_month, gap_metric)) %>%
+  left_join(., pen_rate %>%
+              select(sta5a, vssc_month, pc_crh_per_1k_total_pc)) %>%
+  mutate(pen_rate_w_0 = replace_na(pc_crh_per_1k_total_pc, 0),
+         s_abbr2 = case_when(str_detect(s_abbr, "CBOC") ~ "CBOC",
+                             str_detect(s_abbr, "HCC|VAMC") ~ "HCC/VAMC",
+                             s_abbr == "OOS" ~ "OOS"),
+         gap_cap_3 = if_else(gap_metric >= 3, 3, gap_metric))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This report examines the relationship between the Gap Metric and our PC CRH Penetration Rate
+
+## Decision Points  
+
+* Per our discussion on April 25th I am making a report that examines the relationship between the Gap Metric and our PC CRH Penetration Rate
+
+$$
+\text{PC CRH Penetration Rate}=\frac{\text{PC CRH Encounters}}{\text{PC Encounters}+\text{PC CRH Encounters}}\times 1,000
+$$
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, treated_num) %>% distinct() %>% summarise(tot = sum(treated_num))` of these met our criteria for PC CRH 
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+* Description of _Propensity Score_ matching
+    + This PS model consists of 
+        + Covariates matched on their average values over Q4 FY20
+        + Outcomes matched on their average values over Q4 FY20
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+
+* The penetration rate plots below only include data from the `r length(crh_sta5as)` sta5as that met our meaningful use criteria
+* The plots below have observations with a gap metric > 3 set to 3
+      + There are `r sum(analytic_df$gap_metric > 3, na.rm = T)` observations with a gap metric > 3
+
+# Gap Metric    
+
+
+```{r, fig.asp = 0.8}
+nat_gap <- dates %>%
+  select(vssc_month) %>%
+  left_join(., gap_metric %>%
+              select(vssc_month, expected_ps_tot, observed_ps_tot, sta5a)) %>%
+  group_by(vssc_month) %>%
+  summarise(exp_tot = sum(expected_ps_tot),
+            obs_tot = sum(observed_ps_tot)) %>%
+  mutate(gap_metric = exp_tot / obs_tot)
+#-----
+# p1 <- ggplot(data = nat_gap,
+#        aes(x = vssc_month, y = gap_metric)) +
+#   geom_line() +
+#   scale_y_continuous(limits = c(0, 3)) +
+#   labs(x = "Month",
+#        y = "Gap Metric")
+#
+mean_gap <- analytic_df %>%
+  group_by(treated) %>%
+  summarise(mean_val = mean(gap_metric, na.rm = T))
+#
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = gap_cap_3, group = sta5a)) +
+  geom_line(alpha = 0.2) +
+  labs(x = "Month", 
+       y = "Gap Metric") +
+  facet_wrap(~treated) +
+  geom_hline(data = mean_gap,
+             aes(yintercept = mean_val, group = treated, color = treated),
+             linewidth = 1.25) +
+  theme(legend.position = "none")
+#======
+# p1 <- ggplot(data = nat_gap,
+#        aes(y = gap_metric)) +
+#   geom_boxplot() +
+#   scale_y_continuous(limits = c(0, 3)) +
+#   labs(y = "Gap Metric") +
+#   theme(axis.text.x = element_blank(),
+#         axis.ticks.x = element_blank())
+#
+analytic_df %>%
+  ggplot(data = .,
+         aes(y = gap_cap_3,
+             fill = treated)) +
+  geom_boxplot() +
+  labs(y = "Gap Metric") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none") +
+  facet_wrap(~treated)
+#-------
+# p1 <- ggplot(data = nat_gap,
+#        aes(x = gap_metric)) +
+#   geom_histogram(bins = 20,
+#                  color = "black") +
+#   labs(x = "Gap Metric",
+#        y = "Observations")
+#
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = gap_cap_3, fill = treated)) +
+  geom_histogram(color = "black",
+                 position = "identity",
+                 alpha = 0.4,
+                 bins = 50) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "Gap Metric",
+       y = "Observations") +
+  theme(legend.position = "right")
+```
+
+# Penetration Rate   
+
+
+```{r}
+pen_rate_nat <- dates %>%
+  select(vssc_month) %>%
+  left_join(., pen_rate) %>%
+  filter(sta5a %in% crh_sta5as) %>%
+  group_by(vssc_month) %>%
+  summarise(crh_tot = sum(crh_encounter_count, na.rm = T),
+            pc_tot = sum(pc_encounter_total, na.rm = T)) %>%
+  mutate(pen_rate = crh_tot / pc_tot * 1000)
+#------
+# p1 <- pen_rate_nat %>%
+#   ggplot(data = .,
+#          aes(x = vssc_month, y = pen_rate)) +
+#   geom_line() +
+#   scale_y_continuous(limits = c(0, NA)) +
+#   labs(y = "PC CRH Penetration Rate",
+#        x = "Month")
+#
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = pc_crh_per_1k_total_pc, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "PC CRH Penetration Rate") +
+  facet_wrap(~treated)
+```
+
+```{r}
+analytic_df %>%
+  ggplot(data = .,
+         aes(y = pc_crh_per_1k_total_pc,
+             fill = treated))  +
+  geom_boxplot(color = "black") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "PC CRH Penetration Rate") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  facet_wrap(~treated)
+```
+
+```{r}
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = pc_crh_per_1k_total_pc, fill = treated)) +
+  geom_histogram(color = "black",
+                 position = "identity",
+                 alpha = 0.4,
+                 bins = 50) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Penetration Rate",
+       y = "Observations") +
+  theme(legend.position = "right")
+```
+
+
+# Penetration Rate X Gap Metric  
+
+
+
+```{r, fig.asp = 0.66}
+analytic_df %>%
+  ggplot(data = .,
+       aes(x = gap_cap_3, y = pc_crh_per_1k_total_pc)) +
+  geom_point() +
+  ggpubr::stat_cor(color = "red",
+                   size = 8) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "Gap Metric",
+       y = "PC CRH Penetration Rate")
+#--
+analytic_df %>%
+  ggplot(data = .,
+       aes(x = gap_cap_3, y = pc_crh_per_1k_total_pc)) +
+  geom_point() +
+  ggpubr::stat_cor(color = "red",
+                   size = 8) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "Gap Metric",
+       y = "PC CRH Penetration Rate") +
+  facet_wrap(~treated)
+#--
+# p2 <- analytic_df %>%
+#   filter(gap_metric < 3) %>%
+#   ggplot(data = .,
+#        aes(x = gap_metric, y = pen_rate_w_0)) +
+#   geom_point() +
+#   ggpubr::stat_cor(color = "red") +
+#   scale_y_continuous(labels = scales::comma_format()) +
+#   geom_smooth(method = "lm",
+#               se = F) +
+#   labs(x = "Gap Metric",
+#        y = "PC CRH Penetration Rate",
+#        title = "Zeroes")
+# #
+# cowplot::plot_grid(p1, p2,
+#                    ncol = 2)
+```
+
+## By VISN  
+
+```{r, fig.asp = 0.8}
+analytic_df %>%
+  ggplot(data = .,
+       aes(x = gap_cap_3, y = pc_crh_per_1k_total_pc)) +
+  geom_point() +
+  ggpubr::stat_cor(color = "red",
+                   size = 5) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "Gap Metric",
+       y = "PC CRH Penetration Rate") +
+  facet_wrap(~parent_visn)
+#--
+analytic_df %>%
+  filter(treated == "Treated") %>%
+  ggplot(data = .,
+       aes(x = gap_cap_3, y = pc_crh_per_1k_total_pc)) +
+  geom_point() +
+  ggpubr::stat_cor(color = "red",
+                   size = 5) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "Gap Metric",
+       y = "PC CRH Penetration Rate",
+       title = "Treated") +
+  facet_wrap(~parent_visn)
+#
+analytic_df %>%
+  filter(treated != "Treated") %>%
+  ggplot(data = .,
+       aes(x = gap_cap_3, y = pc_crh_per_1k_total_pc)) +
+  geom_point() +
+  ggpubr::stat_cor(color = "red",
+                   size = 5) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "Gap Metric",
+       y = "PC CRH Penetration Rate",
+       title = "Control") +
+  facet_wrap(~parent_visn)
+#
+# p2 <- analytic_df %>%
+#   filter(gap_metric < 3) %>%
+#   ggplot(data = .,
+#        aes(x = gap_metric, y = pen_rate_w_0)) +
+#   geom_point() +
+#   ggpubr::stat_cor(color = "red") +
+#   scale_y_continuous(labels = scales::comma_format()) +
+#   geom_smooth(method = "lm",
+#               se = F) +
+#   labs(x = "Gap Metric",
+#        y = "PC CRH Penetration Rate",
+#        title = "Zeroes") +
+#   facet_wrap(~parent_visn)
+# #
+
+```
+
+
+## By Site Type    
+
+```{r, fig.asp = 0.8}
+analytic_df %>%
+  ggplot(data = .,
+       aes(x = gap_cap_3, y = pc_crh_per_1k_total_pc)) +
+  geom_point() +
+  ggpubr::stat_cor(color = "red",
+                   size = 8) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "Gap Metric",
+       y = "PC CRH Penetration Rate") +
+  facet_wrap(~s_abbr2)
+# #
+analytic_df %>%
+  filter(treated == "Treated") %>%
+  ggplot(data = .,
+       aes(x = gap_cap_3, y = pc_crh_per_1k_total_pc)) +
+  geom_point() +
+  ggpubr::stat_cor(color = "red",
+                   size = 8) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "Gap Metric",
+       y = "PC CRH Penetration Rate",
+       title = "Treated") +
+  facet_wrap(~s_abbr2)
+#
+analytic_df %>%
+  filter(treated != "Treated") %>%
+  ggplot(data = .,
+       aes(x = gap_cap_3, y = pc_crh_per_1k_total_pc)) +
+  geom_point() +
+  ggpubr::stat_cor(color = "red",
+                   size = 8) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_smooth(method = "lm",
+              se = F) +
+  labs(x = "Gap Metric",
+       y = "PC CRH Penetration Rate",
+       title = "Control") +
+  facet_wrap(~s_abbr2)
+```
+
+# Categorical Mean Gap Metric  
+
+```{r}
+mean_gap <- analytic_df %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T),
+            obs_n = n()) %>%
+  mutate(gap_cat = factor(case_when(mean_gap < 1.0 ~ "< 1.0",
+                                    mean_gap >= 1.0 & mean_gap <= 1.2 ~ "1.0 - 1.2",
+                                    mean_gap > 1.2 ~ "> 1.2"),
+                          ordered = TRUE,
+                          levels = c("< 1.0", "1.0 - 1.2", "> 1.2")))
+```
+
+```{r}
+analytic_df %>%
+  left_join(., mean_gap %>%
+              select(sta5a, gap_cat)) %>%
+  filter(is.na(gap_cat) == F
+         & is.na(pc_crh_per_1k_total_pc) == F) %>%
+  group_by(gap_cat) %>%
+  summarise(n_obs = comma(n()),
+            mean_val = mean(pc_crh_per_1k_total_pc),
+            med_val = comma(median(pc_crh_per_1k_total_pc), accuracy = 0.1),
+            sd_val = sd(pc_crh_per_1k_total_pc),
+            qtl_25 = quantile(pc_crh_per_1k_total_pc, 0.25),
+            qtl_75 = quantile(pc_crh_per_1k_total_pc, 0.75),
+            qtl_975 = quantile(pc_crh_per_1k_total_pc, 0.975),
+            qtl_025 = quantile(pc_crh_per_1k_total_pc, 0.025)) %>%
+  mutate(across(contains("qtl_"), ~comma(.x, accuracy = 0.01)),
+         mean_sd = paste0(comma(mean_val, accuracy = 0.1), " (", comma(sd_val, accuracy = 0.01), ")"),
+         qtl_25_75 = paste0("[", qtl_25, ", ", qtl_75, "]"),
+         qtl_2 = paste0("[", qtl_025, ", ", qtl_975, "]")) %>%
+  select(gap_cat, n_obs, mean_sd, med_val, qtl_25_75, qtl_2) %>%
+  kbl(col.names = c("Mean Gap Metric", "Observations", "Mean Penetration Rate (SD)", "Median", "[25th %ile, 75th %ile]",
+                    "[2.5th %ile, 97.5th %ile]"),
+      align = c("l", rep("r", 5))) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+analytic_df %>%
+  left_join(., mean_gap) %>%
+  filter(is.na(gap_cat) == F
+         & is.na(pc_crh_per_1k_total_pc) == F) %>%
+  ggplot(data = .,
+         aes(x = gap_cat, y = pc_crh_per_1k_total_pc,
+             fill = gap_cat)) +
+  geom_boxplot(color = "black") +
+  theme(legend.position = "none") +
+  labs(x = "Mean Gap Metric", 
+       y = "PC CRH Penetration Rate") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  stat_summary(fun = mean, geom = "point", color = "red")
+```
+
+## By Site Type  
+
+```{r}
+analytic_df %>%
+  left_join(., mean_gap %>%
+              select(sta5a, gap_cat)) %>%
+  filter(is.na(gap_cat) == F
+         & is.na(pc_crh_per_1k_total_pc) == F) %>%
+  group_by(s_abbr2, gap_cat) %>%
+  summarise(n_obs = comma(n()),
+            mean_val = mean(pc_crh_per_1k_total_pc),
+            sd_val = sd(pc_crh_per_1k_total_pc),
+            med_val = comma(median(pc_crh_per_1k_total_pc), accuracy = 0.1),
+            qtl_25 = quantile(pc_crh_per_1k_total_pc, 0.25),
+            qtl_75 = quantile(pc_crh_per_1k_total_pc, 0.75),
+            qtl_975 = quantile(pc_crh_per_1k_total_pc, 0.975),
+            qtl_025 = quantile(pc_crh_per_1k_total_pc, 0.025)) %>%
+  mutate(across(contains("qtl_"), ~comma(.x, accuracy = 0.01)),
+         mean_sd = paste0(comma(mean_val, accuracy = 0.1), " (", comma(sd_val, accuracy = 0.01), ")"),
+         qtl_25_75 = paste0("[", qtl_25, ", ", qtl_75, "]"),
+         qtl_2 = paste0("[", qtl_025, ", ", qtl_975, "]")) %>%
+  select(gap_cat, s_abbr2, n_obs, mean_sd, med_val, qtl_25_75, qtl_2) %>%
+  kbl(col.names = c("Site Type", "Mean Gap Metric", "Observations", "Mean Penetration Rate (SD)", 
+                    "Median", "[25th %ile, 75th %ile]",
+                    "[2.5th %ile, 97.5th %ile]"),
+      align = c("l", "l", rep("r", 5))) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(c(3, 6), extra_css = "border-bottom: 1px solid;")
+```
+
+```{r}
+analytic_df %>%
+  left_join(., mean_gap) %>%
+  filter(is.na(gap_cat) == F) %>%
+  ggplot(data = .,
+         aes(x = gap_cat, y = pc_crh_per_1k_total_pc,
+             fill = gap_cat)) +
+  geom_boxplot(color = "black") +
+  theme(legend.position = "none") +
+  labs(x = "Mean Gap Metric", 
+       y = "PC CRH Penetration Rate") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  facet_wrap(~s_abbr2) +
+  stat_summary(fun = mean, geom = "point", color = "red")
+```
+
+## By VISN  
+
+```{r}
+analytic_df %>%
+  left_join(., mean_gap %>%
+              select(sta5a, gap_cat)) %>%
+  filter(is.na(gap_cat) == F
+         & is.na(pc_crh_per_1k_total_pc) == F) %>%
+  group_by(parent_visn, gap_cat) %>%
+  summarise(n_obs = comma(n()),
+            n_sta5a = n_distinct(sta5a),
+            mean_val = mean(pc_crh_per_1k_total_pc),
+            med_val = comma(median(pc_crh_per_1k_total_pc), accuracy = 0.1),
+            sd_val = sd(pc_crh_per_1k_total_pc),
+            qtl_25 = quantile(pc_crh_per_1k_total_pc, 0.25),
+            qtl_75 = quantile(pc_crh_per_1k_total_pc, 0.75),
+            qtl_975 = quantile(pc_crh_per_1k_total_pc, 0.975),
+            qtl_025 = quantile(pc_crh_per_1k_total_pc, 0.025)) %>%
+  arrange(parent_visn, gap_cat) %>%
+  mutate(across(contains("qtl_"), ~comma(.x, accuracy = 0.01)),
+         mean_sd = paste0(comma(mean_val, accuracy = 0.1), " (", comma(sd_val, accuracy = 0.01), ")"),
+         qtl_25_75 = paste0("[", qtl_25, ", ", qtl_75, "]"),
+         qtl_2 = paste0("[", qtl_025, ", ", qtl_975, "]")) %>%
+  select(parent_visn, gap_cat, n_obs, n_sta5a, mean_sd, med_val, qtl_25_75, qtl_2) %>%
+  kbl(col.names = c("VISN", "Mean Gap Metric", "Observations", "Sta5as", "Mean Penetration Rate (SD)", "Median", "[25th %ile, 75th %ile]",
+                    "[2.5th %ile, 97.5th %ile]"),
+      align = c("l", "l", rep("r", 6))) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(c(2, 4, 7, 9, 11, 14, 17, 19, 22, 25, 27, 30, 32, 35, 37, 39, 42), extra_css = "border-bottom: 1px solid;")
+```
+
+```{r}
+analytic_df %>%
+  left_join(., mean_gap) %>%
+  filter(is.na(gap_cat) == F) %>%
+  ggplot(data = .,
+         aes(x = gap_cat, y = pc_crh_per_1k_total_pc,
+             fill = gap_cat)) +
+  geom_boxplot(color = "black") +
+  theme(legend.position = "none") +
+  labs(x = "Mean Gap Metric", 
+       y = "PC CRH Penetration Rate") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  facet_wrap(~parent_visn) +
+  stat_summary(fun = mean, geom = "point", color = "red")
+```

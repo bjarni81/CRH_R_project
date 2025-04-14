@@ -1,0 +1,453 @@
+---
+title: "% of New Patients Seen in 0-20 days: A closer look"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom",
+             plot.title = element_text(size = 24))
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v6_post_COVID.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+```
+
+
+# Front Matter  
+
+## Description of this report  
+
+* We are considering a new access metric "% of new patients seen in 0-20 days"
+* This document takes a closer look at the distributional qualities of this covariate
+* Also, Peter asked what happens when a sta5a has 0 new patients ask for an appointment in a month
+
+```{r}
+apts_in_0_20 <- read_csv(here("Input", "Data", "VSSC", "Appointments - New 0-20",
+                              "completed_new_0_20_month_sta5a.csv")) %>%
+  rename_all(tolower) %>%
+  rename(date = 1,
+         div_name = 2,
+         completed_in_0_20 = 3) %>%
+  mutate(month_n = match(str_to_title(str_sub(date, end = 3)), month.abb),
+         fy = as.numeric(str_sub(date, start = -2)),
+         cy2 = if_else(month_n > 9, fy - 1, fy),
+         cy = as.numeric(str_c("20", cy2)),
+         vssc_month = ymd(str_c(cy, month_n, "01", sep = "-")),
+         sta5a = if_else(str_sub(div_name, start = 11, end = 11) == ")",
+                         str_sub(div_name, start = 8, end = 10),
+                         str_sub(div_name, start = 8, end = 12)))
+#
+appts_total <- read_csv(here("Input", "Data", "VSSC", "Appointments - New 0-20",
+                              "completed_new_appointments_month_sta5a.csv")) %>%
+  rename_all(tolower) %>%
+  rename(date = 1,
+         div_name = 2,
+         new_pt_appt_reqs = 3) %>%
+  mutate(month_n = match(str_to_title(str_sub(date, end = 3)), month.abb),
+         fy = as.numeric(str_sub(date, start = -2)),
+         cy2 = if_else(month_n > 9, fy - 1, fy),
+         cy = as.numeric(str_c("20", cy2)),
+         vssc_month = ymd(str_c(cy, month_n, "01", sep = "-")),
+         sta5a = if_else(str_sub(div_name, start = 11, end = 11) == ")",
+                         str_sub(div_name, start = 8, end = 10),
+                         str_sub(div_name, start = 8, end = 12)))
+#--
+new_0_20_days_create <- read_csv(here("Input", "Data", "VSSC", "Appointments - Completed Summary",
+                                      "appt_cube_new_pt_pct_appts_0_20_days_create.csv")) %>%
+  rename_all(tolower) %>%
+  rename(date = 1,
+         div_name = 2) %>%
+  mutate(month_n = match(str_to_title(str_sub(date, end = 3)), month.abb),
+         fy = as.numeric(str_sub(date, start = -2)),
+         cy2 = if_else(month_n > 9, fy - 1, fy),
+         cy = as.numeric(str_c("20", cy2)),
+         vssc_month = ymd(str_c(cy, month_n, "01", sep = "-")),
+         sta5a = if_else(str_sub(div_name, start = 11, end = 11) == ")",
+                         str_sub(div_name, start = 8, end = 10),
+                         str_sub(div_name, start = 8, end = 12))) %>%
+  select(vssc_month, sta5a, new_0_20_days_create = 3)
+```
+
+```{r}
+appts_0_20_calc <- appts_total %>%
+  left_join(., apts_in_0_20) %>%
+  left_join(., new_0_20_days_create) %>%
+  mutate(new_0_20_calc = completed_in_0_20 / new_pt_appt_reqs,
+         calc_vssc_match = if_else((new_0_20_calc == new_0_20_days_create) |
+                                     (is.na(new_0_20_calc) & is.na(new_0_20_days_create)), 
+                                   T, F),
+         calc_vssc_diff = new_0_20_calc - new_0_20_days_create)
+```
+
+```{r}
+dates <- tibble(
+  vssc_month = seq.Date(min(appts_0_20_calc$vssc_month), max(appts_0_20_calc$vssc_month), 
+                        "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+```
+
+# Calculating the Metric  
+
+* When I download the components of this metric (i.e., __new patient appointments__ per month and __number of those seen in 0-20 days__) and calculate this metric "by hand" i get a total of `r sum(appts_0_20_calc$calc_vssc_match, na.rm = T) %>% comma()` out of `r nrow(appts_0_20_calc) %>% comma()` (`r (sum(appts_0_20_calc$calc_vssc_match, na.rm = T) / nrow(appts_0_20_calc)) %>% percent(accuracy = .1)`) observations match exactly
+
+* The remaining `r (nrow(appts_0_20_calc) - sum(appts_0_20_calc$calc_vssc_match, na.rm = T)) %>% comma()` (`r ((nrow(appts_0_20_calc) - sum(appts_0_20_calc$calc_vssc_match, na.rm = T)) / nrow(appts_0_20_calc)) %>% percent(accuracy = 0.1)`) have an average difference of `r mean(appts_0_20_calc$calc_vssc_diff, na.rm = T) %>% percent(accuracy = 0.0001)`
+    + Only `r appts_0_20_calc %>% filter(abs(calc_vssc_diff) > 0.01) %>% nrow()` (`r ((appts_0_20_calc %>% filter(abs(calc_vssc_diff) > 0.01) %>% nrow()) / nrow(appts_0_20_calc)) %>% percent(accuracy = 0.01)`) observations have a difference greater than +/- 1%
+
+
+```{r}
+ggplot(data = appts_0_20_calc,
+       aes(x = calc_vssc_diff)) +
+  stat_ecdf() +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(labels = percent_format()) +
+  labs(y = "eCDF",
+       x = "Difference")
+#--
+appts_0_20_calc %>%
+  filter(calc_vssc_diff != 0) %>%
+  ggplot(data = .,
+         aes(x = calc_vssc_diff)) +
+  geom_histogram(color = "black", fill = "seagreen") +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(x = "Difference",
+       y = "Observations",
+       title = "Only observations with differences != 0")
+```
+
+
+# What happens when there are no new patient appointments?  
+* So what happens when a sta5a has no new patient appointment requests?
+* In that case there is no observation made: it is reported as missing
+* The converse is also true: when a sta5a does have new patient appointment requests in a month but completes none of them they get a zero
+
+## In VISN 2  
+```{r}
+sta5as_w_no_new_pt_reqs <- appts_0_20_calc %>%
+  filter(new_pt_appt_reqs == 0) %>%
+  select(sta5a) %>%
+  distinct() %>%
+  pull
+#
+new_0_20_days_create %>%
+  left_join(., vast) %>%
+  filter(sta5a %in% c("526GA", "526GB")) %>%
+  ggplot(data = .,
+       aes(y = new_0_20_days_create, x = vssc_month, group = short_name, color = short_name)) +
+  geom_line(linewidth = 1) +
+  geom_point(shape = 5, size = 1.5) +
+  theme(legend.position = "right") +
+  ggthemes::scale_color_colorblind() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(y = "New Patient Appointments Completed in 0-20 Days") +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  facet_wrap(~short_name)
+```
+
+## In VISN 23  
+```{r}
+#
+new_0_20_days_create %>%
+  left_join(., vast) %>%
+  filter(sta5a %in% c("636GN", "636GJ")) %>%
+  ggplot(data = .,
+       aes(y = new_0_20_days_create, x = vssc_month, group = short_name, color = short_name)) +
+  geom_line(linewidth = 1) +
+  geom_point(shape = 5, size = 1.5) +
+  theme(legend.position = "right") +
+  ggthemes::scale_color_fivethirtyeight() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(y = "New Patient Appointments Completed in 0-20 Days") +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  facet_wrap(~short_name)
+```
+
+# Characterization of the metric  
+
+* The metric appears to be calculated as $\frac{\text{New Patient Appts. Seen in 0-20 days}}{\text{New Patient Appts. Requested}}$
+* As a result it has some quirks:
+    + Because the numerator can never be greater than the denominator, it cannot have values $>1.0$ or $<0.0$ 
+    + Because new patients only represent about 5% of all patients seen, we see sta5a-months with zero $\text{New Patient Appts. Requested}$, which naturally leads to sta5a-months with missing observations
+    + Finally, as a result of both the fact that only 1 in 20 patients is a new patient and that this metric is a proportion, there are peaks in the histogram at 0%, 50%, and 100%
+    
+```{r}
+ggplot(data = appts_0_20_calc,
+       aes(x = new_0_20_days_create)) +
+  geom_histogram(bins = 100,
+                 fill = "cornflowerblue",
+                 color = "black") +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  labs(x = "% of New Patient Appointments Completed in 0-20 Days",
+        y = "Observations")
+```
+
+* The overall average is `r mean(appts_0_20_calc$new_0_20_days_create, na.rm = T) %>% percent(accuracy = 0.1)` (SD = `r sd(appts_0_20_calc$new_0_20_days_create, na.rm = T) %>% percent(accuracy = 0.1)`)
+
+```{r}
+appts_0_20_calc %>%
+  group_by(vssc_month) %>%
+  summarise(total_requests = sum(new_pt_appt_reqs, na.rm = T),
+            total_completed_in_0_20 = sum(completed_in_0_20, na.rm = T)) %>%
+  mutate(prop_completed_in_0_20 = total_completed_in_0_20 / total_requests) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = prop_completed_in_0_20)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(y = "Proportion of New Patient Reqs. Completed in 0-20 days") +
+  theme(axis.title.x = element_blank())
+```
+
+### By Site Type  
+```{r}
+appts_0_20_calc %>%
+  left_join(., vast) %>%
+  filter(is.na(s_abbr) == F) %>%
+  group_by(s_abbr) %>%
+  summarise(mean_val = percent(mean(new_0_20_days_create, na.rm = T), accuracy = 0.1),
+            sd_val = percent(sd(new_0_20_days_create, na.rm = T), accuracy = 0.1),
+            qtl_25 = percent(quantile(new_0_20_days_create, 0.25, na.rm = TRUE), accuracy = 0.1),
+            qtl_75 = percent(quantile(new_0_20_days_create, 0.75, na.rm = TRUE), accuracy = 0.1)) %>%
+  mutate(mean_sd = paste0(mean_val, " (", sd_val, ")"),
+         qrtls = paste0("[", qtl_25, ", ", qtl_75, "]")) %>%
+  select(1, 6, 7) %>%
+  kbl(col.names = c("Site Type", "Mean (SD)", "[25th %-ile, 75th %-ile]"),
+      align = c("l", "c", "c")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r}
+appts_0_20_calc %>%
+  left_join(., vast) %>%
+  filter(is.na(s_abbr) == F) %>%
+  group_by(vssc_month, s_abbr) %>%
+  summarise(total_requests = sum(new_pt_appt_reqs, na.rm = T),
+            total_completed_in_0_20 = sum(completed_in_0_20, na.rm = T)) %>%
+  mutate(prop_completed_in_0_20 = total_completed_in_0_20 / total_requests) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = prop_completed_in_0_20, color = s_abbr)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(y = "Proportion of New Patient Reqs. Completed in 0-20 days") +
+  theme(axis.title.x = element_blank(),
+        legend.position = "right")
+```
+
+### By Uniques in PCMM  
+```{r}
+appts_0_20_calc %>%
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F) %>%
+  group_by(scrssn_count_cat) %>%
+  summarise(mean_val = percent(mean(new_0_20_days_create, na.rm = T), accuracy = 0.1),
+            sd_val = percent(sd(new_0_20_days_create, na.rm = T), accuracy = 0.1),
+            qtl_25 = percent(quantile(new_0_20_days_create, 0.25, na.rm = TRUE), accuracy = 0.1),
+            qtl_75 = percent(quantile(new_0_20_days_create, 0.75, na.rm = TRUE), accuracy = 0.1)) %>%
+  mutate(mean_sd = paste0(mean_val, " (", sd_val, ")"),
+         qrtls = paste0("[", qtl_25, ", ", qtl_75, "]")) %>%
+  select(1, 6, 7) %>%
+  kbl(col.names = c("Site Type", "Mean (SD)", "[25th %-ile, 75th %-ile]"),
+      align = c("l", "c", "c")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+
+```{r}
+appts_0_20_calc %>%
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F) %>%
+  group_by(vssc_month, scrssn_count_cat) %>%
+  summarise(total_requests = sum(new_pt_appt_reqs, na.rm = T),
+            total_completed_in_0_20 = sum(completed_in_0_20, na.rm = T)) %>%
+  mutate(prop_completed_in_0_20 = total_completed_in_0_20 / total_requests) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = prop_completed_in_0_20, color = scrssn_count_cat)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(y = "Proportion of New Patient Reqs. Completed in 0-20 days") +
+  theme(axis.title.x = element_blank(),
+        legend.position = "right") +
+  ggthemes::scale_color_wsj()
+```
+
+# As a binary: > 79% vs. < 80%  
+```{r}
+new_pt_0_20_binary <- appts_0_20_calc %>%
+  mutate(new_0_20_gt79 = if_else(new_0_20_days_create > 0.79, TRUE, FALSE))
+#
+prop_gt_79pct_month <- new_pt_0_20_binary %>% 
+  group_by(vssc_month) %>%
+  summarise(number_gt_79 = sum(new_0_20_gt79, na.rm = T),
+            number_total = n(),
+            prop_gt_79 = number_gt_79 / number_total)
+```
+
+* On average `r mean(prop_gt_79pct_month$prop_gt_79, na.rm = T) %>% percent(accuracy = 0.1)` of sta5as see at least 80% of their new patient requests within 20 days
+    + This is an average of `r mean(prop_gt_79pct_month$number_gt_79) %>% comma(., accuracy = 0.1)` sta5as out of an average total of `r mean(prop_gt_79pct_month$number_total) %>% comma(., accuracy = 0.1)` sta5as per month
+
+```{r}
+new_pt_0_20_binary %>% 
+  group_by(vssc_month) %>%
+  summarise(number_gt_79 = sum(new_0_20_gt79, na.rm = T),
+            number_total = n(),
+            prop_gt_79 = number_gt_79 / number_total) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = prop_gt_79)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(y = "Proportion of sta5as where measure is >79%") +
+  theme(axis.title.x = element_blank())
+```
+
+## By Site Type  
+```{r}
+new_pt_0_20_binary %>% 
+  left_join(., vast) %>%
+  filter(is.na(s_abbr) == F) %>%
+  group_by(vssc_month, s_abbr) %>%
+  summarise(number_gt_79 = sum(new_0_20_gt79, na.rm = T),
+            number_total = n(),
+            prop_gt_79 = number_gt_79 / number_total) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = prop_gt_79, color = s_abbr)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(y = "Proportion of sta5as where measure is >79%") +
+  theme(axis.title.x = element_blank(),
+        legend.position = "right")
+
+```
+
+## By Uniques    
+```{r}
+new_pt_0_20_binary %>% 
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F) %>%
+  group_by(vssc_month, scrssn_count_cat) %>%
+  summarise(number_gt_79 = sum(new_0_20_gt79, na.rm = T),
+            number_total = n(),
+            prop_gt_79 = number_gt_79 / number_total) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = prop_gt_79, color = scrssn_count_cat)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(y = "Proportion of sta5as where measure is >79%") +
+  theme(axis.title.x = element_blank(),
+        legend.position = "right") +
+  ggthemes::scale_color_gdocs()
+
+```

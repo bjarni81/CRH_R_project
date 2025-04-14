@@ -1,0 +1,209 @@
+---
+title: "Correlation Between Continuous Covariates"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#library(MatchIt)
+library(lme4)
+#library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             plot.caption = element_text(size = 12),
+             legend.position = "right")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v3_1.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- access_metrics %>%
+  filter(vssc_month < ymd("2020-03-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+  #1: must have Access metrics
+  #2: must be in VAST
+  #3: no missing scrssn_count_cat
+  #4: CBOCs only
+  #5: must have scrssn_count_avg_fy18 >= 450
+sta5as_to_include <- access_metrics %>%#1: must have Access metrics
+  select(sta5a) %>%
+  inner_join(., vast %>% select(sta5a, s_abbr)) %>%#2: must be in VAST
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, "PC CRH", "No PC CRH")) %>%#making the crh_flag
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F #3: no missing scrssn_count_cat
+         & str_detect(s_abbr, "CBOC")#4: CBOCs only
+           & scrssn_count_cat != "< 450")#5: must have scrssn_count_avg_fy18 >= 450
+#=================
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df")
+#making the analytic dataset
+analytic_df <- covariates %>%# start with access metrics
+      rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+      filter(sta5a %in% sta5as_to_include$sta5a) %>%#restrict to our table from above
+      filter(vssc_month < ymd("2020-03-01") & vssc_month > ymd("2018-09-01")) %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, "PC CRH", "No PC CRH"),
+         prop_male = male_count / scrssn_count,
+         prop_white = race_white_count / scrssn_count,
+         prop_rural = urh_rural_count / scrssn_count)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This report is looks at the correlations between the covariates in our list of potential covariates 
+
+## Decision Points  
+
+* This is one of the steps we are taking before adding covariates to our CITS models
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, crh_flag) %>% distinct() %>% summarise(tot = sum(crh_flag == "PC CRH"))` of these met our criteria for PC CRH before March, 2020
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+    + Each row is a sta5a-month
+    
+```{r}
+corr_df <- analytic_df %>%
+  select(pc_crh_per_1k_total_pc, pcccr_per_10k_uniques,
+         avg_age_oct1_2020, nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr, est_pc_pt_wt, new_pc_pt_wt, third_next_avail,
+         adi_natRnk_avg, prop_male, prop_white, prop_rural, avg_driveDist,
+         shep_access_metric)
+#
+corr <- round(cor(corr_df, use = "complete.obs"), 1)
+#
+# Function to get correletions and p.values in a "long" data frame
+corr.data = function(data) {
+  
+  # Get correlations
+  cor.vals = cor(data, use = "complete.obs")
+  
+  # Get p-values
+  cor.p = corrplot::cor.mtest(data, conf.level = 0.95)$p
+  rownames(cor.p) = rownames(cor.vals)
+  colnames(cor.p) = colnames(cor.vals)
+  
+  cbind(rowvars=rownames(cor.vals), data.frame(cor.vals)) %>% 
+    gather(colvars, corr, -rowvars) %>% 
+    left_join(cbind(rowvars=rownames(cor.p), data.frame(cor.p)) %>% 
+                gather(colvars, p.value, -rowvars)) %>%
+    mutate(p.value = if_else(p.value < 0.001, "<0.001", 
+                             as.character(round(p.value, 2))))
+}
+
+#
+corr.data(corr_df) %>% 
+  ggplot(aes(colvars, fct_rev(rowvars))) +
+  geom_tile(colour="grey70", aes(fill = corr)) +
+  geom_text(aes(label=sprintf("%1.2f", corr)), position=position_nudge(y=0.2), 
+            size=3, colour="grey20") +
+  geom_text(aes(label=paste0("(",p.value,")")), position=position_nudge(y=-0.2), 
+            colour="grey20", size=2.5) +
+  scale_fill_gradient2(low="blue", mid="white", high="red", midpoint=0, limits=c(-1,1)) +
+  scale_size_continuous(range=c(8,12)) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1), 
+        axis.title = element_blank())
+```

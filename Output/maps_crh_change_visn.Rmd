@@ -1,0 +1,259 @@
+---
+title: "VISN Maps of CRH Encounters"
+date: "`r Sys.Date()`"
+output: 
+  pdf_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = '-')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(ggrepel)
+library(sf)
+library(tidyVA)
+library(RColorBrewer)
+#
+data("visn")
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 15),
+             strip.text = element_text(size = 15),
+             legend.text = element_text(size = 14),
+             legend.title = element_text(size = 16),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+#
+#sf::sf_use_s2(TRUE)
+```
+
+```{r reading-in}
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#==
+all_months <- seq.Date(ymd('2019-10-01'),ymd('2021-09-01'), by = 'month')
+#--
+all_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].encounter_counts") %>%
+  select(-contains("Vax")) %>%
+  mutate(vizMonth = ymd(vizMonth)) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name),
+         spoke_flag = if_else(sta6a %in% spokes_v, TRUE, FALSE),
+         fy = if_else(month(vizMonth) > 9, year(vizMonth) + 1, year(vizMonth)),
+         qtr = case_when(month(vizMonth) %in% c(10, 11, 12) ~ 1,
+                         month(vizMonth) %in% c(1, 2, 3) ~ 2,
+                         month(vizMonth) %in% c(4, 5, 6) ~ 3,
+                         month(vizMonth) %in% c(7, 8, 9) ~ 4)) %>%
+  filter(is.na(parent_visn) == F & fy %in% c(2020, 2021)) %>%
+  rename("Primary Care" = pc_encounters,
+         "Mental Health" = mh_encounters,
+         "Pharmacy" = pharmacy_encounters,
+         "PCMHI" = pcmhi_encounters)
+#
+spoke_encounters <- all_encounters %>% filter(spoke_flag == T)
+#==
+crh_encounters <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].crh_encounters_deDup") %>%
+  rename_all(tolower) %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  mutate(crh_month = ymd(crh_month))
+```
+
+```{r creating_data_frames}
+#--TOTAL
+crh_visn_total <- crh_encounters %>%
+  group_by(crh_month, parent_visn) %>%
+  summarise(crh_encounters = n())
+#
+all_visn_total <- spoke_encounters %>%
+  select(2:6, parent_visn) %>%
+  pivot_longer(-c(vizMonth, parent_visn)) %>%
+  group_by(vizMonth, parent_visn) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+total_visn_df <- crh_visn_total %>%
+  left_join(., all_visn_total, by = c("crh_month" = "vizMonth", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ungroup %>%
+  complete(crh_month = all_months, nesting(parent_visn))
+#==BY CARE TYPE
+crh_visn_type <- crh_encounters %>%
+  group_by(crh_month, parent_visn, care_type) %>%
+  summarise(crh_encounters = n())
+#
+all_visn_type <- spoke_encounters %>%
+  select(2:6, parent_visn) %>%
+  pivot_longer(-c(vizMonth, parent_visn)) %>%
+  group_by(vizMonth, parent_visn, name) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+type_visn_df <- crh_visn_type %>%
+  left_join(., all_visn_type, by = c("crh_month" = "vizMonth", "care_type" = "name", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ungroup %>%
+  complete(crh_month = all_months, nesting(parent_visn, care_type))
+#------- MAPS
+pct_change_total_map_df <- total_visn_df %>%
+  filter(crh_month == ymd("2019-10-01")) %>%
+  select(parent_visn, start_val = crh_per_1k_total) %>%
+  left_join(., total_visn_df %>% 
+              filter(crh_month == ymd('2021-09-01')) %>% 
+              select(parent_visn, final_val = crh_per_1k_total)) %>%
+  mutate(pct_change = (final_val - start_val) / abs(start_val),
+         change_val = final_val - start_val,
+         parent_visn = str_pad(parent_visn, pad = "0", side = "left", width = 2),
+         start_cat = factor(case_when(start_val < 4 ~ "< 4/1,000",
+                               start_val >= 4 & start_val <= 8 ~ "4-8/1,000",
+                               start_val > 8 & start_val <= 11 ~ "9-11/1,000",
+                               start_val > 11 ~ "> 12/1,000"),
+                            ordered = TRUE, levels = c("< 4/1,000", "4-8/1,000", "9-11/1,000", "> 12/1,000")),
+         start_cat2 = factor(case_when(
+           start_val < 1 ~ "< 1/1,000",
+           start_val >= 1 & start_val < 3 ~ "1-2.9/1,000",
+           start_val >= 3 & start_val < 5 ~ "3-4.9/1,000",
+           start_val >= 5 & start_val < 9 ~ "5-8.9/1,000",
+           start_val >= 9 & start_val < 12 ~ "9-11.9/1,000",
+           start_val >= 12 & start_val < 20 ~ "12-19.9/1,000",
+           start_val >= 20 ~ ">= 20"
+         ), ordered = TRUE, levels = c("< 1/1,000","1-2.9/1,000","3-4.9/1,000","5-8.9/1,000","9-11.9/1,000",
+                                       "12-19.9/1,000",">= 20")),
+         final_cat = factor(case_when(final_val < 10 ~ "< 10/1,000",
+                              final_val >= 10 & final_val < 20 ~ "10-19/1,000",
+                              final_val >= 20 & final_val < 25 ~ "20-24/1,000",
+                              final_val >= 25 ~ "> 24/1,000"),
+                            ordered = TRUE, levels = c("< 10/1,000", "10-19/1,000", "20-24/1,000", "> 24/1,000")),
+         final_cat2 = factor(case_when(
+           final_val < 10 ~ "< 10/1,000",
+           final_val >= 10 & final_val < 15 ~ "10-14.9/1,000",
+           final_val >= 15 & final_val < 20 ~ "15-19.9/1,000",
+           final_val >= 20 & final_val < 22 ~ "20-21.9/1,000",
+           final_val >= 22 & final_val < 40 ~ "22-39.9/1,000",
+           final_val >= 40 ~ ">= 40/1,000"
+         ), ordered = TRUE, levels = c("< 10/1,000","10-14.9/1,000","15-19.9/1,000","20-21.9/1,000",
+                                       "22-39.9/1,000",">= 40/1,000")),
+         change_cat = factor(case_when(
+           change_val < 6 ~ "< 6/1,000",
+           change_val >= 6 & change_val < 10 ~ "6-9.9/1,000",
+           change_val >= 10 & change_val < 13 ~ "10-12.9/1,000",
+           change_val >= 13 & change_val < 15 ~ "13-14.9/1,000",
+           change_val >= 15 & change_val < 20 ~ "15-19.9/1,000",
+           change_val >= 20 ~ ">= 20/1,000"
+         ), ordered = TRUE, levels = c("< 6/1,000","6-9.9/1,000","10-12.9/1,000","13-14.9/1,000","15-19.9/1,000",
+                                       ">= 20/1,000")),
+         pct_cat = factor(case_when(pct_change < 1 ~ "< 100%",
+                                    pct_change >= 1 & pct_change < 2 ~ "100-199%",
+                                    pct_change >= 2 & pct_change < 4 ~ "200-399%",
+                                    pct_change >= 4 & pct_change < 7 ~ "400-699%",
+                                    pct_change >= 7 ~ "700% +"),
+                          ordered = TRUE, levels = c("< 100%", "100-199%", "200-399%", "400-699%", "700% +")))
+#
+visn_total_map_df <- visn %>%
+  merge(., pct_change_total_map_df, by.y = "parent_visn", by.x = "VISN")
+```
+
+\newpage
+
+# CRH Encounters per 1,000 - October, 2019  
+
+```{r}
+shift_geo(visn_total_map_df) %>%
+  ggplot(aes(fill = start_cat2)) +
+  geom_sf() +
+  scale_fill_brewer(palette = "YlGn") +
+  theme_void() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 20))
+```
+
+\newpage
+
+# CRH Encounters per 1,000 - September, 2021  
+```{r}
+shift_geo(visn_total_map_df) %>%
+  ggplot(aes(fill = final_cat2)) +
+  geom_sf() +
+  scale_fill_brewer(palette = "YlGn") +
+  theme_void() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 20))
+```
+
+\newpage
+
+# % Change in CRH Encounters per 1,000 from October, 2019 to September, 2021  
+```{r}
+shift_geo(visn_total_map_df) %>%
+  ggplot(aes(fill = pct_cat)) +
+  geom_sf() +
+  scale_fill_brewer(palette = "YlGn") +
+  theme_void() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 20))
+```
+
+\newpage
+
+# Absolute Change in CRH Encounters per 1,000 from October, 2019 to September, 2021    
+```{r}
+shift_geo(visn_total_map_df) %>%
+  ggplot(aes(fill = change_cat)) +
+  geom_sf() +
+  scale_fill_brewer(palette = "YlGn") +
+  theme_void() +
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 20))
+```
+
+\newpage
+
+# As a Table  
+```{r}
+pct_change_total_map_df %>%
+  select(parent_visn, start_val, final_val, change_val, pct_change) %>%
+  mutate(start_val = round(start_val, 1),
+         final_val = round(final_val, 1),
+         change_val = round(change_val, 1),
+         pct_change = paste0(round(pct_change * 100, 1), "%")) %>%
+  select(parent_visn, start_val, final_val, change_val, pct_change) %>%
+  kbl(col.names = c("VISN", "October, 2019", "September, 2021", "Absolute Change", "Percent Change"),
+      align = c("c", "r", "r", "r", "r")) %>%
+  kable_classic("striped", latex_options = c("hold_position"))
+```

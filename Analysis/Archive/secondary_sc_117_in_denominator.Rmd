@@ -1,0 +1,290 @@
+---
+title: "PC CRH Denominator: What is the distribution of SecondaryStopCode = 117?"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+#--
+colorize <- function(x, color) {
+  if (knitr::is_latex_output()) {
+    sprintf("\\textcolor{%s}{%s}", color, x)
+  } else if (knitr::is_html_output()) {
+    sprintf("<span style='color: %s;'>%s</span>", color,
+      x)
+  } else x
+}
+```
+
+```{r reading-in}
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#===================
+# PC CRH Encounters
+pc_crh_encounters <- dbGetQuery(oabi_con,
+                             "select * from [PACT_CC].[CRH].[crh_full_utilization_final_fy20_21]") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr),
+         ssc_117_flag = if_else(secondarystopcode == 117, T, F)) %>%
+  left_join(., vast, by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  rename(sta5a = spoke_sta5a_combined_cdw) %>%
+  filter(fy %in% c(2020, 2021) 
+         & care_type == "Primary Care")
+#---
+pc_psc_ssc <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].stopCode_combos
+                         where careType = 'PC'") %>%
+  arrange(desc(sc_count))
+```
+
+# Review    
+* Below are the top 25 Primary & Secondary stop code combinations using the following criteria to pull PC encounters from CDW:
+    + `r colorize("PrimaryStopCode in (156, 176, 177, 178, 301, 322, 323, 338, 348) AND (SecondaryStopCode not in(160, 534, 539) OR SecondaryStopCode IS NULL)", "red")`
+    + `r colorize("OR (PrimaryStopCode not in(160, 534, 539) AND SecondaryStopCode in (156, 176, 177, 178, 301, 322, 323, 338, 348))", "red")` 
+* There are a total of `r nrow(pc_psc_ssc)` stop code combinations  
+					
+```{r} 
+#
+pc_psc_ssc %>%
+  select(pStopCode_, pStopCodeName_,
+         sStopCode_, sStopCodeName_, sc_count) %>%
+  slice_head(., n = 25) %>%
+  mutate(prop = round(sc_count / sum(pc_psc_ssc$sc_count) * 100, 1),
+         pStopCode_ = as.character(pStopCode_),
+         sStopCode_ = as.character(sStopCode_),
+         sc_count = as.character(scales::comma(sc_count))) %>%
+  janitor::adorn_totals() %>%
+  mutate(prop = paste0(prop, "%")) %>%
+  kbl(align = c("c", "l", "c", "l", "r", "r"),
+      col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "Total Encounters", "Proportion of total")) %>%
+  kable_classic("striped")
+#
+sc_117_as_total <- pc_psc_ssc %>%
+  filter(sStopCode_ == 117) %>%
+  summarise(total_with_ssc_117 = sum(sc_count)) %>%
+  pull
+#=======
+ssc_117_sta5a <- dbGetQuery(oabi_con,
+                            "select * from [OABI_MyVAAccess].[crh_eval].ssc_117_sta5a")
+#
+ssc_total_sta5a <- dbGetQuery(oabi_con,
+                              "select * from [OABI_MyVAAccess].[crh_eval].stopCode_combos_sta5a") %>%
+  filter(careType == "PC") %>%
+  group_by(Sta6a) %>%
+  summarise(total_pc_sc = sum(sc_count)) %>%
+  rename(sta6a = Sta6a)
+#
+ssc_117_as_prop_of_total <- ssc_117_sta5a %>%
+  left_join(., ssc_total_sta5a) %>%
+  mutate(prop = ssc_117_count / total_pc_sc) %>%
+  filter(prop < 1)
+```
+
+* A total of `r scales::comma(sc_117_as_total)` out of `r scales::comma(sum(pc_psc_ssc$sc_count))` encounters (`r round(sc_117_as_total / sum(pc_psc_ssc$sc_count) * 100, 1)`%) identified using the method above have a Secondary Stop Code of __117 "NURSING (2ND ONLY)"__ 
+* Out of a total `r scales::comma(nrow(pc_crh_encounters))` PC CRH Encounters we identified only `r scales::comma(sum(pc_crh_encounters$ssc_117_flag, na.rm = T))` (`r round(sum(pc_crh_encounters$ssc_117_flag, na.rm = T) / nrow(pc_crh_encounters) * 100, 1)`%) with a Secondary Stop Code of __117 "NURSING (2ND ONLY)"__
+* What is the distribution of the proportion of a sta5a's PC encounters that are = 117? Is use of SSC = 117 colinear with other characteristics?   
+    + The plots below have `r scales::comma(nrow(ssc_117_as_prop_of_total))` observations (i.e., sta5as), from April 1st, 2019 through December 31st, 2021
+    
+
+$$\frac{\sum{\text{PC Encounters SSC = 117}}}{\sum{\text{All PC Encounters}}}\times 100$$
+
+# National Distribution  
+```{r}
+#--
+nat_p1 <- ggplot(data = ssc_117_as_prop_of_total,
+       aes(x = prop)) +
+  geom_histogram(bins = 100,
+                 color = "black",
+                 fill = "red") +
+  scale_x_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1)) +
+  labs(x = "Proportion of Total",
+       y = "Number of Sta5as")
+#
+nat_p2 <- ggplot(data = ssc_117_as_prop_of_total,
+       aes(y = prop)) +
+  geom_boxplot(color = "black",
+               fill = "royalblue") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1)) +
+  labs(y = "Proportion of Total") +
+  theme(axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank())
+#--
+multiplot(nat_p1, nat_p2)
+```
+
+# By VISN  
+
+```{r}
+ssc_117_as_prop_of_total %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+         aes(x = prop)) +
+  geom_histogram(bins = 50,
+                 color = "black",
+                 fill = "darkorchid3") +
+  scale_x_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1),
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  scale_y_continuous(limits = c(0, 10), 
+                     breaks = c(0, 2, 4, 6, 8, 10)) +
+  facet_wrap(~parent_visn) +
+  labs(x = "Proportion of Total",
+       y = "Number of Sta5as")
+#
+ssc_117_as_prop_of_total %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+         aes(y = prop)) +
+  geom_boxplot(color = "black",
+                 fill = "firebrick") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1),
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  facet_wrap(~parent_visn) +
+  labs(y = "Proportion of Total") +
+  theme(axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  geom_hline(yintercept = 0.31,
+             lty = 2)
+```
+
+# By Site Type  
+```{r}
+ssc_117_as_prop_of_total %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+         aes(x = prop)) +
+  geom_histogram(bins = 50,
+                 color = "black",
+                 fill = "red") +
+  facet_wrap(~s_abbr) +
+  labs(x = "Proportion of Total",
+       y = "Number of Sta5as") +
+  scale_x_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1),
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  scale_y_continuous(limits = c(0, 40), 
+                     breaks = c(0, 10, 20, 30, 40))
+#--
+ssc_117_as_prop_of_total %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+         aes(y = prop)) +
+  geom_boxplot(color = "black",
+               fill = "dodgerblue") +
+  facet_wrap(~s_abbr) +
+  labs(y = "Proportion of Total") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1),
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  theme(axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  geom_hline(yintercept = 0.31,
+             lty = 2)
+```
+
+# CRH Site vs. Not CRH Site  
+
+```{r}
+pc_crh_sta5a <- pc_crh_encounters %>%
+  select(sta5a) %>%
+  distinct %>% pull
+#
+crh_flag <- vast %>%
+  select(sta5a) %>%
+  distinct() %>%
+  mutate(crh_flag = if_else(sta5a %in% pc_crh_sta5a, "CRH Site", "Not CRH Site"))
+#
+ssc_117_as_prop_of_total %>%
+  left_join(., crh_flag, by = c("sta6a" = "sta5a")) %>%
+  filter(is.na(crh_flag) == F) %>%
+  ggplot(data = .,
+         aes(x = prop)) +
+  geom_histogram(bins = 50,
+                 color = "black",
+                 fill = "red") +
+  facet_wrap(~crh_flag) +
+  labs(x = "Proportion of Total",
+       y = "Number of Sta5as") +
+  scale_x_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1),
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  scale_y_continuous(limits = c(0, 45), 
+                     breaks = c(0, 10, 20, 30, 40))
+#
+#
+ssc_117_as_prop_of_total %>%
+  left_join(., crh_flag, by = c("sta6a" = "sta5a")) %>%
+  filter(is.na(crh_flag) == F) %>%
+  ggplot(data = .,
+         aes(y = prop)) +
+  geom_boxplot(color = "black",
+                 fill = "forestgreen") +
+  facet_wrap(~crh_flag) +
+  labs(y = "Proportion of Total") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1),
+                     breaks = c(0, 0.25, 0.5, 0.75, 1)) +
+  theme(axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) +
+  geom_hline(yintercept = 0.31,
+             lty = 2)
+```

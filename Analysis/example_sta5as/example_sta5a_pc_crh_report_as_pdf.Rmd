@@ -1,0 +1,481 @@
+---
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  pdf_document:
+    toc: false
+urlcolor: blue
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, echo = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(jsonlite)
+library(httr)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+pactCC_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+
+
+```{r query_va_location_api, echo = FALSE}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#--
+age <- dbGetQuery(oabi_con,
+                  "select * from [crh_eval].D1_age_sta5a_qtr")
+#
+race_gender_urh <- dbGetQuery(oabi_con,
+                              "select * from [crh_eval].D2_race_gender_urh_count")
+#
+adi <- dbGetQuery(oabi_con,
+                  "select * from [crh_eval].D3_adi_sta5a_qtr")
+#---
+pcmm_count <- dbGetQuery(pactCC_con,
+                         "select count(distinct ScrSSN_char) as pcmm_scrssn_count, Sta5a
+from [PACT_CC].[econ].PatientPCP
+where fy = 2020 AND qtr = 1
+group by sta5a") %>%
+  mutate(pcmm_scrssn_count = comma(pcmm_scrssn_count, accuracy = 1))
+#--
+penRate <- dbGetQuery(oabi_con,
+                      "select pr.*
+                    	, crh_flag = case
+                    		when c1.crh_10_flag = 1 then 1
+                    		else 0 end
+                      from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate as pr
+                      left join [OABI_MyVAAccess].[crh_eval].C1_crh_flag as c1
+	                    on pr.sta5a = c1.sta5a") %>%
+  inner_join(., vast) %>%
+  mutate(crh_month = ymd(crh_month),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(
+           month(crh_month) %in% c(10, 11, 12) ~ 1,
+           month(crh_month) %in% c(1, 2, 3) ~ 2,
+           month(crh_month) %in% c(4, 5, 6) ~ 3,
+           month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fy_qtr = str_c(fy, qtr, sep = "-"),
+         short_name = gsub(",.*", "", short_name),
+         sta5a_lab = paste0("(", sta5a, ") ", short_name))
+#--
+rural_prop <- dbGetQuery(oabi_con,
+                         "select urh.sta5a, urh.urh_rural_count, urh.scrssn_count
+                              
+                    	, crh_flag = case
+                    		when c1.crh_10_flag = 1 then 1
+                    		else 0 end
+                      from [crh_eval].D2_race_gender_urh_count as urh
+                      inner join [OABI_MyVAAccess].[crh_eval].C1_crh_flag as c1
+	                    on urh.sta5a = c1.sta5a
+                              where urh.fy = 2020 AND urh.qtr = 1") %>%
+  mutate(prop_rural = urh_rural_count / scrssn_count) %>%
+  filter(crh_flag == 1) %>%
+  left_join(., penRate %>% group_by(sta5a) %>% summarise(total_pc_crh = sum(crh_encounter_count, na.rm = T)))
+#-------------------------------------
+has_gap_metric <- read_csv("//vhacdwdwhapp15.vha.med.va.gov/PACT_CC/CRH/Documentation/Gap Metric/GapData_Jan2022.csv") %>%
+  rename_all(tolower) %>%
+  mutate(moyear = ymd(moyear)) %>%
+  filter(moyear >= ymd("2019-10-01") & moyear <= ymd("2021-12-01")) %>%
+  inner_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name)) %>%
+  group_by(sta6a) %>%
+  summarise(months_w_gap_metric = sum(!is.na(gap))) %>%
+  filter(months_w_gap_metric > 1) %>%
+  select(sta6a) %>%
+  pull
+#-----------------------------------ò--
+small_clinics_3_4ths_rural <- rural_prop %>%
+  filter(scrssn_count < 4500 
+         & prop_rural > 0.75
+         & total_pc_crh > 1000
+         & sta5a %in% has_gap_metric) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  arrange(parent_visn) %>%
+  select(sta5a) %>%
+  pull
+#===============
+gap_metric <- read_csv("//vhacdwdwhapp15.vha.med.va.gov/PACT_CC/CRH/Documentation/Gap Metric/GapData_Jan2022.csv") %>%
+  rename_all(tolower) %>%
+  mutate(moyear = ymd(moyear)) %>%
+  filter(moyear >= ymd("2019-10-01") & moyear <= ymd("2021-12-01")) %>%
+  inner_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name))
+```
+
+
+```{r functions}
+phrase_fxn <- function(sta5a){
+  headers = c(
+  `apikey` = 'IXCQi6rtiZFA4tMhDOWpHqJf6oeA1Cg1')
+#
+  url_for_pull = paste0("https://sandbox-api.va.gov/services/va_facilities/v0/facilities/vha_", sta5a)
+  #--
+  apiResults <- fromJSON(content(GET(url = url_for_pull,
+                                     add_headers(.headers=headers)), 
+                                 "text"),
+                         flatten = TRUE)
+  # Phrases
+  location_phrase <- paste0("Located in ", apiResults$data$attributes$address$physical$city, ", ",
+                            apiResults$data$attributes$address$physical$state,
+                            " (VISN ", apiResults$data$attributes$visn, ")")
+  #--
+  hours <- apiResults$data$attributes$hours %>% unlist()
+  days_phrase <- case_when(
+    sum(hours[1:7] == "24/7") == 7 ~ "7 days per week",
+    sum(hours[6:7] == "Closed") == 2 & sum(hours[1:5] == "Closed") == 0 ~ "M-F",
+    sum(hours[1:4] == "800AM-430PM") == 3 & hours[3] == "800AM-630PM" ~ "",
+    sum(hours[5:7] == "Closed") == 3 & sum(hours[1:4] == "Closed") == 0 ~ "M-Th",
+    TRUE ~ "How do this?"
+  )
+  #
+  open_phrase <- case_when(
+    sum(hours[1:7] == "24/7") == 7 ~ "24 hours",
+    sum(hours[1:5] == "700AM-530PM") == 5 ~ "7:00-5:30",
+    sum(hours[1:5] == "700AM-330PM") == 5 ~ "7:00-3:30",
+    sum(hours[1:5] == "730AM-400PM") == 5 ~ "7:30-4:00",
+    sum(hours[1:5] == "730AM-430PM") == 5 ~ "7:30-4:30",
+    sum(hours[1:5] == "800AM-430PM") == 5 ~ "8:00-4:30",
+    sum(hours[1:5] == "800AM-400PM") == 5 ~ "8:00-4:00",
+    sum(hours[1:4] == "800AM-430PM") == 5 ~ "8:00-4:30",
+    sum(hours[1:4] == "800AM-430PM") == 3 & hours[3] == "800AM-630PM" ~ "8:00-4:30 M, Tu, Th, 8:00-6:30 We",
+    TRUE ~ "This too?"
+  )
+  #--
+  hours_phrase <- paste0(open_phrase, ", ", days_phrase)
+  #
+  classification_phrase <- case_when(
+    str_detect(apiResults$data$attributes$classification, "OOS") == T ~ 
+      paste0("They are classified as an ", apiResults$data$attributes$classification, " site"),
+    TRUE ~ paste0("They are classified as a ", apiResults$data$attributes$classification, " site")
+  )
+  #
+  website <- apiResults$data$attributes$website
+  #--
+  sta5a_lab_phrase <- paste0("V", 
+                             str_pad(apiResults$data$attributes$visn,
+                                     side = "left", width = 2, pad = "0"), 
+                             " (", sta5a, ") ",apiResults$data$attributes$name)
+#
+phrase_list <- list(location = location_phrase, hours = hours_phrase, classification = classification_phrase,
+                    sta5a_lab = sta5a_lab_phrase,
+                    website = website) 
+#
+return(phrase_list)
+}
+#--=========--------------
+demog_fxn <- function(sta5a){
+  bind_rows(
+  adi %>% 
+    filter(Sta5a == sta5a & fy == 2020 & qtr == 1) %>%
+    mutate(label = "ADI Average (SD)",
+           measure = paste0(round(adi_natRnk_avg, 1), " (", round(adi_natRnk_sd, 1), ")")) %>%
+    select(label, measure),
+  #
+  age %>%
+    filter(Sta5a == sta5a & FY == 2020 & QTR == 1) %>%
+    mutate(label = "Average Age (SD)",
+           measure = paste0(round(avg_age_oct1_2020, 1), " (", round(std_age_oct1_2020, 1), ")")) %>%
+    select(label, measure),
+  #
+  race_gender_urh %>%
+    filter(Sta5a == sta5a & FY == 2020 & QTR == 1) %>%
+    mutate(label = "Male",
+           measure = percent(male_count / scrssn_count, accuracy = 0.1)) %>%
+    select(label, measure),
+  #
+  race_gender_urh %>%
+    filter(Sta5a == sta5a & FY == 2020 & QTR == 1) %>%
+    mutate(label = "White",
+           measure = percent(race_white_count / scrssn_count, accuracy = 0.1)) %>%
+    select(label, measure),
+  #
+  race_gender_urh %>%
+    filter(Sta5a == sta5a & FY == 2020 & QTR == 1) %>%
+    mutate(label = "Rural",
+           measure = percent(urh_rural_count / scrssn_count, accuracy = 0.1)) %>%
+    select(label, measure),
+  #
+  pcmm_count %>%
+    filter(Sta5a == sta5a) %>%
+    mutate(label = "Uniques in PCMM") %>%
+    select(label, measure = pcmm_scrssn_count)) %>%
+  #
+  kbl(col.names = c("Demographic", "Measure"),
+      align = c("l", "r"),
+      format = 'latex') %>%
+  kable_classic("striped",
+                full_width = FALSE,
+                font_size = 14,
+                position = "left") %>%
+  row_spec(0, bold = TRUE,
+           font_size = 16)
+}
+#----------------------------------------------
+plot_fxn <- function(sta5a){
+pr1 <- penRate %>%
+  filter(!! sta5a == sta5a) %>%
+  group_by(crh_month, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "PC Not CRH" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(crh_month, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = value, group = name, fill = name)) +
+  geom_bar(position = "stack", stat = "identity") +
+  ggsci::scale_fill_aaas() +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  scale_x_date(breaks = "2 months", date_labels = "%b-%Y") +
+  labs(y = "Encounters",
+       x = "Month") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "bottom") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+             lty = 2)
+#
+pr2 <- penRate %>%
+  filter(!! sta5a == sta5a) %>%
+  group_by(crh_month, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "PC Not CRH" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(crh_month, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = value, group = name, fill = name)) +
+  geom_bar(position = "fill", stat = "identity") +
+  ggsci::scale_fill_aaas() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_x_date(breaks = "2 months", date_labels = "%b-%Y") +
+  labs(y = "Proportion of Encounters",
+       x = "Month") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.title = element_blank(),
+        legend.position = "bottom") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+             lty = 2)
+#
+multiplot(pr1, pr2, cols = 2)}
+#-------------------------------
+gap_plot_fxn <- function(sta5a){
+  gap_subset <- gap_metric %>%
+    filter(sta6a == sta5a) %>%
+    select(sta5a_lab, moyear, expected, observed, gap) %>%
+    pivot_longer(-c(moyear, sta5a_lab)) %>%
+    filter(str_detect(name, "gap"))
+  #
+  ymax_val <- plyr::round_any(max(gap_subset$value, na.rm = TRUE), 0.5, ceiling)
+  #
+  gap_plot <- gap_subset %>%
+    ggplot(data = .,
+           aes(x = moyear, y = value, color = name)) +
+    scale_y_continuous(limits = c(0.5, ymax_val), 
+                       breaks = seq(0.5, ymax_val, 0.5)) +
+    theme(legend.position = "none",
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    scale_x_date(breaks = "2 months", date_labels = "%b-%Y") +
+    labs(y = "Gap Metric") +
+    geom_rect(aes(xmin = ymd("2019-10-01"),
+                  xmax = ymd("2021-12-01"),
+                  ymin = 0.5,
+                  ymax = 1.0),
+              fill = "red", 
+              alpha = 0.02,
+              color = NA) +
+    geom_rect(aes(xmin = ymd("2019-10-01"),
+                  xmax = ymd("2021-12-01"),
+                  ymin = 1.0,
+                  ymax = 1.2),
+              fill = "gold", 
+              alpha = 0.02, 
+              color = NA) +
+    geom_rect(aes(xmin = ymd("2019-10-01"),
+                  xmax = ymd("2021-12-01"),
+                  ymin = 1.2,
+                  ymax = ymax_val),
+              fill = "forestgreen", 
+              alpha = 0.02,
+              color = NA) +
+    geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+               lty = 2) +
+    geom_line(size = 1,
+              color = "black")
+  #
+  print(gap_plot)
+}
+#============
+obsExp_plot_fxn <- function(sta5a){
+  gap_subset_exp <- gap_metric %>%
+    filter(sta6a == sta5a) %>%
+    select(sta5a_lab, moyear, expected, observed, gap) %>%
+    pivot_longer(-c(moyear, sta5a_lab)) %>%
+    filter(name == "expected")
+  #
+  ymax_exp_val <- plyr::round_any(max(gap_subset_exp$value, na.rm = TRUE), 1000, ceiling)
+  #
+  ymin_exp_val <- plyr::round_any(min(gap_subset_exp$value, na.rm = TRUE), 500, floor)
+  #==
+  gap_subset_obs <- gap_metric %>%
+    filter(sta6a == sta5a) %>%
+    select(sta5a_lab, moyear, expected, observed, gap) %>%
+    pivot_longer(-c(moyear, sta5a_lab)) %>%
+    filter(name == "observed")
+  #
+  ymax_obs_val <- plyr::round_any(max(gap_subset_obs$value, na.rm = TRUE), 1000, ceiling)
+  #
+  ymin_obs_val <- plyr::round_any(min(gap_subset_obs$value, na.rm = TRUE), 500, floor)
+  #--
+  ymax_val <- if_else(ymax_obs_val >= ymax_exp_val, ymax_obs_val, ymax_exp_val)
+  ymin_val <- if_else(ymin_obs_val <= ymin_exp_val, ymin_obs_val, ymin_exp_val)
+#
+  exp <- ggplot(data = gap_subset_exp,
+         aes(x = moyear, y = value, group = name, color = name)) +
+    geom_line(size = 1,
+              color = "forestgreen") +
+    theme(legend.position = "none",
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    scale_y_continuous(limits = c(ymin_val, ymax_val),
+                       labels = comma_format(accuracy = 1)) +
+    scale_x_date(breaks = "2 months", date_labels = "%b-%Y") +
+    labs(y = "Expected")  +
+    geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+               lty = 2)
+  #
+  obs <- ggplot(data = gap_subset_obs,
+           aes(x = moyear, y = value, group = name, color = name)) +
+    geom_line(size = 1,
+              color = "royalblue") +
+    theme(legend.position = "none",
+          axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    scale_y_continuous(limits = c(ymin_val, ymax_val),
+                       labels = comma_format(accuracy = 1)) +
+    scale_x_date(breaks = "2 months", date_labels = "%b-%Y") +
+    labs(y = "Observed")  +
+    geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+               lty = 2)
+  #
+  multiplot(exp, obs, cols = 2)
+}
+```
+
+```{r results = 'asis'}
+for (i in 1:length(small_clinics_3_4ths_rural)){
+  phrase_list <- phrase_fxn(small_clinics_3_4ths_rural[i])
+  #
+  demog <- demog_fxn(small_clinics_3_4ths_rural[i])
+  #
+  cat("\n")
+  cat("\\newpage")
+  cat("\n")
+  # 
+  cat(paste0("# ", phrase_list$sta5a_lab, "   "))
+  #
+  cat("\n\n")
+  #
+  cat(paste0("## Demographics  "))
+  cat("\n")
+  #
+  cat(paste0("* [", phrase_list$location, "]","(", phrase_list$website, ")"))
+  cat("\n")
+  cat(paste0("* They are open ", phrase_list$hours))
+  cat("\n")
+  cat(paste0("* ", phrase_list$classification))
+  cat("\n")
+  cat("* Regarding the ADI:")
+  cat("\n")
+  cat("  + This is the [Area Deprivation Index](https://www.neighborhoodatlas.medicine.wisc.edu/)")
+  cat("\n")
+  cat("  + A lower ADI indicates less disadvantage")
+  cat("\n")
+  cat("  + In FY21, Q4 the national average in PCMM was 53.2")
+  cat("\n")
+  #
+  #cat("\\newpage")
+  # 
+  cat("\n")
+  cat(demog)
+  #
+  cat("\n")
+  cat("\\pagebreak")
+  cat("\n")
+  # 
+  cat(paste0("## PC CRH Penetration Rate  "))
+  cat("\n")
+  cat("* These plots show the degree to which the CRH provides Primary Care at this sta5a")
+  cat("\n")
+  cat("* On the left are monthly Primary Care encounter counts, with color indicating whether the encounters are attributed to CRH or not")
+  cat("\n")
+  cat("* On the right those same counts are presented as a proportion of the total")
+  cat("\n\n\n")
+  plot_fxn(small_clinics_3_4ths_rural[i])
+  #
+  cat("\n")
+  cat("\\pagebreak")
+  cat("\n\n")
+  #
+  cat(paste0("## PC Gap Metric  "))
+  cat("\n")
+  cat("* The Primary Care Gap Metric is a measure of staffing adequacy at the sta5a-level")
+  cat("\n")
+  cat(paste0("$$Gap\\:Metric\\:=\\:\\frac{Maximum\\:Clinic\\:Capacity}{Total\\:Clinic\\:Assigned\\:Panel\\:Size}$$"))
+  cat("\n")
+  cat("* A value below 1.0 indicates an under-staffed sta5a")
+  cat("\n")
+  cat("* A value between 1 and 1.2 indicates a marginally-staffed sta5a")
+  cat("\n")
+  cat("* A value greater than 1.2 indicates an adequately-staffed sta5a")
+  cat("\n\n\n")
+  gap_plot_fxn(small_clinics_3_4ths_rural[i])
+  cat("\n")
+  #
+  # cat("\n")
+  # cat("\\pagebreak")
+  # cat("\n\n")
+  # #
+  # cat(paste0("## Components of the PC Gap Metric  "))
+  # cat("\n")
+  # obsExp_plot_fxn(small_clinics_3_4ths_rural[i])
+  # cat("\n")
+}
+```
+
+

@@ -1,0 +1,364 @@
+---
+title: "PC CRH Matching"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 8, fig.height = 8)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+gap_join_dates <- dbGetQuery(oabi_con,
+                         "with cte as(
+select sta5a, dateadd(MONTH, -1, first_mo_w_mt9_pc_crh) as month_for_joining
+from [OABI_MyVAAccess].[crh_eval].C1_crh_flag
+where crh_10_flag = 1)
+select cte.sta5a
+	, cte.month_for_joining
+from cte as cte
+UNION
+select sta5a
+	, cast('2019-09-01' as date) as month_for_joining
+from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06
+where sta5a NOT IN (select sta5a from [OABI_MyVAAccess].[crh_eval].C1_crh_flag where crh_10_flag = 1)") %>%
+  mutate(month_for_joining = ymd(month_for_joining),
+         month_minus_2 = month_for_joining - months(2))
+#=====
+gap_metric <- read_csv("//vhacdwdwhapp15.vha.med.va.gov/PACT_CC/CRH/Documentation/Gap Metric/GapData_Jan2022.csv") %>%
+  rename_all(tolower) %>%
+  mutate(moyear = ymd(moyear))
+#-----
+gap_avg <- gap_join_dates %>%
+  left_join(., gap_metric, by = c("sta5a" = "sta6a")) %>%
+  filter(moyear >= month_minus_2 & moyear <= month_for_joining) %>%
+  group_by(sta5a) %>%
+  summarise(gap_3mo_avg = mean(gap, na.rm = T))
+#===
+sta5a_demog <- dbGetQuery(oabi_con,
+                          "select vast.sta5a
+	, at_least_10_pc_crh_flag = case	
+		when crh_flag.crh_10_flag = 1 then 1
+		else 0 end
+	, vast.parent_visn
+	, urh = case 
+		when vast.urh_vast = 'U' then 'U'
+		when vast.urh_vast <> 'U' then 'R'
+		end
+	, vast.census_division
+	, vast.s_abbr
+	, vssc.nosos_3mo_avg
+	, vssc.obs_exp_panel_ratio_3mo_avg
+	, vssc.team_pcp_ap_fte_total_3mo_avg
+	, pcmm.pcmm_scrssn_count
+	, access.est_pc_pt_wt_3mo_avg
+	, access.new_pc_pt_wt_3mo_avg
+	, access.third_next_avail_3mo_avg
+	, adi.adi_natRnk_avg
+	, age.avg_age_oct1_2020
+	, prop_male = cast(demog.male_count as float) / cast(demog.scrssn_count as float)
+	, prop_white = cast(demog.race_white_count as float) / cast(demog.scrssn_count as float)
+	, prop_rural = cast(demog.urh_rural_count as float) / cast(demog.scrssn_count as float)
+from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06 as vast
+left join [OABI_MyVAAccess].[crh_eval].C1_crh_flag as crh_flag
+	on vast.sta5a = crh_flag.sta5a
+left join [OABI_MyVAAccess].[crh_eval].F1_3_vssc_3mo_avg as vssc
+	on vast.sta5a = vssc.sta5a
+left join [OABI_MyVAAccess].[crh_eval].F2_pcmm_scrssn_count_avg as pcmm
+	on vast.sta5a = pcmm.sta5a
+left join [OABI_MyVAAccess].[crh_eval].F3_access_metrics_3mo_avg as access
+	on vast.sta5a = access.sta5a
+left join [OABI_MyVAAccess].[crh_eval].F4_adi_avg as adi
+	on vast.sta5a = adi.sta5a
+left join [OABI_MyVAAccess].[crh_eval].D1_age_sta5a_qtr as age
+	on vast.sta5a = age.Sta5a
+left join [OABI_MyVAAccess].[crh_eval].D2_race_gender_urh_count as demog
+	on vast.sta5a = demog.Sta5a
+where age.FY = 2020 AND age.QTR = 1
+	AND demog.fy = 2020 AND demog.qtr = 1") %>%
+  mutate(parent_visn = factor(parent_visn),
+         adi_cat = case_when(adi_natRnk_avg < 25 ~ "0-24",
+                             adi_natRnk_avg >= 25 & adi_natRnk_avg < 50 ~ "25-49",
+                             adi_natRnk_avg >= 50 & adi_natRnk_avg < 75 ~ "50-74",
+                             adi_natRnk_avg >= 75 ~ "75-100"),
+         treat = if_else(at_least_10_pc_crh_flag == 1, 0, 1),
+         s_abbr2 = case_when(s_abbr %in% c("MSCBOC", "PCCBOC") ~ "CBOC",
+                             s_abbr %in% c("HCC", "VAMC") ~ "VAMC/HCC",
+                             TRUE ~ s_abbr)) %>%
+  left_join(., gap_avg)
+#
+sta5a_demog_no_missing <- sta5a_demog %>%
+  drop_na()
+#
+# write_csv(sta5a_demog_no_missing,
+#           here("Analysis", "PS Matching", "sta5a_demog_no_missing.csv"))
+#sta5a_demog %>% filter(sta5a %ni% sta5a_demog_no_missing$sta5a)
+```
+
+# [Nearest Neighbor (1:1) Matching](https://cran.r-project.org/web/packages/MatchIt/vignettes/matching-methods.html#nearest-neighbor-matching-method-nearest)  
+* Model: Treatment = 
+    + Parent VISN (Exact)
+    + Census Division
+    + NOSOS (3 month average)
+    + Observed:Expected PC Panel Size (3 month average)
+    + Team PCP/AP FTE (3 month average)
+    + Uniques in PCMM (2 quarter average)
+    + Established patient wait time (3 month average)
+    + New patient wait time (3 month average)
+    + Third next available (3 month average)
+    + ADI (3 month average)
+    + Average age October 1st, 2020
+    + Proportion male
+    + Proportion white
+    + Proportion rural
+    + Gap Metric (3 month average)
+
+* Out of `r nrow(sta5a_demog) %>% comma(accuracy = 1)` sta5as included, `r nrow(sta5a_demog_no_missing) %>% comma(accuracy = 1)` have complete data for all of these covariates
+
+```{r}
+#-- nearest neighbor (1:1) matching
+nn_match <- matchit(at_least_10_pc_crh_flag ~ 
+                        parent_visn 
+                      + census_division 
+                      + s_abbr2
+                      + nosos_3mo_avg
+                      + obs_exp_panel_ratio_3mo_avg
+                      + team_pcp_ap_fte_total_3mo_avg
+                      + pcmm_scrssn_count
+                      + est_pc_pt_wt_3mo_avg
+                      + new_pc_pt_wt_3mo_avg
+                      + third_next_avail_3mo_avg
+                      + adi_natRnk_avg
+                      + avg_age_oct1_2020
+                      + prop_male 
+                      + prop_white
+                      + prop_rural
+                      + gap_3mo_avg,
+                      data = sta5a_demog_no_missing,
+                      method = "nearest",
+                      distance = "glm",
+                      link = "logit",
+                      exact = ~parent_visn)
+#
+nn_get_matches <- get_matches(nn_match)
+#
+print(nn_match)
+```
+
+* This yields `r nrow(nn_get_matches) / 2` pairs 
+
+```{r}
+plot(nn_match, type = "jitter", interactive = FALSE)
+```
+
+```{r}
+plot(summary(nn_match), position = NULL)
+```
+
+# [Optimal (Pair) Matching](https://cran.r-project.org/web/packages/MatchIt/vignettes/matching-methods.html#optimal-pair-matching-method-optimal)  
+* Model: Treatment = 
+    + Parent VISN (Exact)
+    + Census Division
+    + NOSOS (3 month average)
+    + Observed:Expected PC Panel Size (3 month average)
+    + Team PCP/AP FTE (3 month average)
+    + Uniques in PCMM (2 quarter average)
+    + Established patient wait time (3 month average)
+    + New patient wait time (3 month average)
+    + Third next available (3 month average)
+    + ADI (3 month average)
+    + Average age October 1st, 2020
+    + Proportion male
+    + Proportion white
+    + Proportion rural
+    + Gap Metric (3 month average)
+
+* Out of `r nrow(sta5a_demog) %>% comma(accuracy = 1)` sta5as included, `r nrow(sta5a_demog_no_missing) %>% comma(accuracy = 1)` have complete data for all of these covariates
+
+```{r}
+#-- optimal matching
+opt_match <- matchit(at_least_10_pc_crh_flag ~ 
+                        parent_visn 
+                      + census_division 
+                      + s_abbr2
+                      + nosos_3mo_avg
+                      + obs_exp_panel_ratio_3mo_avg
+                      + team_pcp_ap_fte_total_3mo_avg
+                      + pcmm_scrssn_count
+                      + est_pc_pt_wt_3mo_avg
+                      + new_pc_pt_wt_3mo_avg
+                      + third_next_avail_3mo_avg
+                      + adi_natRnk_avg
+                      + avg_age_oct1_2020
+                      + prop_male 
+                      + prop_white
+                      + prop_rural
+                      + gap_3mo_avg,
+                      data = sta5a_demog_no_missing,
+                      method = "optimal",
+                      distance = "glm",
+                      link = "logit",
+                      exact = ~parent_visn)
+#
+opt_get_matches <- get_matches(opt_match)
+#
+print(opt_match)
+```
+
+
+* This yields `r nrow(opt_get_matches) / 2` pairs 
+
+
+```{r}
+plot(opt_match, type = "jitter", interactive = FALSE)
+```
+
+```{r}
+plot(summary(opt_match), position = NULL)
+```
+
+
+# [Full Matching](https://cran.r-project.org/web/packages/MatchIt/vignettes/matching-methods.html#optimal-full-matching-method-full)  
+* Model: Treatment = 
+    + Parent VISN (Exact)
+    + Census Division
+    + NOSOS (3 month average)
+    + Observed:Expected PC Panel Size (3 month average)
+    + Team PCP/AP FTE (3 month average)
+    + Uniques in PCMM (2 quarter average)
+    + Established patient wait time (3 month average)
+    + New patient wait time (3 month average)
+    + Third next available (3 month average)
+    + ADI (3 month average)
+    + Average age October 1st, 2020
+    + Proportion male
+    + Proportion white
+    + Proportion rural
+    + Gap Metric (3 month average)
+
+* Out of `r nrow(sta5a_demog) %>% comma(accuracy = 1)` sta5as included, `r nrow(sta5a_demog_no_missing) %>% comma(accuracy = 1)` have complete data for all of these covariates
+
+```{r}
+#-- full matching
+full_match <- matchit(at_least_10_pc_crh_flag ~ 
+                        parent_visn 
+                      + census_division 
+                      + s_abbr2
+                      + nosos_3mo_avg
+                      + obs_exp_panel_ratio_3mo_avg
+                      + team_pcp_ap_fte_total_3mo_avg
+                      + pcmm_scrssn_count
+                      + est_pc_pt_wt_3mo_avg
+                      + new_pc_pt_wt_3mo_avg
+                      + third_next_avail_3mo_avg
+                      + adi_natRnk_avg
+                      + avg_age_oct1_2020
+                      + prop_male 
+                      + prop_white
+                      + prop_rural
+                      + gap_3mo_avg,
+                      data = sta5a_demog_no_missing,
+                      method = "full",
+                      distance = "glm",
+                      link = "logit",
+                      exact = ~parent_visn)
+#
+full_get_matches <- match.data(full_match)
+#
+print(full_match)
+```
+
+* This yields a match between all `r sum(1-sta5a_demog_no_missing$at_least_10_pc_crh_flag)` treated sta5as and at least 1 control sta5a, for a total of `r max(as.integer(full_get_matches$subclass))` groups
+
+```{r}
+full_get_matches %>% 
+  filter(at_least_10_pc_crh_flag == 1) %>%
+  group_by(subclass) %>% 
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = count)) +
+  geom_histogram(binwidth = 1) +
+  labs(x = "Number of Treated Matched",
+       y = "Sta5a Count in Bin")
+```
+
+```{r}
+full_get_matches %>% 
+  filter(at_least_10_pc_crh_flag == 0) %>%
+  group_by(subclass) %>% 
+  summarise(count = n()) %>%
+  ggplot(data = .,
+         aes(x = count)) +
+  geom_histogram(binwidth = 1, color = "black", fill = "seagreen") +
+  labs(x = "Number of Controls Matched",
+       y = "Sta5a Count in Bin")
+```
+
+
+```{r}
+plot(full_match, type = "jitter", interactive = FALSE)
+```
+
+```{r}
+plot(summary(full_match), position = NULL)
+```
+
+# Distribution of PC CRH Start Month  
+
+```{r}
+start_month <- dbGetQuery(oabi_con,
+                          "select * from [OABI_MyVAAccess].[crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh)) %>%
+  filter(is.na(first_mo_w_mt9_pc_crh) == F)
+#--
+ggplot(data = start_month,
+       aes(x = first_mo_w_mt9_pc_crh)) +
+  geom_histogram(bins = 26, color = "black", fill = "red") +
+  scale_x_date(breaks=  "2 months") +
+  theme(axis.text.x = element_text(angle = 270, hjust = 0.3, vjust = 0.3)) +
+  labs(x = "First Month (of dyad) w/>9 PC CRH Encounters",
+       y = "Number of Sta5as")
+```

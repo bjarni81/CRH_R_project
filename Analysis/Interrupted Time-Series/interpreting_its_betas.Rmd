@@ -1,0 +1,215 @@
+---
+title: "Interpreting 3-way Interaction (ITS)"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+library(emmeans)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+pactcc_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+$$ \text{Established Patient Wait Time} = \beta_0 +\beta_{time}X_{time}+\beta_{\text{PC CRH}}X_{\text{PC CRH}} + \beta_{Post Imp.}X_{Post Imp.}+ $$
+
+$$\beta_{\text{time}\times\text{PC CRH}}X_{time}X_{\text{PC CRH}}+\beta_{\text{time}\times\text{Post Imp.}}X_{time}X_{\text{Post Imp.}} +\beta_{\text{PC CRH}\times\text{Post Imp.}}X_{\text{PC CRH}}X_{\text{Post Imp.}} +$$
+
+$$\beta_{time\times\text{PC CRH}\times\text{Post Imp.}}X_{time}X_{\text{PC CRH}}X_{\text{Post Imp.}} $$
+
+# Established Patient Wait Time  
+
+* $\beta_{intercept}=52.31$
+* $\beta_{time}=0.57$
+* $\beta_{\text{PC CRH}}=-5.46$
+* $\beta_{\text{Post Imp.}}=-7.62$
+* $\beta_{time\times\text{PC CRH}}=-0.06$
+* $\beta_{time\times\text{Post Imp.}}=0.39$
+* $\beta_{\text{PC CRH}\times\text{Post Imp.}}=2.63$
+* $\beta_{time\times\text{PC CRH}\times\text{Post Imp.}}=-0.23$
+
+```{r}
+intercept <- 52.31
+b_time <- 0.57
+b_pc_crh <- -5.46
+b_post_imp <- -7.62
+b_time_x_pc_crh <- -0.06
+b_time_x_post_imp <- 0.39
+b_pc_crh_x_post_imp <- 2.63
+b_time_x_pc_crh_x_post_imp <- -0.23
+#
+
+```
+
+## Contrast 1  
+* $Time = 1$
+* $\text{Post Imp.} = 0$
+
+### PC CRH  
+$$ y_{\text{PC CRH}} = 52.31 + 0.57\times(1)+(-5.46)\times(1)+(-7.62)\times(0)+(-0.06)\times(1\times1)+0.39\times(1\times0) + 2.63\times(1\times0) +(-0.23)\times(1\times1\times0)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 0.57+(-5.46)+0+(-0.06)+0 + 0 +0 = 47.36$$
+
+### No PC CRH  
+$$ y_{\text{No PC CRH}} = 52.31 + 0.57\times(1)+(-5.46)\times(0)+(-7.62)\times(0)+(-0.06)\times(1\times0)+0.39\times(1\times0) + 2.63\times(0\times0) +(-0.23)\times(1\times0\times0)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 0.57+0+0+0+0 + 0 +0 = 52.88$$
+
+### No PC CRH - PC CRH  
+
+$$ 52.88-47.36=5.52$$
+
+## Contrast 2  
+* $Time = 1$
+* $\text{Post Imp.} = 1$
+
+### PC CRH  
+$$ y_{\text{PC CRH}} = 52.31 + 0.57\times(1)+(-5.46)\times(1)+(-7.62)\times(1)+(-0.06)\times(1\times1)+0.39\times(1\times1) + 2.63\times(1\times1) +(-0.23)\times(1\times1\times1)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 0.57+(-5.46)+(-7.62)+(-0.06)+0.39 + 2.63 +(-0.23) = 42.53$$
+
+### No PC CRH  
+$$ y_{\text{No PC CRH}} = 52.31 + 0.57\times(1)+(-5.46)\times(0)+(-7.62)\times(1)+(-0.06)\times(1\times0)+0.39\times(1\times1) + 2.63\times(0\times1) +(-0.23)\times(1\times0\times1)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 0.57+0+(-7.62)+0+0.39 + 0 +0 = 45.65$$
+
+### No PC CRH - PC CRH  
+
+$$ 45.65-42.53=3.12$$
+
+## Contrast 3  
+* $Time = 17$
+* $\text{Post Imp.} = 0$
+
+### PC CRH  
+$$ y_{\text{PC CRH}} = 52.31 + 0.57\times(17)+(-5.46)\times(1)+(-7.62)\times(0)+(-0.06)\times(17\times1)+0.39\times(17\times0) + 2.63\times(1\times0) +(-0.23)\times(17\times1\times0)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 9.69+(-5.46)+0+(-1.02)+0 + 0 +0 = 55.52$$
+
+### No PC CRH  
+$$ y_{\text{No PC CRH}} = 52.31 + 0.57\times(17)+(-5.46)\times(0)+(-7.62)\times(0)+(-0.06)\times(17\times0)+0.39\times(17\times0) + 2.63\times(0\times0) +(-0.23)\times(17\times0\times0)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 9.69+0+0+0+0 + 0 +0 = 62.0$$
+
+### No PC CRH - PC CRH  
+
+$$ 62.0-55.52=6.48$$
+
+## Contrast 4  
+* $Time = 17$
+* $\text{Post Imp.} = 1$
+
+### PC CRH  
+$$ y_{\text{PC CRH}} = 52.31 + 0.57\times(17)+(-5.46)\times(1)+(-7.62)\times(1)+(-0.06)\times(17\times1)+0.39\times(17\times1) + 2.63\times(1\times1) +(-0.23)\times(17\times1\times1)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 9.69+(-5.46)+(-7.62)+(-1.02)+6.63 + 2.63 +(-3.91) = 53.25$$
+
+### No PC CRH  
+$$ y_{\text{No PC CRH}} = 52.31 + 0.57\times(17)+(-5.46)\times(0)+(-7.62)\times(1)+(-0.06)\times(17\times0)+0.39\times(17\times1) + 2.63\times(0\times1) +(-0.23)\times(17\times0\times1)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 9.69+0+(-7.62)+0+6.63 + 0 +0 = 61.01$$
+
+### No PC CRH - PC CRH  
+
+$$ 61.01-53.25=7.76$$
+
+## Contrast 5  
+* $Time = 1$
+* $\text{PC CRH} = 1$
+
+### Post Implementation    
+$$ y_{\text{Post Imp.}} = 52.31 + 0.57\times(1)+(-5.46)\times(1)+(-7.62)\times(1)+(-0.06)\times(1\times1)+0.39\times(1\times1) + 2.63\times(1\times1) +(-0.23)\times(1\times1\times1)$$
+
+$$ y_{\text{Post Imp.}} = 52.31 + 0.57+(-5.46)+(-7.62)+(-0.06)+0.39 + 2.63 +(-0.23) = 42.53$$
+
+### Pre Implementation    
+$$ y_{\text{Pre Imp.}} = 52.31 + 0.57\times(1)+(-5.46)\times(1)+(-7.62)\times(0)+(-0.06)\times(1\times1)+0.39\times(1\times0) + 2.63\times(1\times0) +(-0.23)\times(1\times1\times0)$$
+
+$$ y_{\text{Pre Imp.}} = 52.31 + 0.57+(-5.46)+0+(-0.06)+0 + 0 +0 = 47.36$$
+
+### Pre Implementation - Post Implementation     
+
+$$ 47.36-42.53=4.83$$
+
+## Contrast 6  
+* $Time = 17$
+* $\text{PC CRH} = 1$
+
+### Post Implementation    
+$$ y_{\text{Post Imp.}} = 52.31 + 0.57\times(17)+(-5.46)\times(1)+(-7.62)\times(1)+(-0.06)\times(17\times1)+0.39\times(17\times1) + 2.63\times(1\times1) +(-0.23)\times(17\times1\times1)$$
+
+$$ y_{\text{Post Imp.}} = 52.31 + 9.69+(-5.46)+(-7.62)+(-1.02)+6.63 + 2.63 +(-3.91) = 53.25$$
+
+### Pre Implementation    
+$$ y_{\text{Pre Imp.}} = 52.31 + 0.57\times(17)+(-5.46)\times(1)+(-7.62)\times(0)+(-0.06)\times(17\times1)+0.39\times(17\times0) + 2.63\times(1\times0) +(-0.23)\times(17\times1\times0)$$
+
+$$ y_{\text{Pre Imp.}} = 52.31 + 9.69+(-5.46)+0+(-1.02)+0 + 0 +0 = 55.52$$
+
+### Pre Implementation - Post Implementation     
+
+$$ 55.52-53.25=2.27$$
+
+## Contrast 7  
+* $Time = 1$
+* $\text{PC CRH} = 1$
+* $\text{Post Imp.} = 0$
+
+$$ y_{7} = 52.31 + 0.57\times(1)+(-5.46)\times(1)+(-7.62)\times(0)+(-0.06)\times(1\times1)+0.39\times(1\times0) + 2.63\times(1\times0) +(-0.23)\times(1\times1\times0)$$
+
+$$ y_{7} = 52.31 + 0.57+(-5.46)+0+(-0.06)+0 + 0 +0 = 47.36$$
+
+## Contrast 8  
+* $Time = 17$
+* $\text{PC CRH} = 1$
+* $\text{Post Imp.} = 1$
+### PC CRH  
+$$ y_{\text{PC CRH}} = 52.31 + 0.57\times(17)+(-5.46)\times(1)+(-7.62)\times(1)+(-0.06)\times(17\times1)+0.39\times(17\times1) + 2.63\times(1\times1) +(-0.23)\times(17\times1\times1)$$
+
+$$ y_{\text{PC CRH}} = 52.31 + 9.69+(-5.46)+(-7.62)+(-1.02)+6.63 + 2.63 +(-3.91) = 53.25$$

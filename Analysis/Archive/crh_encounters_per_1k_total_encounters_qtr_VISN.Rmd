@@ -1,0 +1,420 @@
+---
+title: "CRH Encounters per 1,000 Total Encounters - VISN"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = '')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(ggrepel)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 24),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+hubs <- dbGetQuery(oabi_con,
+                     "select hub_sta3n from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select hub_sta3n from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#==
+all_months <- seq.Date(ymd('2019-10-01'),ymd('2021-09-01'), by = 'month')
+#--
+all_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].all_encounters_E_counts") %>%
+  select(-contains("Vax")) %>%
+  mutate(vizMonth = ymd(vizMonth)) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name),
+         spoke_flag = if_else(sta6a %in% spokes_v, TRUE, FALSE),
+         fy = if_else(month(vizMonth) > 9, year(vizMonth) + 1, year(vizMonth)),
+         qtr = case_when(month(vizMonth) %in% c(10, 11, 12) ~ 1,
+                         month(vizMonth) %in% c(1, 2, 3) ~ 2,
+                         month(vizMonth) %in% c(4, 5, 6) ~ 3,
+                         month(vizMonth) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  filter(is.na(parent_visn) == F & fy %in% c(2020, 2021)) %>%
+  rename("Primary Care" = pc_encounters,
+         "Mental Health" = mh_encounters,
+         "Pharmacy" = pharmacy_encounters,
+         "PCMHI" = pcmhi_encounters)
+#
+all_qtrs <- all_encounters %>% select(fyqtr) %>% distinct %>% pull
+#
+spoke_encounters <- all_encounters %>% filter(spoke_flag == T)
+#==
+crh_encounters <- dbGetQuery(oabi_con,
+                         "select * from [PACT_CC].[CRH].[crh_full_utilization_final_fy20_21]") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  left_join(., vast, by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  filter(is.na(parent_visn) == FALSE)
+```
+
+```{r creating_data_frames}
+#--TOTAL
+crh_visn_total <- crh_encounters %>%
+  group_by(fyqtr, parent_visn) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup
+#
+all_visn_total <- spoke_encounters %>%
+  select(3:6, parent_visn, fyqtr) %>%
+  pivot_longer(-c(fyqtr, parent_visn)) %>%
+  group_by(fyqtr, parent_visn) %>%
+  summarise(total = sum(value, na.rm = T)) %>%
+  ungroup
+#
+total_visn_df <- crh_visn_total %>%
+  left_join(., all_visn_total, by = c("fyqtr" = "fyqtr", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ungroup %>%
+  complete(fyqtr = all_qtrs, nesting(parent_visn))
+#==BY CARE TYPE
+crh_visn_type <- crh_encounters %>%
+  group_by(fyqtr, parent_visn, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup
+#
+all_visn_type <- spoke_encounters %>%
+  select(3:6, parent_visn, fyqtr) %>%
+  pivot_longer(-c(fyqtr, parent_visn)) %>%
+  group_by(fyqtr, parent_visn, name) %>%
+  summarise(total = sum(value, na.rm = T)) %>%
+  ungroup
+#
+type_visn_df <- crh_visn_type %>%
+  left_join(., all_visn_type, by = c("fyqtr" = "fyqtr", "care_type" = "name", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ungroup %>%
+  complete(fyqtr = all_qtrs, nesting(parent_visn, care_type))
+```
+
+
+# All VISNs  
+
+## CRH per 1,000 Total          
+```{r}
+total_visn_df %>% 
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_per_1k_total, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 50),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "CRH Encounters per 1,000 Total Encounters") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+## CRH Encounters    
+```{r}
+total_visn_df %>% 
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_encounters)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "CRH Encounters") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+## Total Encounters    
+```{r}
+total_visn_df %>% 
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = total, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "Total Encounters") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+\newpage
+# By Care Type     
+## Mental Health 
+### CRH MH per 1,000 MH Total       
+```{r} 
+type_visn_df %>% filter(care_type == "Mental Health") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_per_1k_total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "CRH Mental Health Encounters/1,000 Mental Health Encounters")
+```
+
+### CRH MH         
+```{r} 
+type_visn_df %>% filter(care_type == "Mental Health") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_encounters)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "CRH Mental Health Encounters")
+```
+
+### Total MH         
+```{r} 
+type_visn_df %>% filter(care_type == "Mental Health") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Mental Health Encounters")
+```
+
+    
+## Primary Care 
+### CRH PC per 1,000 PC Total       
+```{r} 
+type_visn_df %>% filter(care_type == "Primary Care") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_per_1k_total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "CRH Primary Care Encounters/1,000 Primary Care Encounters")
+```
+
+### CRH PC         
+```{r} 
+type_visn_df %>% filter(care_type == "Primary Care") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_encounters)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "CRH Primary Care Encounters")
+```
+
+### Total PC         
+```{r} 
+type_visn_df %>% filter(care_type == "Primary Care") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Primary Care Encounters")
+```
+
+    
+## Pharmacy 
+### CRH CPS per 1,000 CPS Total       
+```{r} 
+type_visn_df %>% filter(care_type == "Pharmacy") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_per_1k_total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "CRH Pharmacy Encounters/1,000 Pharmacy Encounters")
+```
+
+### CRH CPS         
+```{r} 
+type_visn_df %>% filter(care_type == "Pharmacy") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_encounters)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "CRH Pharmacy Encounters")
+```
+
+### Total CPS         
+```{r} 
+type_visn_df %>% filter(care_type == "Pharmacy") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Pharmacy Encounters")
+```
+
+    
+## PCMHI 
+### CRH PCMHI per 1,000 PCMHI Total       
+```{r} 
+type_visn_df %>% filter(care_type == "PCMHI") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_per_1k_total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "CRH PCMHI Encounters/1,000 PCMHI Encounters")
+```
+
+### CRH PCMHI         
+```{r} 
+type_visn_df %>% filter(care_type == "PCMHI") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_encounters)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "CRH PCMHI Encounters")
+```
+
+### Total PCMHI         
+```{r} 
+type_visn_df %>% filter(care_type == "PCMHI") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "PCMHI Encounters")
+```
+
+

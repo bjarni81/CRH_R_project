@@ -1,0 +1,302 @@
+---
+title: "% of New Patients seen in 0-20 days"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v6_post_COVID.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2021-07-01"), ymd("2022-12-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+# scrssn_count <- dbGetQuery(oabi_con,
+#                            "with CTE as(
+#                             	select count(distinct ScrSSN_num) as scrssn_count
+#                             		, sta5a, fy, qtr
+#                             	from [PACT_CC].[econ].PatientPCP
+#                             	where fy = 2018
+#                             	group by Sta5a, fy, QTR
+#                             	)
+#                             select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+#                             from CTE
+#                             group by Sta5a") %>%
+#   mutate(scrssn_count_cat = factor(case_when(
+#     scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+#     scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+#     scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+#     scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+#   ), ordered = TRUE,
+#   levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- ps_matched %>%
+  filter(pc_crh_criteria_met_after_march_20 == 1) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include <- ps_matched %>%
+  inner_join(., vast %>% select(sta5a, s_abbr, urh_vast)) %>%#2: must be in VAST
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, 
+                            "PC CRH", "No PC CRH"))
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      filter(vssc_month > ymd("2021-06-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%
+  mutate(new_0_20_days_create_pct = new_0_20_days_create * 100,
+         treat = factor(case_when(
+           sta5a %in% crh_sta5as ~ "PC CRH",
+           TRUE ~ "No PC CRH"))) %>%
+  left_join(., covariates)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is an exploration of a potential new outcome: __% of new patients seen in 0-20 days (from create date)__
+
+## Decision Points  
+
+* Speaking with Matt he was excited about this covariate, and asked that I download it 
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, crh_flag) %>% distinct() %>% summarise(tot = sum(crh_flag == "PC CRH"))` of these met our criteria for PC CRH 
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+* Description of _Propensity Score_ matching
+    + This report uses __Propensity Score v6.0__
+    + PS model v6.0 consists of 
+        + Covariates matched on their average values in FY21 Q2
+        + Outcomes matched on their average values over October 2020 - March 2021
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+        + VISN - Exact
+
+# Overall  
+
+```{r}
+#new_0_20_days_create
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = new_0_20_days_create,
+             fill = "foo")) +
+  geom_histogram(bins = 50,
+                 color = "black") +
+  ggsci::scale_fill_aaas() +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme(legend.position = "none") +
+  labs(x = "New Patients Seen in 0-20 Days (create)",
+       y = "Observations")
+```
+
+```{r}
+ggplot(data = analytic_df,
+       aes(x = "foo",
+           y = new_0_20_days_create,
+           fill = "bar")) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_blank(),
+        axis.title.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "New Patients Seen in 0-20 Days (create)")
+```
+
+## By Urban/Rural  
+```{r}
+analytic_df %>%
+  mutate(urh2 = if_else(urh_vast == "U",
+                        "Urban", "Rural")) %>%
+  select(urh2, new_0_20_days_create) %>%
+  pivot_longer(-urh2) %>%
+  ggplot(data = .,
+         aes(x = value,
+             fill = urh2)) +
+  geom_histogram(bins = 50,
+                 color = "black",
+                 position = "identity") +
+  ggsci::scale_fill_aaas() +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme(legend.position = "none") +
+  labs(x = "New Patients Seen in 0-20 Days (create)",
+       y = "Observations") +
+  facet_wrap(~urh2)
+```
+
+## By Site Type    
+```{r}
+analytic_df %>%
+  select(s_abbr, new_0_20_days_create) %>%
+  pivot_longer(-s_abbr) %>%
+  ggplot(data = .,
+         aes(x = value,
+             fill = s_abbr)) +
+  geom_histogram(bins = 50,
+                 color = "black",
+                 position = "identity") +
+  ggsci::scale_fill_aaas() +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  theme(legend.position = "none") +
+  labs(x = "New Patients Seen in 0-20 Days (create)",
+       y = "Observations") +
+  facet_wrap(~s_abbr)
+```
+
+## By New Patient Wait Time  
+
+```{r}
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = new_0_20_days_create,
+             y = new_pc_pt_wt_create)) +
+  geom_point() +
+  scale_x_continuous(labels = percent_format(accuracy = 1)) +
+  scale_y_continuous(limits = c(0, 200)) +
+  labs(x = "New Patients Seen in 0-20 Days (create)",
+       y = "New Patient Wait Time (create)") +
+  geom_smooth(se = FALSE,
+              method = "lm")
+#
+tab_model(
+  lm(new_pc_pt_wt_create ~ new_0_20_days_create_pct, data = analytic_df),
+  dv.labels = c("New Pt WT (Create)")
+)
+```
+
+# As an outcome  
+
+```{r}
+ggplot(data = analytic_df,
+       aes(x = vssc_month,
+           y = new_0_20_days_create,
+           group = sta5a)) +
+  geom_line(alpha = 0.2) +
+  geom_smooth(method = "lm",
+              se = FALSE,
+              aes(group = crh_flag,
+                  color = crh_flag),
+              linewidth = 1.2) +
+  ggsci::scale_color_d3() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(y = "New Patients Seen in 0-20 Days (create)") +
+  theme(axis.title.x = element_blank())
+```
+
+```{r}
+new_0_20_lm <- lmer(new_0_20_days_create_pct ~ time * treat 
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+```
+
+#### Model Estimates    
+```{r}
+tab_model(new_0_20_lm,
+          dv.labels = c("New Patients Seen in 0-20 Days (create)"))
+```

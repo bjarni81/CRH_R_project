@@ -1,0 +1,505 @@
+---
+title: "Missingness in PC CRH PS Matching Data"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 8, fig.height = 8)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v6_post_COVID.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month),
+         tna_new_source = as.numeric(tna_new_source))
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-04-01"), ymd("2020-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+dates3 <- tibble(
+  vssc_month = seq.Date(ymd("2020-07-01"), ymd("2020-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+pc_community_care <- dbGetQuery(oabi_con,
+                                 "select *
+                                 from [OABI_MyVAAccess].[crh_eval].F5_avg_pc_cons_post_COVID")
+```
+
+```{r}
+# a vector of sta5as that:
+    #1. have at least 451 average unique scrssns in pcmm FY20
+    #2. are a CBOC, OOS, VAMC, or HCC
+sta5as_to_start_with <- vast %>%
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F
+         & scrssn_count_cat != "< 450"
+         & s_abbr %in% c("PCCBOC", "MSCBOC", "VAMC", "OOS", "HCC")) %>%
+  select(sta5a, s_abbr, scrssn_count_cat)
+#-----
+months_meeting_inclusion_criteria <- pen_rate %>%
+  arrange(sta5a, vssc_month) %>%#ordering by station and month
+  group_by(sta5a) %>%#grouping by station
+  mutate(this_mo_mt9_pc_crh = if_else(crh_encounter_count > 9, 1, 0),#flag for this month meeting criteria 
+         last_mo_mt9_pc_crh = if_else(lag(crh_encounter_count) > 9, 1, 0),#flag for last month
+         next_mo_mt9_pc_crh = if_else(lead(crh_encounter_count) > 9, 1, 0),#flag for next month
+         meets_inc_crit = if_else(this_mo_mt9_pc_crh == 1 & # IF this month meets criteria
+                                    (last_mo_mt9_pc_crh == 1 | next_mo_mt9_pc_crh == 1),#AND either this or last month
+                                  1, 0),#THEN 1, ELSE 0
+         meets_inc_crit = replace_na(meets_inc_crit, 0)) %>%#replacing NA with 0
+  mutate(
+    period_meeting_citeria = factor(case_when(
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month < ymd("2020-03-01") #AND month < march 2020
+      ~ "Before March 2020",#label
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month >= ymd("2020-03-01")#AND month between March 2020
+      & vssc_month <= ymd("2020-09-01") #AND September 2020
+      ~ "Between March and September 2020",#label
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month > ymd("2020-09-01") #AND month > Setember 2020
+      ~ "After September 2020",#label
+      TRUE ~ "Not Enough PC CRH"),#ELSE
+      ordered = TRUE,
+      levels = c("Before March 2020", 
+                 "Between March and September 2020",
+                 "After September 2020",
+                 "Not Enough PC CRH")))
+#--
+sta5a_month_inc <- months_meeting_inclusion_criteria %>%
+  group_by(sta5a, period_meeting_citeria) %>%
+  summarise(count = n()) %>%
+  filter(period_meeting_citeria != "Not Enough PC CRH") %>%
+  group_by(sta5a) %>%
+  summarise(period1_inc = sum(if_else(period_meeting_citeria == "Before March 2020" & count > 1, 1, 0)),
+            period2_inc = sum(if_else(period_meeting_citeria == "Between March and September 2020" & count > 1, 1, 0)),
+            period3_inc = sum(if_else(period_meeting_citeria == "After September 2020" & count > 1, 1, 0)))
+#--
+cases_controls <- sta5as_to_start_with %>%
+  left_join(., sta5a_month_inc) %>%
+  mutate(across(contains("period"), ~replace_na(.x, 0)),
+         not_enough_crh = if_else(period1_inc == 0 & period2_inc == 0 & period3_inc == 0 & sta5a %in% pen_rate$sta5a, 
+                                  1, 0),
+         potential_control = if_else(period1_inc == 0 & period2_inc == 0 & period3_inc == 0 & not_enough_crh == 0, 1, 0),
+         ever_met_criteria = if_else(period1_inc == 1 | period2_inc == 1 | period3_inc == 1, 1, 0),
+         treated = factor(case_when(period3_inc == 1 ~ "Treated",
+                             potential_control == 1 ~ "Control",
+                             TRUE ~ "Drop me!"),
+                          ordered = T, 
+                          levels = c("Treated", "Control", "Drop me!"))) %>%
+  filter(treated != "Drop me!")
+#--average values of outcomes over April through September
+outcomes_df <- cases_controls %>%
+  select(sta5a) %>%
+  cross_join(., dates %>%
+               select(-time)) %>%
+  left_join(., access_metrics %>%
+              select(sta5a, vssc_month, est_pc_pt_wt_pid, new_pc_pt_wt_create, tna_new_source, 
+                     new_0_20_days_create, panel_fullness)) %>%
+  left_join(., timely_care %>%
+              select(sta5a, vssc_month, tc_pc_success_prop)) %>%
+  pivot_longer(-c(sta5a, vssc_month)) %>%
+  group_by(sta5a, name) %>%
+  summarise(avg_val = mean(value, na.rm = T)) %>%
+  pivot_wider(names_from = name, values_from = avg_val)
+#--average values of covariates over July, August, September
+covars_df <- cases_controls %>%
+  select(sta5a) %>%
+  cross_join(., dates3 %>%
+               select(-time)) %>%
+  left_join(., covariates) %>%
+  left_join(., gap_metric %>%
+              select(sta5a, vssc_month, gap_metric)) %>%
+  select(-parent_visn, -census_division, -pc_crh_per_1k_total_pc) %>%
+  pivot_longer(-c(sta5a, vssc_month)) %>%
+  group_by(sta5a, name) %>%
+  summarise(avg_val = mean(value, na.rm = T)) %>%
+  pivot_wider(names_from = name, values_from = avg_val) %>%
+  left_join(., vast %>%
+              select(sta5a, parent_visn, s_abbr, census_division)) %>%
+  left_join(., cases_controls %>%
+              select(sta5a, treated)) %>%
+  mutate(across(contains("pct_"), ~.x / 100))
+#=====
+analytic_df <- outcomes_df %>%
+  left_join(., covars_df) %>%
+  left_join(., pc_community_care %>%
+              rename(sta5a = sta6a) %>%
+              select(sta5a, non_va_cons_rate_per_10k_pcmm))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a look at the missingness and combinations of missingness in the Propensity Score Matching data
+* I also make a detour to discuss alternative ideas for a PC Community Care covariate 
+
+## Decision Points  
+
+* Per our discussion on November 21st I am investigating what column(s), or combination of columns, in our Propensity Score matching data are responsible for the most missingness
+
+    
+## Analytic details  
+
+
+* Description of the data:
+    + The first observation in the data occurs on `r min(dates$vssc_month)`
+    + The last observation in the data occurs on `r max(dates$vssc_month)`
+    + Outcome values are averaged over all 6 months
+    + All other covariates are averaged over the 4th quarter of FY2020 (i.e., July, August, and September of CY2020)
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + There are `r analytic_df %>% select(sta5a) %>% n_distinct()` unique sta5as
+      + `r sum(analytic_df$treated == "Treated")` of these met our criteria for PC CRH at least once after September 2020  
+      + `r sum(str_detect(analytic_df$s_abbr, "CBOC") == T)` of these are CBOCs
+      + `r sum(str_detect(analytic_df$s_abbr, "HCC|VAMC") == T)` of these are HCCs or VAMCs
+      + `r sum(str_detect(analytic_df$s_abbr, "OOS") == T)` of these are OOS    
+    + Treated sta5as are the `r sum(analytic_df$treated == "Treated")` sta5as that __met our inclusion criteria after September 2020__ 
+    + Control sta5as are the `r sum(analytic_df$treated != "Treated")` sta5as that have __never had a PC CRH encounter__
+
+
+
+
+# Missingness  
+
+```{r}
+naniar::gg_miss_upset(analytic_df)
+```
+
+<!-- ## Without PC Consult Rate   -->
+
+<!-- ```{r} -->
+<!-- analytic_df %>% select(-non_va_cons_rate_per_10k_pcmm) %>% naniar::gg_miss_upset(.) -->
+<!-- ``` -->
+
+# Complete Data For Summary?  
+* It occurrred to me to investigate how any sta5as have complete data for the summary data. I.e., what proportion of sta5as had 6 months of non-missing data for outcomes and 3 months of non-missing data for all other covariates
+
+```{r}
+outcomes_no_summary <- cases_controls %>%
+  select(sta5a) %>%
+  cross_join(., dates %>%
+               select(-time)) %>%
+  left_join(., access_metrics %>%
+              select(sta5a, vssc_month, est_pc_pt_wt_pid, new_pc_pt_wt_create, tna_new_source, 
+                     new_0_20_days_create, panel_fullness)) %>%
+  left_join(., timely_care %>%
+              select(sta5a, vssc_month, tc_pc_success_prop)) %>%
+  pivot_longer(-c(sta5a, vssc_month))
+#
+outcomes_no_summary %>% group_by(sta5a, name) %>%
+  summarise(missing_count = sum(is.na(value))) %>%
+  ggplot(data = .,
+         aes(x = missing_count)) +
+  geom_histogram(bins = 7) +
+  facet_wrap(~name) +
+  labs(x = "Number of Months Without Data",
+       y = "Number of Sta5as in Column")
+```
+
+```{r alternative_cc}
+community_care_no_summary <- cases_controls %>%
+  cross_join(dates3) %>%
+  select(sta5a, vssc_month) %>%
+  left_join(., dbGetQuery(oabi_con,
+                          "select sum(non_va) as non_va_cons, sta5a = sta6a
+	, vssc_month = DATEFROMPARTS(year(activityDateTime), month(activityDateTime), '01')
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+where stopCode_group = 'Primary Care'
+	AND MONTH(activityDateTime) IN(7, 8, 9)
+	AND year(activityDateTime) = 2020
+group by Sta6a, DATEFROMPARTS(year(activityDateTime), month(activityDateTime), '01')") %>%
+  mutate(vssc_month = ymd(vssc_month))) %>%
+  mutate(non_va_cons_na = non_va_cons,
+         non_va_cons = replace_na(non_va_cons, 0))
+```
+
+```{r}
+covariates_no_summary <- cases_controls %>%
+  select(sta5a) %>%
+  cross_join(., dates3 %>%
+               select(-time)) %>%
+  left_join(., covariates) %>%
+  left_join(., gap_metric %>%
+              select(sta5a, vssc_month, gap_metric)) %>%
+  select(-parent_visn, -census_division, -pc_crh_per_1k_total_pc) %>%
+  left_join(., community_care_no_summary %>%
+              select(sta5a, vssc_month, non_va_cons_na)) %>%
+  pivot_longer(-c(sta5a, vssc_month))
+#--
+covariates_no_summary %>% group_by(sta5a, name) %>%
+  summarise(missing_count = sum(is.na(value))) %>%
+  ggplot(data = .,
+         aes(x = missing_count)) +
+  geom_histogram(bins = 7) +
+  facet_wrap(~name) +
+  labs(x = "Number of Months Without Data",
+       y = "Number of Sta5as in Column")
+```
+
+# Alternative Community Care Covariate   
+* Out of a total of `r nrow(community_care_no_summary) %>% comma()` observations/sta5a-months, there are `r community_care_no_summary %>% filter(non_va_cons >0) %>% nrow()` (`r ((community_care_no_summary %>% filter(non_va_cons >0) %>% nrow()) / nrow(community_care_no_summary)) %>% percent(accuracy = 0.1)`) that have at least 1 non-VA PC consult
+* The average number of consults is `r mean(community_care_no_summary$non_va_cons) %>% comma(accuracy = 0.1)`
+* The average number of consults __without zeroes__ is `r mean(community_care_no_summary$non_va_cons_na, na.rm = T) %>% comma(accuracy = 0.1)`
+
+
+```{r}
+bp_all <- community_care_no_summary %>%
+  ggplot(data = .,
+         aes(y = non_va_cons)) +
+  geom_boxplot(fill = "dodgerblue") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "Consults per Sta5a-Month")
+#--
+bp_no0 <- community_care_no_summary %>%
+  filter(non_va_cons > 0) %>%
+  ggplot(data = .,
+         aes(y = non_va_cons)) +
+  geom_boxplot(fill = "darkorchid") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "Consults per Sta5a-Month (no 0)")
+#--
+hp_all <- community_care_no_summary %>%
+  ggplot(data = .,
+         aes(x = non_va_cons)) +
+  geom_histogram(fill = "dodgerblue",
+                 color = "black",
+                 bins = 50) +
+  labs(x = "Consults per sta5a-month",
+       y = "Observations") +
+  scale_y_continuous(labels = comma_format())
+#--
+hp_no0 <- community_care_no_summary %>%
+  filter(non_va_cons > 0) %>%
+  ggplot(data = .,
+         aes(x = non_va_cons)) +
+  geom_histogram(fill = "darkorchid",
+                 color = "black",
+                 bins = 50) +
+  labs(x = "Consults per sta5a-month (no 0)",
+       y = "Observations") +
+  scale_y_continuous(labels = comma_format())
+#==
+multiplot(bp_all, bp_no0, hp_all, hp_no0, cols = 2)
+
+```
+
+```{r}
+bp_all <- community_care_no_summary %>%
+  ggplot(data = .,
+         aes(y = non_va_cons)) +
+  geom_boxplot(fill = "dodgerblue") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "Consults per Sta5a-Month") +
+  scale_y_continuous(limits = c(0, 50))
+#--
+bp_no0 <- community_care_no_summary %>%
+  filter(non_va_cons > 0) %>%
+  ggplot(data = .,
+         aes(y = non_va_cons)) +
+  geom_boxplot(fill = "darkorchid") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "Consults per Sta5a-Month (no 0)") +
+  scale_y_continuous(limits = c(0, 50))
+#--
+hp_all <- community_care_no_summary %>%
+  ggplot(data = .,
+         aes(x = non_va_cons)) +
+  geom_histogram(fill = "dodgerblue",
+                 color = "black",
+                 bins = 50) +
+  labs(x = "Consults per sta5a-month",
+       y = "Observations") +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(limits = c(-1, 50))
+#--
+hp_no0 <- community_care_no_summary %>%
+  filter(non_va_cons > 0) %>%
+  ggplot(data = .,
+         aes(x = non_va_cons)) +
+  geom_histogram(fill = "darkorchid",
+                 color = "black",
+                 bins = 50) +
+  labs(x = "Consults per sta5a-month (no 0)",
+       y = "Observations") +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(limits = c(0, 50))
+#==
+multiplot(bp_all, bp_no0, hp_all, hp_no0, cols = 2)
+```
+
+## Making Cutoffs at 0, 5, and 10 Consults per month  
+
+```{r}
+categorical_community_care <- community_care_no_summary %>%
+  mutate(mt_0 = if_else(non_va_cons > 0, 1, 0),
+         mt_4 = if_else(non_va_cons > 4, 1, 0),
+         mt_9 = if_else(non_va_cons > 9, 1, 0)) %>%
+  group_by(sta5a) %>%
+  summarise(mt_0 = sum(mt_0),
+            mt_4 = sum(mt_4),
+            mt_9 = sum(mt_9))
+```
+
+
+
+### At least 1  
+* There are `r sum(categorical_community_care$mt_0 != 0)` sta5as that have at least 1 month with 1 or more PC community care consults
+
+
+```{r}
+ggplot(data = categorical_community_care,
+         aes(x = mt_0)) +
+  geom_histogram(bins = 4,
+                 color = "black") +
+  scale_x_continuous(breaks = c(0, 1, 2, 3)) +
+  labs(x = "Months with > 0 Community Care Consults",
+       y = "Sta5as in Column")
+```
+
+
+### At least 5   
+* There are `r sum(categorical_community_care$mt_4 != 0)` sta5as that have at least 1 month with 5 or more PC community care consults
+```{r}
+ggplot(data = categorical_community_care,
+         aes(x = mt_4)) +
+  geom_histogram(bins = 4,
+                 color = "black") +
+  scale_x_continuous(breaks = c(0, 1, 2, 3)) +
+  labs(x = "Months with > 4 Community Care Consults",
+       y = "Sta5as in Column")
+```
+
+### At least 10   
+* There are `r sum(categorical_community_care$mt_9 != 0)` sta5as that have at least 1 month with 10 or more PC community care consults
+```{r}
+ggplot(data = categorical_community_care,
+         aes(x = mt_9)) +
+  geom_histogram(bins = 4,
+                 color = "black") +
+  scale_x_continuous(breaks = c(0, 1, 2, 3)) +
+  labs(x = "Months with > 9 Community Care Consults",
+       y = "Sta5as in Column")
+```

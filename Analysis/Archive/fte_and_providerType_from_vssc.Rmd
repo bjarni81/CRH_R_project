@@ -1,0 +1,270 @@
+---
+title: "PC CRH: Non-Admin FTE by Provider Type"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_connect <- dbConnect(odbc::odbc(), Driver = "SQL Server", 
+                          Server = "vhacdwsql13.vha.med.va.gov",
+                          Database = "OABI_MyVAAccess", 
+                          Trusted_Connection = "true"
+)
+# VAST
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv")) %>%
+  mutate(parent_visn = str_pad(parent_visn, side = 'left', width = 2, pad = "0"))
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+crh_pc_fte_20 <- read_xlsx("H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/CRH_r_project/Input/Data/VSSC/CRH FTE/CRH_FTE_FY20.xlsx",
+                           skip = 16) %>%
+  filter(is.na(VISN) == T) %>%
+  fill(`Host Facility`) %>%
+  filter(is.na(`OCCUPATION NAME`) == F) %>%
+  select(-c(`...3`, `...4`, `...6`, `...10`, `...11`, `...13`, `...14`,`...15`, `...17`, `...18`, `...19`,
+            `...21`, `...23`, `...24`, `...25`, `...26`, `...28`, `...29`, `...31`)) %>%
+  mutate(VISN = str_sub(`Host Facility`, start = 4, end = 5))
+#
+names(crh_pc_fte_20) <- str_replace_all(names(crh_pc_fte_20), "\\n", " ")
+#--
+crh_pc_fte_21 <- read_xlsx("H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/CRH_r_project/Input/Data/VSSC/CRH FTE/CRH_FTE_FY21.xlsx",
+                           skip = 16) %>%
+  filter(is.na(VISN) == T) %>%
+  fill(`Host Facility`) %>%
+  filter(is.na(`OCCUPATION NAME`) == F) %>%
+  select(-c(`...3`, `...4`, `...6`, `...10`, `...11`, `...13`, `...14`,`...15`, `...17`, `...18`, `...19`,
+            `...21`, `...23`, `...24`, `...25`, `...26`, `...28`, `...29`, `...31`)) %>%
+  mutate(VISN = str_sub(`Host Facility`, start = 4, end = 5))
+#
+names(crh_pc_fte_21) <- str_replace_all(names(crh_pc_fte_21), "\\n", " ")
+```
+
+```{r}
+total_fte_fy20 <- crh_pc_fte_20 %>%
+  filter(`Discipline- Services Provided` != 'Admin') %>%
+  summarise(total_fte = sum(`Coverage FTE (same Discipline) * excludes Admin`, na.rm = T)) %>%
+  pull
+```
+
+# Total FTE  
+
+## Primary Care FTE - Fiscal Year 2020  
+* In FY 2020 there was a total of `r round(total_fte_fy20, 1)` non-administrative FTE for PC CRH  
+```{r}
+crh_pc_fte_20 %>%
+  filter(`Discipline- Services Provided` != 'Admin') %>%
+  group_by(`Discipline- Services Provided`) %>%
+  summarise(total_fte = round(sum(`Coverage FTE (same Discipline) * excludes Admin`, na.rm = T), 1)) %>%
+  arrange(desc(total_fte)) %>%
+  mutate(prop = total_fte / total_fte_fy20) %>%
+  filter(total_fte > 0) %>%
+  adorn_totals() %>%
+  mutate(prop = scales::percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Provider Type", "Total FTE", "Proportion"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T) %>%
+  row_spec(9, bold = T)
+```
+
+
+```{r}
+total_fte_fy21 <- crh_pc_fte_21 %>%
+  filter(`Discipline- Services Provided` != 'Admin') %>%
+  summarise(total_fte = sum(`Coverage FTE (same Discipline) * excludes Admin`, na.rm = T)) %>%
+  pull
+```
+
+## Primary Care FTE - Fiscal Year 2021  
+* In FY 2021 there was a total of `r round(total_fte_fy21, 1)` non-administrative FTE for PC CRH  
+```{r}
+crh_pc_fte_21 %>%
+  filter(`Discipline- Services Provided` != 'Admin') %>%
+  group_by(`Discipline- Services Provided`) %>%
+  summarise(total_fte = round(sum(`Coverage FTE (same Discipline) * excludes Admin`, na.rm = T), 1)) %>%
+  arrange(desc(total_fte)) %>%
+  mutate(prop = total_fte / total_fte_fy21) %>%
+  filter(total_fte > 0) %>%
+  adorn_totals() %>%
+  mutate(prop = scales::percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Provider Type", "Total FTE", "Proportion"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T) %>%
+  row_spec(10, bold = T)
+```
+
+# FTE By VISN - FY 2021    
+```{r}
+visn_table_fxn <- function(visn) {
+  visn_denom <- crh_pc_fte_21 %>%
+  filter(`Discipline- Services Provided` != 'Admin' & VISN == visn) %>%
+  summarise(total_fte = sum(`Coverage FTE (same Discipline) * excludes Admin`, na.rm = T)) %>%
+  pull
+  #
+  crh_pc_fte_21 %>%
+  filter(`Discipline- Services Provided` != 'Admin' & VISN == visn) %>%
+  group_by(`Discipline- Services Provided`) %>%
+  summarise(total_fte = round(sum(`Coverage FTE (same Discipline) * excludes Admin`, na.rm = T), 1)) %>%
+  arrange(desc(total_fte)) %>%
+  mutate(prop = total_fte / visn_denom) %>%
+  filter(total_fte > 0) %>%
+  adorn_totals() %>%
+  mutate(prop = scales::percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Provider Type", "Total FTE", "Proportion"),
+      full_width = F,
+      align = c("l", "r", "r"),
+      caption = paste0("VISN ", visn)) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+}
+```
+
+## VISN 01
+
+```{r}
+visn_table_fxn("01")
+````
+
+
+## VISN 02
+
+```{r}
+visn_table_fxn("02")
+````
+
+## VISN 04
+
+```{r}
+visn_table_fxn("04")
+````
+
+## VISN 05
+
+```{r}
+visn_table_fxn("05")
+````
+
+## VISN 06
+
+```{r}
+visn_table_fxn("06")
+````
+
+## VISN 07
+
+```{r}
+visn_table_fxn("07")
+````
+
+## VISN 08
+
+```{r}
+visn_table_fxn("08")
+````
+
+## VISN 09
+
+```{r}
+visn_table_fxn("09")
+````
+
+## VISN 10
+
+```{r}
+visn_table_fxn("10")
+````
+
+## VISN 12
+
+```{r}
+visn_table_fxn("12")
+````
+
+## VISN 15
+
+```{r}
+visn_table_fxn("15")
+````
+
+## VISN 16
+
+```{r}
+visn_table_fxn("16")
+````
+
+## VISN 17
+
+```{r}
+visn_table_fxn("17")
+````
+
+## VISN 19
+
+```{r}
+visn_table_fxn("19")
+````
+
+## VISN 20
+
+```{r}
+visn_table_fxn("20")
+````
+
+## VISN 21
+
+```{r}
+visn_table_fxn("21")
+````
+
+
+## VISN 22
+
+```{r}
+visn_table_fxn("22")
+````
+
+## VISN 23
+
+```{r}
+visn_table_fxn("23")
+````

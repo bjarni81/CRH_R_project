@@ -1,0 +1,286 @@
+---
+title: "CRH Urgent Request for USH"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+# scrssn_count <- dbGetQuery(oabi_con,
+#                            "with CTE as(
+#                             	select count(distinct ScrSSN_num) as scrssn_count
+#                             		, sta5a, fy, qtr
+#                             	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+#                             	where fy = 2020
+#                             	group by Sta5a, fy, QTR
+#                             	)
+#                             select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+#                             from CTE
+#                             group by Sta5a") %>%
+#   mutate(scrssn_count_cat = factor(case_when(
+#     scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+#     scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+#     scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+#     scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+#   ), ordered = TRUE,
+#   levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+```{r}
+analytic_df <- ps_matched %>%
+  select(sta5a, treated, weights) %>%
+  cross_join(., dates) %>%
+  left_join(., access_metrics %>%
+              select(sta5a, vssc_month, est_pc_pt_wt_pid, new_pc_pt_wt_create, tna_new_source)) %>%
+  mutate(tna_new_source = as.numeric(tna_new_source))
+#
+difference_df <- analytic_df %>%
+  filter(vssc_month == ymd("2022-09-01")) %>%
+  rename_at(vars(c(est_pc_pt_wt_pid, new_pc_pt_wt_create, tna_new_source)), paste0, "_2022") %>%
+  select(-weights, -time, -vssc_month) %>%
+  left_join(., analytic_df %>%
+              filter(vssc_month == ymd("2023-09-01")) %>%
+              rename_at(vars(c(est_pc_pt_wt_pid, new_pc_pt_wt_create, tna_new_source)), paste0, "_2023")) %>%
+  select(-weights, -time, -vssc_month) %>%
+  mutate(est_diff = est_pc_pt_wt_pid_2023 - est_pc_pt_wt_pid_2022,
+         new_diff = new_pc_pt_wt_create_2023 - new_pc_pt_wt_create_2022,
+         tna_diff = tna_new_source_2023 - tna_new_source_2022)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This document contains analyses for the rapid request for CRH information by the USH
+
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+
+    
+* Description of _Propensity Score_ matching
+    + This report uses __Propensity Score v6.0__
+    + PS model v6.0 consists of 
+        + Covariates matched on their average values in FY21 Q2
+        + Outcomes matched on their average values over October 2020 - March 2021
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+        + VISN - Exact
+
+# Linear Regression  
+## Established Patient Wait Time  
+
+```{r}
+est_model <- lmer(est_pc_pt_wt_pid ~ treated + (1|sta5a),
+                  weights = weights,
+     data = analytic_df)
+#
+tab_model(est_model)
+```
+
+## New Patient Wait Time  
+
+```{r}
+new_model <- lmer(new_pc_pt_wt_create ~ treated + (1|sta5a),
+                  weights = weights,
+     data = analytic_df)
+#
+tab_model(new_model)
+```
+
+## Third Next Available    
+
+```{r}
+tna_model <- lmer(tna_new_source ~ treated + (1|sta5a),
+                  weights = weights,
+     data = analytic_df)
+#
+tab_model(tna_model)
+```
+
+
+# Average Wait Times September 2023  
+## Established Patient Wait Time  
+
+```{r}
+analytic_df %>%
+  filter(vssc_month == ymd("2023-09-01")) %>%
+  t.test(est_pc_pt_wt_pid ~ treated, data = .)
+```
+
+## New Patient Wait Time  
+```{r}
+analytic_df %>%
+  filter(vssc_month == ymd("2023-09-01")) %>%
+  t.test(new_pc_pt_wt_create ~ treated, data = .)
+```
+
+## Third Next Available    
+```{r}
+analytic_df %>%
+  filter(vssc_month == ymd("2023-09-01")) %>%
+  t.test(tna_new_source ~ treated, data = .)
+```
+
+# Change in Wait Times from September 2022 to September 2023  
+## Established  
+```{r}
+difference_df %>%
+  t.test(est_diff ~ treated, data = .)
+```
+
+## New  
+```{r}
+difference_df %>%
+  t.test(new_diff ~ treated, data = .)
+```
+
+## TNA  
+```{r}
+difference_df %>%
+  t.test(tna_diff ~ treated, data = .)
+```
+
+# Subtracting Previous Month's Value  
+## Established  
+
+* This model is singular  
+```{r}
+lagged_df <- analytic_df %>%
+  arrange(sta5a, vssc_month) %>%
+  group_by(sta5a) %>%
+  mutate(est_diff = est_pc_pt_wt_pid - lag(est_pc_pt_wt_pid),
+         new_diff = new_pc_pt_wt_create - lag(new_pc_pt_wt_create),
+         tna_diff = tna_new_source - lag(tna_new_source))
+#
+lmer(est_diff ~ treated + (1 | sta5a),
+     data = lagged_df) %>%
+  tab_model()
+```
+
+## New  
+* This model is also singular  
+```{r}
+lmer(new_diff ~ treated + (1 | sta5a),
+     data = lagged_df) %>%
+  tab_model()
+```
+
+## TNA    
+* This model is also singular  
+```{r}
+lmer(tna_diff ~ treated + (1 | sta5a),
+     data = lagged_df) %>%
+  tab_model()
+```

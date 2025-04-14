@@ -1,0 +1,346 @@
+---
+title: "Outcomes by Period and CRH, Matching vs. Not"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv("H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/CRH_r_project/Input/Data/ps_matched_sta5as_v3.csv")
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- access_metrics %>%
+  filter(vssc_month < ymd("2020-03-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#
+ps_matched_initiated_before_feb_20 <- crh_flag %>%
+  filter(period_initiating_crh %in% 
+           c("Initiated PC CRH Between 10/2019 and 2/2020", "Initiated PC CRH Before 9/2019")) %>%
+  select(sta5a) %>%
+  inner_join(ps_matched) %>%
+  select(-at_least_10_pc_crh_flag) %>%
+  inner_join(., ps_matched, by = "subclass") %>%
+  select(sta5a = sta5a.y) %>%
+  pull
+  
+  
+#this is where exclusion criteria are applied:
+  #1: must have Access metrics
+  #2: must be in VAST
+  #3: no missing scrssn_count_cat
+  #4: CBOCs only
+  #5: must have scrssn_count_avg_fy18 >= 450
+sta5as_to_include <- access_metrics %>%#1: must have Access metrics
+  select(sta5a) %>%
+  inner_join(., vast %>% select(sta5a, s_abbr)) %>%#2: must be in VAST
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, "PC CRH", "No PC CRH")) %>%#making the crh_flag
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F #3: no missing scrssn_count_cat
+         & str_detect(s_abbr, "CBOC")#4: CBOCs only
+           & scrssn_count_cat != "< 450")
+#this little table is for the functions i wrote for outputting tables, and I don't want to have to look for it later
+# not strictly necissary
+# scrssn_cat_count <- sta5as_to_include %>%
+#   group_by(crh_flag, scrssn_count_cat) %>%
+#   summarise(count = n()) %>%
+#   mutate(count = as.character(count)) %>%
+#   pivot_wider(names_from = scrssn_count_cat, values_from = count)
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      filter(vssc_month < ymd("2020-03-01") & vssc_month > ymd("2018-06-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%#add time column
+  filter(sta5a %in% ps_matched_initiated_before_feb_20)
+#making the analytic dataset without the PS matching restriction for comparison
+analytic_df2 <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      filter(vssc_month < ymd("2020-03-01") & vssc_month > ymd("2018-06-01") & third_next_avail < 100) %>%#restrict to our timeframe
+      left_join(., dates)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This report does 2 things:
+    1. It allows visual comparison of outcome slopes between CRH and non-CRH sites over 3 periods
+    2. Acts as an example of the .html template I have in mind moving forward
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, crh_flag) %>% distinct() %>% summarise(tot = sum(crh_flag == "PC CRH"))` of these met our criteria for PC CRH before March, 2020
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+    + Each row is a sta5a-month
+    + This uses the naive PS matching scheme 
+    + What else?
+    
+* Description of _Propensity Score_ matching
+    + The current PS matching scheme is the naive one I proposed on November 1st
+    + This PS matching scheme includes `r n_distinct(ps_matched$subclass)` pairs of sta5a (i.e., `r nrow(ps_matched)` sta5as)
+    + I could add a hyperlink here to the "official" PS Matching report, when we have one
+    + Could also get fancy and output more model info from the PS match and include that here in a table, maybe?
+  
+
+* Description of plots  
+    + The y-axes (i.e., outcomes) are: __New Patient Wait Time__, __Established Patient Wait Time__, and __Third Next Available__
+    + The x-axis is time in months
+    + The black lines are individual sta5as' monthly values
+    + The regression lines are OLS regressions, stratified by PC CRH: $$y_{outcome}=x_{time}$$
+    + The plots __without matching__ include all `r analytic_df2 %>% select(sta5a) %>% n_distinct()` sta5as, while the plots __with matching__ include the `r n_distinct(ps_matched$subclass)` sta5as (and their PS matches) that met our inclusion criteria before March, 2020
+
+
+# New Patient Wait Time (ignoring values > 75)  
+## Without Matching  
+```{r}
+ggplot(data = subset(analytic_df2, new_pc_pt_wt < 75),
+       aes(x = vssc_month, y = new_pc_pt_wt, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  labs(y = "New Patient Wait Time (days)") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month < ymd("2018-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month > ymd("2018-09-01") & vssc_month < ymd("2019-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month > ymd("2019-09-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F)
+```
+
+ 
+## With Matching  
+```{r}
+ggplot(data = subset(analytic_df, new_pc_pt_wt < 75),
+       aes(x = vssc_month, y = new_pc_pt_wt, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  labs(y = "New Patient Wait Time (days)") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month < ymd("2018-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month > ymd("2018-09-01") & vssc_month < ymd("2019-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month > ymd("2019-09-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F)
+```
+
+
+# Established Patient Wait Time   
+## Without Matching  
+```{r}
+ggplot(data = analytic_df2,
+       aes(x = vssc_month, y = est_pc_pt_wt, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  labs(y = "Established Patient Wait Time (days)") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month < ymd("2018-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month > ymd("2018-09-01") & vssc_month < ymd("2019-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month > ymd("2019-09-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F)
+```
+
+ 
+## With Matching  
+```{r}
+ggplot(data = analytic_df,
+       aes(x = vssc_month, y = est_pc_pt_wt, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  labs(y = "Established Patient Wait Time (days)") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month < ymd("2018-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month > ymd("2018-09-01") & vssc_month < ymd("2019-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month > ymd("2019-09-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F)
+```
+
+# Third Next Available Appointment     
+## Without Matching (ignoring values < 60)    
+```{r}
+ggplot(data = subset(analytic_df2, third_next_avail < 60),
+       aes(x = vssc_month, y = third_next_avail, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  labs(y = "Third Next Available Appointment (days)") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month < ymd("2018-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month > ymd("2018-09-01") & vssc_month < ymd("2019-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df2, vssc_month > ymd("2019-09-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F)
+```
+
+ 
+## With Matching  
+```{r}
+ggplot(data = subset(analytic_df, third_next_avail < 60),
+       aes(x = vssc_month, y = third_next_avail, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  labs(y = "Third Next Available Appointment (days)") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month < ymd("2018-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month > ymd("2018-09-01") & vssc_month < ymd("2019-10-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F) +
+  geom_smooth(size = 1.5, data = subset(analytic_df, vssc_month > ymd("2019-09-01")),
+              aes(group = crh_flag, color = crh_flag), 
+              method = "lm", se = F)
+```
+
+# An aside about period of PC CRH Initiation  
+
+```{r}
+crh_flag %>%
+  mutate(period_initiating_crh = factor(period_initiating_crh,
+                                        ordered = T,
+                                        levels = c("Initiated PC CRH Before 9/2019",
+                                                   "Initiated PC CRH Between 10/2019 and 2/2020",
+                                                   "Initiated PC CHR Between 3/2020 and 2/2021",
+                                                   "Initiated PC CRH After 2/2021"))) %>%
+  filter(is.na(period_initiating_crh) == F) %>%
+  group_by(period_initiating_crh) %>%
+  summarise(count = n()) %>%
+  kbl(col.names = c("Period Meeting Inclusion Criteria", "Number of Sta5as")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+```{r}
+crh_flag %>%
+  group_by(first_mo_w_mt9_pc_crh) %>%
+  summarise(count = n()) %>%
+  kbl(col.names = c("First Month Meeting Inclusion Criteria", "Number of Sta5as")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```

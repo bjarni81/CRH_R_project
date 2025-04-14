@@ -1,0 +1,803 @@
+---
+title: "PC CRH - Pre-COVID Analysis"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+set.seed(1234)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(urh_vast2 = if_else(urh_vast == "U", "U", "R"))
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_pre_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(vssc_month = seq.Date(ymd("2018-10-01"), ymd("2020-02-01"), "1 month")) %>%
+  rowid_to_column(., var = "time") %>%
+  mutate(time2 = time - 12)
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+# scrssn_count <- dbGetQuery(oabi_con,
+#                            "with CTE as(
+#                             	select count(distinct ScrSSN_num) as scrssn_count
+#                             		, sta5a, fy, qtr
+#                             	from [PACT_CC].[econ].PatientPCP
+#                             	where fy = 2018
+#                             	group by Sta5a, fy, QTR
+#                             	)
+#                             select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+#                             from CTE
+#                             group by Sta5a") %>%
+#   mutate(scrssn_count_cat = factor(case_when(
+#     scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+#     scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+#     scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+#     scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+#   ), ordered = TRUE,
+#   levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+#
+vimpact <- dbGetQuery(oabi_con,
+                      "select distinct spoke_sta5a as sta5a, vimpact_pilot
+from [PACT_CC].[CRH].CRH_sites_FY20_working")
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include <- ps_matched %>%
+  select(sta5a, at_least_10_pc_crh_flag) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH"),
+                           ordered = TRUE,
+                           levels = c("PC CRH", "No PC CRH")))
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      filter(vssc_month < ymd("2020-03-01") 
+             & vssc_month > ymd("2018-09-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%#add time column
+  group_by(sta5a) %>%
+  mutate(treat = factor(case_when(
+    sta5a %in% crh_sta5as ~ "PC CRH",
+    TRUE ~ "Control")),
+         post = factor(if_else(vssc_month > ymd("2019-09-01"), 
+                               "Post Intervention (i.e., FY20)",
+                               "Pre-Intervention (i.e., FY19)")),
+    tx_fe = if_else(treat == "PC CRH", 1, 0),
+    post_fe = if_else(post == "Post Intervention (i.e., FY20)", 1, 0)) %>%
+  ungroup %>%
+  left_join(., covariates) %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  mutate(nosos_x_10 = nosos_risk_score * 10,
+         panel_ratio_x_10 = obs_exp_panel_ratio * 10,
+         adi_div_10 = adi_natRnk_avg / 10) %>%
+  left_join(., vast %>% select(sta5a, urh_vast2)) %>%
+  left_join(., vimpact) %>%
+  mutate(vimpact_pilot = if_else(vimpact_pilot == 1, 1, 0))
+#
+analytic_df$post <- relevel(analytic_df$post, ref = "Pre-Intervention (i.e., FY19)")
+analytic_df$treat <- relevel(analytic_df$treat, ref = 'Control')
+```
+
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a description of the three pre-COVID analyses
+
+## Decision Points  
+
+* Per our discussions:
+    + This analysis includes a __3-way interaction:__ _time X treat X post_
+        + This is per the discussion we had on August 23rd
+    + This analysis uses the newest version of the PS match
+    + This analysis uses Established Patient Wait Time from patient-indicated date
+    + I've re-scaled some covariates:
+        + Multiplied NOSOS and Panel Ratio by 10, meaning that the coefficients can be interpreted as a one-tenth unit change
+        + Divided ADI by 10, meaning that the coefficient can be interpreted as a change of 10%-iles 
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, crh_flag) %>% distinct() %>% summarise(tot = sum(crh_flag == "PC CRH"))` of these met our criteria for PC CRH before March, 2020
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+* Description of _Propensity Score_ matching
+    + This report uses the pre-COVID PS matching model
+    + This model consists of: 
+        + Outcomes matched on their average values over FY19
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+        + VISN - Exact
+        + Matched on FY18 Q4 average values of PCMM uniques, Obs:Exp panel size ratio, proportion rural, non-VA consults per 10,000 in PCMM
+
+* Description of analyses  
+    + These analyses are a Comparative Interrupted Time Series with covariates
+    + They are mixed-effects models and allow random intercepts for sta5a
+    + On the LHS of the model we have New Patient Wait Time, Established Patient Wait Time (PID), and Third Next Available 
+    + In addition to the various combinations of _treat_, _time_, and _post_, all models have the following covariates:
+        + Observed:Expected PC Panel Size 
+        + Proportion male 
+        + Proportion rural 
+        + ADI
+        + NOSOS
+    + I also run a parametric, 500 simulation bootstrap for the confidence intervals on our fixed-effects estimates
+
+* Refresher on the [NOSOS](https://www.herc.research.va.gov/include/page.asp?id=risk-adjustment)  
+    + It was designed to predict cost
+    + It is centered around 1
+    + A veteran with a value of 1 would be expected to have annual costs that are the national average for VA patients
+    + A veteran with a value of 2.5 would be expected to incur 2.5-times the national average annual costs for VA patients
+
+## Covariate description  
+
+```{r}
+analytic_df %>% 
+  select(obs_exp_panel_ratio, pct_male, pct_rural, nosos_risk_score, adi_natRnk_avg) %>%
+  rownames_to_column() %>%
+  pivot_longer(-rowname) %>%
+  group_by(name) %>%
+  summarise(mean_val = mean(value, na.rm = T),
+            med_val = median(value, na.rm = T),
+            sd_val = sd(value, na.rm = T),
+            qtl_25 = quantile(value, probs = 0.25, na.rm = T),
+            qtl_75 = quantile(value, probs = 0.75, na.rm = T)) %>%
+  mutate(
+    name2 = case_when(
+      name == "obs_exp_panel_ratio" ~ "Obs:Exp",
+      name == "pct_male" ~ "% male",
+      name == "pct_rural" ~ "% rural",
+      name == "nosos_risk_score" ~ "NOSOS",
+      name == "adi_natRnk_avg" ~ "ADI"),
+    mean_val2 = if_else(str_detect(name, "obs_|adi_|nosos"),
+                          paste0(round(mean_val, 2), " (", round(sd_val, 2), ")"),
+                        paste0(percent(mean_val / 100, accuracy = 0.1), 
+                               " (", round(sd_val, 1), ")")),
+    med_val2 = if_else(str_detect(name, "obs_|adi_|nosos"),
+                       as.character(round(med_val, 2)),
+                       percent(med_val / 100, accuracy = 0.1)),
+    qtls = if_else(str_detect(name, "obs_|adi_|nosos"),
+                   paste0(round(qtl_25, 2), ", ", round(qtl_75, 2)),
+                   paste0(round(qtl_25, 1), "%, ", round(qtl_75, 1), "%"))) %>%
+  select(7:10) %>%
+  kbl(col.names = c("", "Mean (SD)", "Median", "25th, 75th %-iles"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped", full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+plot_fxn <- function(outcome, outcome_c){
+  ylab <- if(outcome_c == "est_pc_pt_wt_pid"){
+    "Established Patient Wait Time (days)"
+  }
+  else if(outcome_c == "new_pc_pt_wt"){
+    "New Patient Wait Time (days)"
+  }
+  else{
+    "Third Next Available (days)"
+  }
+#
+
+  ggplot(data = analytic_df,
+         aes(x = vssc_month, y = {{outcome}}, group = sta5a)) +
+    geom_smooth(linewidth = 1, data = subset(analytic_df, vssc_month < ymd("2019-10-01")),
+                aes(x = vssc_month, y = {{outcome}}, group = treat, color = treat),
+                inherit.aes = F,
+                method = lm, se = F) +
+    geom_smooth(linewidth = 1, data = subset(analytic_df, vssc_month > ymd("2019-09-01")),
+                aes(x = vssc_month, y = {{outcome}}, group = treat, color = treat),
+                inherit.aes = F,
+                method = lm, se = F) +
+    ggthemes::scale_color_colorblind() +
+    theme(axis.title.x = element_blank()) +
+    labs(y = ylab) +
+    scale_y_continuous(limits = c(0, NA))
+}
+#
+```
+
+# Baseline Linear Trend  
+
+* This model includes _time2_ (i.e., months) as well as an interaction between _time2_ and _treat_, an interaction between _treat_ and _post_, and a 3-way interaction between _time2_ _treat_ and _post_
+* We chose to center time (i.e., __time2__) to facilitate interpretation of the instantaneous change at implementation
+
+$$Y_{jt}=\beta_{0} +\beta_1Z_{jt}+ \beta_{2}time2_{t} +  \beta_{3}post_{t}+\beta_{4}treat_{j}+\beta_{5}time2_{t}treat_{j}+\beta_{6}post_{t}treat_{j} +\beta_{7}time2_{t}post_{t}treat_{j} + v_{j}+u_{jt}$$
+
+# Dates  
+* Below is a table describing the relationship between month of the year and the analytic variable __time2__  
+
+```{r}
+dates %>%
+  kbl(col.names = c("time", "Month of Year", "time2"),
+      align = rep("c", 3)) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = TRUE)
+```
+
+# Established Patient Wait Time  
+
+## Observed Values  
+
+```{r}
+plot_fxn(est_pc_pt_wt_pid, "est_pc_pt_wt_pid")
+```
+
+## Predicted Values    
+
+```{r}
+bline_trend1 <- lmer(est_pc_pt_wt_pid ~ 
+                       treat * post * time2
+                     + panel_ratio_x_10
+                     + pct_male
+                     + pct_rural
+                     + nosos_x_10
+                     + adi_div_10
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+pred_1 <- ggeffects::ggpredict(bline_trend1, terms = c("time2 [-12:5]", "treat", "post")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2"))
+#--
+p_pred_1 <- ggplot(data = pred_1,
+       aes(x = vssc_month, y = predicted, group = group, color = group)) +
+  geom_line(data = subset(pred_1, vssc_month < ymd("2019-10-01") & facet == "Pre-Intervention (i.e., FY19)"),
+            linewidth = 1) +
+  geom_line(data = subset(pred_1, vssc_month > ymd("2019-09-01") & facet != "Pre-Intervention (i.e., FY19)"),
+            linewidth = 1) +
+  scale_y_continuous(limits = c(0, NA)) +
+  ggthemes::scale_color_colorblind() +
+  theme(legend.position = "bottom",
+        axis.title.x = element_blank()) +
+  labs(y = "Established Patient Wait Time")
+#
+p_pred_1
+```
+
+
+#### Model Estimates    
+```{r}
+bline_trend1b <- lmer(est_pc_pt_wt_pid ~ 
+                       treat * post * time2
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + nosos_risk_score
+                     + adi_natRnk_avg
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+tab_model(bline_trend1, bline_trend1b,
+          dv.labels = c("Established Patient Wait Time (PID)", "Without Scaling"),
+          digits = 3)
+```
+
+#### Bootstrapped Confidence Intervals  
+```{r}
+confint(bline_trend1, method = "boot", oldNames = F, nsim = 500)
+```
+
+
+
+# New Patient Wait Time  
+
+## Observed Values  
+
+```{r}
+plot_fxn(new_pc_pt_wt, "new_pc_pt_wt")
+```
+
+## Predicted Values  
+
+```{r}
+bline_trend2 <- lmer(new_pc_pt_wt ~ 
+                       treat * post * time2
+                     + panel_ratio_x_10
+                     + pct_male
+                     + pct_rural
+                     + nosos_x_10
+                     + adi_div_10
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+pred_2 <- ggeffects::ggpredict(bline_trend2, terms = c("time2 [-12:5]", "treat", "post")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2"))
+#--
+p_pred_2 <- ggplot(data = pred_2,
+       aes(x = vssc_month, y = predicted, group = group, color = group)) +
+  geom_line(data = subset(pred_2, vssc_month < ymd("2019-10-01") & facet == "Pre-Intervention (i.e., FY19)"),
+            linewidth = 1) +
+  geom_line(data = subset(pred_2, vssc_month > ymd("2019-09-01") & facet != "Pre-Intervention (i.e., FY19)"),
+            linewidth = 1) +
+  scale_y_continuous(limits = c(0, NA)) +
+  ggthemes::scale_color_colorblind() +
+  theme(legend.position = "bottom",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time")
+#
+p_pred_2
+```
+
+
+#### Model Estimates      
+```{r}
+bline_trend2b <- lmer(new_pc_pt_wt ~ 
+                       treat * post * time2
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + nosos_risk_score
+                     + adi_natRnk_avg
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+tab_model(bline_trend2, bline_trend2b,
+          dv.labels = c("New Patient Wait Time", "Without Scaling"),
+          digits = 3)
+```
+
+#### Bootstrapped Confidence Intervals  
+```{r}
+confint(bline_trend2, method = "boot", oldNames = F, nsim = 500)
+```
+
+
+
+# Third Next Available    
+
+## Observed Values  
+
+```{r}
+plot_fxn(third_next_avail, "third_next_avail")
+```
+
+## Predicted Values  
+
+```{r}
+bline_trend3 <- lmer(third_next_avail ~ 
+                       treat * post * time2
+                     + panel_ratio_x_10
+                     + pct_male
+                     + pct_rural
+                     + nosos_x_10
+                     + adi_div_10
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+pred_3 <- ggeffects::ggpredict(bline_trend3, terms = c("time2 [-12:5]", "treat", "post")) %>%
+  tibble() %>%
+  left_join(., dates, by = c("x" = "time2"))
+#--
+p_pred_3 <- ggplot(data = pred_3,
+       aes(x = vssc_month, y = predicted, group = group, color = group)) +
+  geom_line(data = subset(pred_3, vssc_month < ymd("2019-10-01") & facet == "Pre-Intervention (i.e., FY19)"),
+            size = 1) +
+  geom_line(data = subset(pred_3, vssc_month > ymd("2019-09-01") & facet != "Pre-Intervention (i.e., FY19)"),
+            size = 1) +
+  scale_y_continuous(limits = c(0, 15)) +
+  ggthemes::scale_color_colorblind() +
+  theme(legend.position = "bottom",
+        axis.title.x = element_blank()) +
+  labs(y = "Third Next Available")
+#-
+p_pred_3
+```
+
+
+#### Model Estimates      
+```{r}
+bline_trend3b <- lmer(third_next_avail ~ 
+                       treat * post * time2
+                     + obs_exp_panel_ratio
+                     + pct_male
+                     + pct_rural
+                     + nosos_risk_score
+                     + adi_natRnk_avg
+                     + (1|sta5a),
+                     data = analytic_df,
+                     REML = TRUE)
+#
+tab_model(bline_trend3, bline_trend3b,
+          dv.labels = c("Third Next Available", "Without Scaling"),
+          digits = 3)
+```
+
+
+#### Bootstrapped Confidence Intervals  
+```{r}
+confint(bline_trend3, method = "boot", oldNames = F, nsim = 500)
+```
+
+# All Together in One Plot  
+
+```{r fig.width = 12, fig.height = 15}
+multiplot(p_pred_1 + theme(legend.position = "none"),
+          p_pred_2 + theme(legend.position = "none"),
+          p_pred_3,
+          cols = 1)
+```
+
+
+# Rural Clinics Only   
+
+```{r}
+analytic_df2 <- analytic_df %>%
+  filter(urh_vast2 == "R")
+#----
+glm_table_fxn <- function(outcome){
+  glm_fmla <- as.formula(paste0(outcome, " ~ treat * post * time2 + panel_ratio_x_10 + pct_male + pct_rural + nosos_x_10 + adi_div_10 + (1|sta5a)"))
+  
+  #-----
+  glm_1 <- lmerTest::lmer(glm_fmla,
+       data = analytic_df,
+       REML = TRUE) 
+  glm_summ1 <- summary(glm_1)
+  #
+  glm_coef1 <- glm_summ1$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column() %>%
+    select(1, 2, 6) %>%
+    rename(p = 3)
+  
+  #-----
+  glm_2 <- lmerTest::lmer(glm_fmla,
+                          data = analytic_df2,
+                          REML = TRUE) 
+  glm_summ2 <- summary(glm_2)
+  #
+  glm_coef2 <- glm_summ2$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column() %>%
+    select(1, 2, 6) %>%
+    rename(p = 3)
+  #===============
+  #-----------------
+  glm_coef1 %>% left_join(., glm_coef2, by = "rowname")%>%
+    mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.001)),
+           p.x = if_else(as.numeric(p.x) < 0.05 | p.x == "0.000", cell_spec(p.x, background = "skyblue"), cell_spec(p.x, background = "white")),
+           p.y = if_else(as.numeric(p.y) < 0.05 | p.y == "0.000", cell_spec(p.y, background = "skyblue"), cell_spec(p.y, background = "white"))) %>%
+    kbl(col.names = c("", "Estimate", "p", "Estimate", "p"),
+        align = c("l", rep("c", 4)),
+        escape = F) %>%
+    kable_classic("striped") %>%
+    add_header_above(c("", "All Sta5a" = 2, "Rural Sta5a" = 2),
+                     bold = T) %>%
+    column_spec(3, border_right = T)
+}
+```
+
+## Established Patient Wait Time  
+
+```{r}
+glm_table_fxn("est_pc_pt_wt_pid")
+```
+
+## New Patient Wait Time  
+
+```{r}
+glm_table_fxn("new_pc_pt_wt_create")
+```
+
+## Third Next Available  
+
+```{r}
+glm_table_fxn("third_next_avail")
+```
+
+# Penetration Rate vs. Binary Indicator  
+
+```{r}
+glm_table_fxn2 <- function(outcome){
+  glm_fmla1 <- as.formula(paste0(outcome, " ~ treat * post * time2 + panel_ratio_x_10 + pct_male + pct_rural + nosos_x_10 + adi_div_10 + (1|sta5a)"))
+  glm_fmla2 <- as.formula(paste0(outcome, " ~ pc_crh_per_1k_total_pc * post * time2 + panel_ratio_x_10 + pct_male + pct_rural + nosos_x_10 + adi_div_10 + (1|sta5a)"))
+  
+  #-----
+  glm_1 <- lmerTest::lmer(glm_fmla1,
+       data = analytic_df,
+       REML = TRUE) 
+  glm_summ1 <- summary(glm_1)
+  #
+  glm_coef1 <- glm_summ1$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column() %>%
+    select(1, 2, 6) %>%
+    rename(p = 3)
+  
+  #-----
+  glm_2 <- lmerTest::lmer(glm_fmla2,
+                          data = analytic_df,
+                          REML = TRUE) 
+  glm_summ2 <- summary(glm_2)
+  #
+  glm_coef2 <- glm_summ2$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column() %>%
+    select(1, 2, 6) %>%
+    rename(p = 3) %>%
+    mutate(rowname2 = rowname) %>%
+    select(rowname, rowname2, Estimate, p)
+  #===============
+  #-----------------
+  glm_coef1 %>% full_join(., glm_coef2, by = "rowname")%>%
+    mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.001)),
+           p.x = if_else(as.numeric(p.x) < 0.05 | p.x == "0.000", cell_spec(p.x, background = "skyblue"), cell_spec(p.x, background = "white")),
+           p.y = if_else(as.numeric(p.y) < 0.05 | p.y == "0.000", cell_spec(p.y, background = "skyblue"), cell_spec(p.y, background = "white"))) %>%
+    kbl(col.names = c("", "Estimate", "p", "", "Estimate", "p"),
+        align = c("l", "c", "c", "l", "c", "c"),
+        escape = F) %>%
+    kable_classic("striped") %>%
+    add_header_above(c("Binary Treated" = 3, "Penetration Rate" = 3),
+                     bold = T) %>%
+    column_spec(3, border_right = T)
+}
+```
+
+## Established Patient Wait Time  
+
+```{r}
+glm_table_fxn2("est_pc_pt_wt_pid")
+```
+
+## New Patient Wait Time  
+
+```{r}
+glm_table_fxn2("new_pc_pt_wt_create")
+```
+
+## Third Next Available  
+
+```{r}
+glm_table_fxn2("third_next_avail")
+```
+
+# Effect of V-IMPACT Pilot Status    
+
+
+```{r}
+glm_table_fxn3 <- function(outcome){
+  glm_fmla1 <- as.formula(paste0(outcome, " ~ treat * post * time2 + panel_ratio_x_10 + pct_male + pct_rural + nosos_x_10 + adi_div_10 + vimpact_pilot + (1|sta5a)"))
+  glm_fmla2 <- as.formula(paste0(outcome, " ~ treat * post * time2 + panel_ratio_x_10 + pct_male + pct_rural + nosos_x_10 + adi_div_10 + (1|sta5a)"))
+  
+  #-----
+  glm_1 <- lmerTest::lmer(glm_fmla1,
+       data = analytic_df,
+       REML = TRUE) 
+  glm_summ1 <- summary(glm_1)
+  #
+  glm_coef1 <- glm_summ1$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column() %>%
+    select(1, 2, 6) %>%
+    rename(p = 3)
+  
+  #-----
+  glm_2 <- lmerTest::lmer(glm_fmla2,
+                          data = analytic_df,
+                          REML = TRUE) 
+  glm_summ2 <- summary(glm_2)
+  #
+  glm_coef2 <- glm_summ2$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column() %>%
+    select(1, 2, 6) %>%
+    rename(p = 3)
+  #===============
+  #-----------------
+  glm_coef1 %>% full_join(., glm_coef2, by = "rowname")%>%
+    mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.001)),
+           p.x = if_else(as.numeric(p.x) < 0.05 | p.x == "0.000", cell_spec(p.x, background = "skyblue"), cell_spec(p.x, background = "white")),
+           p.y = if_else(as.numeric(p.y) < 0.05 | p.y == "0.000", cell_spec(p.y, background = "skyblue"), cell_spec(p.y, background = "white"))) %>%
+    kbl(col.names = c("", "Estimate", "p", "Estimate", "p"),
+        align = c("l", "c", "c", "c", "c"),
+        escape = F) %>%
+    kable_classic("striped") %>%
+    add_header_above(c("", "V-Impact" = 2, "No V-IMPACT" = 2),
+                     bold = T) %>%
+    column_spec(3, border_right = T)
+}
+```
+
+## Established Patient Wait Time  
+
+```{r}
+glm_table_fxn3("est_pc_pt_wt_pid")
+```
+
+## New Patient Wait Time  
+
+```{r}
+glm_table_fxn3("new_pc_pt_wt_create")
+```
+
+## Third Next Available  
+
+```{r}
+glm_table_fxn3("third_next_avail")
+```
+
+```{r}
+glm_table_fxn4 <- function(outcome){
+  glm_fmla1 <- as.formula(paste0(outcome, " ~ treat * post * time2 + panel_ratio_x_10 + pct_male + pct_rural + nosos_x_10 + adi_div_10 + vimpact_pilot + (1|sta5a)"))
+  glm_fmla2 <- as.formula(paste0(outcome, " ~ treat * post * time2 + panel_ratio_x_10 + pct_male + pct_rural + nosos_x_10 + adi_div_10 + (1|sta5a)"))
+  
+  #-----
+  glm_1 <- lmerTest::lmer(glm_fmla2,
+       data = analytic_df,
+       REML = TRUE) 
+  glm_summ1 <- summary(glm_1)
+  #
+  glm_coef1 <- glm_summ1$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column() %>%
+    select(1, 2, 6) %>%
+    rename(p = 3)
+  
+  #-----
+  glm_2 <- analytic_df %>%
+  filter(vimpact_pilot == F) %>%
+    lmerTest::lmer(glm_fmla2,
+                          data = .,
+                          REML = TRUE) 
+  glm_summ2 <- summary(glm_2)
+  #
+  glm_coef2 <- glm_summ2$coefficients %>%
+    as.data.frame() %>%
+    rownames_to_column() %>%
+    select(1, 2, 6) %>%
+    rename(p = 3)
+  #===============
+  #-----------------
+  glm_coef1 %>% full_join(., glm_coef2, by = "rowname")%>%
+    mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.001)),
+           p.x = if_else(as.numeric(p.x) < 0.05 | p.x == "0.000", cell_spec(p.x, background = "skyblue"), cell_spec(p.x, background = "white")),
+           p.y = if_else(as.numeric(p.y) < 0.05 | p.y == "0.000", cell_spec(p.y, background = "skyblue"), cell_spec(p.y, background = "white"))) %>%
+    kbl(col.names = c("", "Estimate", "p", "Estimate", "p"),
+        align = c("l", "c", "c", "c", "c"),
+        escape = F) %>%
+    kable_classic("striped") %>%
+    add_header_above(c("", "V-Impact" = 2, "No V-IMPACT" = 2),
+                     bold = T) %>%
+    column_spec(3, border_right = T)
+}
+```
+
+## Established Patient Wait Time  
+
+```{r}
+glm_table_fxn4("est_pc_pt_wt_pid")
+```
+
+## New Patient Wait Time  
+
+```{r}
+glm_table_fxn4("new_pc_pt_wt_create")
+```
+
+## Third Next Available  
+
+```{r}
+glm_table_fxn4("third_next_avail")
+```
+
+# Clustered at VISN and Sta5a  
+
+```{r}
+visn_cluster_fxn <- function(outcome){
+  glm_fmla <- as.formula(paste0(outcome, 
+                                 " ~ treat * post * time2 + panel_ratio_x_10", 
+                                 " + pct_male + pct_rural + nosos_x_10 + adi_div_10 + (1|sta5a) + (1|parent_visn)"))
+  #---
+  lmer(glm_fmla,
+       data = analytic_df)
+}
+#
+est_mod <- visn_cluster_fxn("est_pc_pt_wt_pid")
+new_mod <- visn_cluster_fxn("new_pc_pt_wt_create")
+tna_mod <- visn_cluster_fxn("third_next_avail")
+#
+tab_model(est_mod, new_mod, tna_mod)
+```

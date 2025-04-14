@@ -1,0 +1,247 @@
+---
+title: "CRH Specialty Care"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+library(DT)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+# theme_update(axis.title = element_text(size = 20),
+#              axis.text = element_text(size = 16),
+#              strip.text = element_text(size = 14),
+#              legend.text = element_text(size = 18),
+#              legend.title = element_blank(),
+#              plot.caption = element_text(size = 12),
+#              legend.position = "bottom")
+#===========
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#--
+stop_codes = dbGetQuery(oabi_con,
+                        "with cte as(
+	select distinct primarystopcode as stopcode from [PACT_CC].[CRH].[C_crh_utilization_final]
+	UNION
+	select distinct secondarystopcode as stopcode from [PACT_CC].[CRH].[C_crh_utilization_final]
+	)
+select distinct a.stopcode
+	, StopCodeName = CASE
+		WHEN b.StopCode = 674 THEN 'ADMIN PAT ACTIVTIES (MASNONCT)'
+		WHEN b.StopCode = 201 THEN 'PHYSICAL MED & REHAB SVC'
+		WHEN b.StopCode = 303 THEN 'CARDIOLOGY'
+		WHEN b.StopCode = 305 THEN 'ENDOCRINOLOGY'
+		WHEN b.StopCode = 307 THEN 'GI CLINIC'
+		WHEN b.StopCode = 311 THEN 'CIED DEVICES'
+		WHEN b.StopCode = 323 THEN 'PRIMARY CARE/MEDICINE'
+		WHEN b.StopCode = 408 THEN 'OPTOMETRY'
+		WHEN b.StopCode = 409 THEN 'ORTHOPEDICS'
+		WHEN b.StopCode = 502 THEN 'MENTAL HEALTH CLINIC - IND'
+		WHEN b.StopCode = 415 THEN 'VASCULAR SURGERY'
+		ELSE b.StopCodeName END
+from cte as a
+left join [CDWWork].Dim.StopCode as b
+on a.stopcode = b.StopCode
+where b.StopCodeName NOT LIKE 'Z%'
+	AND InactiveDateTime IS NULL") %>%
+  rename_all(tolower)
+#
+non_informative_scs = c("CHART CONSULT", 
+                        "CVT PRV SITE SAME DIV/STA",
+                        "NURSE PRACTITIONER",
+                        "PHYSICIAN ASSISTANT", 
+                        "RT CLIN VD TH PRV SITE(DIFSTA)",
+                        "RT CLIN VID CARE HOME",
+                        "RT CLIN VID TH PAT SITE",
+                        "S&F HOME NON VA PROV SITE",
+                        "SF TH PAT SITE", 
+                        "SF TH PRV SITE SAME DIV/STA",
+                        "SF TH PRV SITE(DIFSTA)",
+                        "NURSING (2ND ONLY)",
+                        "ADMIN PAT ACTIVTIES (MASNONCT)",
+                        "TELEPHONE/MEDICINE",
+                        "MHV SECURE MESSAGING")
+#
+spec_care = dbGetQuery(oabi_con,
+                       "select *
+                       from [PACT_CC].[CRH].[C_crh_utilization_final]
+                       where care_type = 'Specialty'") %>%
+  left_join(., stop_codes %>%
+              rename(psc_name = stopcodename),
+            by = c("primarystopcode" = "stopcode")) %>%
+  left_join(., stop_codes %>%
+              rename(ssc_name = stopcodename),
+            by = c("secondarystopcode" = "stopcode")) %>%
+  mutate(
+    spec_care_type = case_when(
+    primarystopcode %in% c(718, 407, 408) ~ "Eye Care",
+    TRUE ~ "Other"
+    ),
+    combined_scname = case_when(primarystopcode %in% c(718, 407, 408) ~ "Eye Care",
+                                ssc_name %in% non_informative_scs
+                                & psc_name %in% non_informative_scs ~ "Non-informative",
+                                psc_name %in% non_informative_scs & is.na(ssc_name) ~
+                                  "Non-informative",
+                                ssc_name %in% non_informative_scs 
+                                | is.na(ssc_name) ~ psc_name, 
+                                TRUE ~ ssc_name),
+    visit_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")))
+```
+
+
+# CRH Specialty Care Over Time  
+
+
+## National  
+
+```{r}
+spec_care %>%
+  group_by(visit_month) %>%
+  summarise(spec_encounters = n()) %>%
+  ggplot(data = .,
+         aes(x = visit_month, y = spec_encounters)) +
+  geom_line(color = "darkorchid",
+            linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  labs(x = "Time",
+       y = "CRH Specialty Encounters")
+```
+
+## By VISN  
+
+
+```{r}
+spec_care %>%
+  group_by(visit_month, spoke_visn_crh) %>%
+  summarise(spec_encounters = n()) %>%
+  ggplot(data = .,
+         aes(x = visit_month, y = spec_encounters, color = spoke_visn_crh)) +
+  geom_line(linewidth = 0.75) +
+  scale_y_continuous(labels = comma_format()) +
+  labs(x = "Time",
+       y = "CRH Specialty Encounters") +
+  facet_wrap(~spoke_visn_crh) +
+  theme(legend.position = "none")
+```
+
+# Frequency Of Combined Stop Codes     
+
+```{r}
+spec_care %>%
+  group_by(combined_scname) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(prop = scales::percent(count / nrow(spec_care), accuracy = 0.1),
+         count = comma(count)) %>%
+  datatable(.,
+            colnames = c("Specialty Care Category", "Encounters", ""),
+            class = 'cell-border stripe',
+            rownames = FALSE,
+            options = list(
+              pageLength = 15,
+              columnDefs = list(list(className = 'dt-left', targets = "_all"))
+            ))
+```
+
+## What is \"Non-informative\"?  
+
+```{r}
+spec_care %>% 
+  filter(combined_scname == "Non-informative") %>% 
+  group_by(primarystopcode, psc_name, secondarystopcode, ssc_name) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(prop = scales::percent(count / nrow(spec_care), accuracy = 0.1),
+         count = comma(count)) %>%
+  kbl(col.names = c("Primary SC", "Primary SC Name", 
+                    "Secondary SC", "Secondary SC Name",
+                    "Encounters", " "), 
+      align = rep("l", 6),
+      full_width = F) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## What is \"Eye Care\"?  
+
+```{r}
+spec_care %>% 
+  filter(combined_scname == "Eye Care") %>% 
+  group_by(primarystopcode, psc_name, secondarystopcode, ssc_name) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(prop = scales::percent(count / nrow(spec_care), accuracy = 0.1),
+         count = comma(count)) %>%
+  kbl(col.names = c("Primary SC", "Primary SC Name", 
+                    "Secondary SC", "Secondary SC Name",
+                    "Encounters", " "), 
+      align = rep("l", 6),
+      full_width = F) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+# All CRH Specialty Care Encounters  
+
+* Below is a frequency table of all `r nrow(spec_care) %>% comma()` CRH Specialty Care encounters, through December 31st, 2024
+
+```{r}
+spec_care %>%
+  group_by(primarystopcode, psc_name, secondarystopcode, ssc_name) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(prop = scales::percent(count / nrow(spec_care), accuracy = 0.1),
+         count = comma(count)) %>%
+  datatable(.,
+            colnames = c("Primary StopCode", "Primary StopCode Name", 
+                         "Secondary StopCode", "Secondary StopCode Name", "Encounters", ""),
+            class = 'cell-border stripe',
+            rownames = FALSE,
+            options = list(
+              pageLength = 15,
+              columnDefs = list(list(className = 'dt-left', targets = "_all"))
+            ))
+```

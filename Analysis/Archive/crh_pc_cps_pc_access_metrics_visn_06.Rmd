@@ -1,0 +1,586 @@
+---
+title: "VISN 6"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+
+
+```{r reading-in}
+hubs <- dbGetQuery(oabi_con,
+                   "select distinct hub_sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY20]
+                    UNION 
+                    select distinct Hub_Sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY21_working]") %>%
+  pull
+#--
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#==
+all_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].all_encounters_E_counts") %>%
+  select(-contains("Vax")) %>%
+  mutate(vizMonth = ymd(vizMonth)) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name),
+         spoke_flag = if_else(sta6a %in% spokes_v, TRUE, FALSE),
+         fy = if_else(month(vizMonth) > 9, year(vizMonth) + 1, year(vizMonth)),
+         qtr = case_when(month(vizMonth) %in% c(10, 11, 12) ~ 1,
+                         month(vizMonth) %in% c(1, 2, 3) ~ 2,
+                         month(vizMonth) %in% c(4, 5, 6) ~ 3,
+                         month(vizMonth) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  filter(is.na(parent_visn) == F & fy %in% c(2020, 2021)) %>%
+  rename("Primary Care" = pc_encounters,
+         "Mental Health" = mh_encounters,
+         "Pharmacy" = pharmacy_encounters,
+         "PCMHI" = pcmhi_encounters)
+#
+all_qtrs <- all_encounters %>% select(fyqtr) %>% distinct
+#
+spoke_encounters <- all_encounters %>% filter(spoke_flag == T) %>%
+  rename(sta5a = sta6a)
+#-----
+crh_encounters <- dbGetQuery(oabi_con,
+                         "select * from [PACT_CC].[CRH].[crh_full_utilization_final_fy20_21]") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  filter(fy %in% c(2020, 2021) & care_type %in% c("Primary Care", "Pharmacy")) %>%
+  left_join(., vast, by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  rename(sta5a = spoke_sta5a_combined_cdw)
+#--==================
+access_metrics_sta5a <- read_csv(here("Input", "Data", "pc_access_metrics_sta5a_qtr.csv")) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  rename(sta5a = sta6a) %>%
+  mutate(sta5a_lab = paste0("(", sta5a, ") ", short_name),
+         fy_qtr = str_replace(fy_qtr, "_", "-"))
+```
+
+```{r creating_sta5a_data_frames}
+#--TOTAL
+crh_sta5a_total <- all_qtrs %>% left_join(., crh_encounters) %>%
+  group_by(fyqtr, sta5a) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup
+#
+all_sta5a_total <- all_qtrs %>% left_join(., spoke_encounters) %>%
+  select(4:7, sta5a, fyqtr) %>%
+  pivot_longer(-c(fyqtr, sta5a)) %>%
+  group_by(fyqtr, sta5a) %>%
+  summarise(total = sum(value, na.rm = T)) %>%
+  ungroup
+#
+total_avg <- crh_sta5a_total %>% 
+  group_by(sta5a) %>%
+  summarise(avg_crh_per_qtr = mean(crh_encounters, na.rm = T))
+#
+total_sta5a_df <- all_qtrs %>% 
+  full_join(., crh_sta5a_total) %>%
+  full_join(., all_sta5a_total, by = c("fyqtr" = "fyqtr", "sta5a" = "sta5a")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  ungroup %>%
+  left_join(., vast %>% select(sta5a, parent_visn, short_name)) %>%
+  mutate(sta5a_lab = paste0("(", sta5a, ") ", short_name)) %>%
+  left_join(., total_avg) %>%
+  filter(sta5a %in% spokes_v)
+#==BY CARE TYPE
+crh_sta5a_type <- all_qtrs %>% left_join(., crh_encounters) %>%
+  group_by(fyqtr, sta5a, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup
+#
+all_sta5a_type <- all_qtrs %>% left_join(., spoke_encounters) %>%
+  select(4:7, sta5a, fyqtr) %>%
+  pivot_longer(-c(fyqtr, sta5a)) %>%
+  group_by(fyqtr, sta5a, name) %>%
+  summarise(total = sum(value, na.rm = T)) %>%
+  ungroup
+#
+type_avg <- crh_sta5a_type %>% 
+  group_by(sta5a, care_type) %>%
+  summarise(avg_crh_per_qtr = mean(crh_encounters, na.rm = T))
+#
+type_sta5a_df <- all_qtrs %>% 
+  full_join(., crh_sta5a_type) %>%
+  full_join(., all_sta5a_type, by = c("fyqtr" = "fyqtr", "care_type" = "name", "sta5a" = "sta5a")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  ungroup %>%
+  left_join(., vast %>% select(sta5a, parent_visn, short_name)) %>%
+  mutate(sta5a_lab = paste0("(", sta5a, ") ", short_name)) %>%
+  left_join(., type_avg) %>%
+  filter(sta5a %in% spokes_v)
+#-------
+access_metrics_sta5a <- access_metrics_sta5a %>%
+  inner_join(., type_avg %>% filter(care_type == "Primary Care")) %>%
+  filter(sta5a %in% spokes_v)
+```
+
+```{r sta5a_functions}
+crh_plot_fxn_1 <- function(visn_var, care_type_var, metric){
+  if (metric == "total"){
+    y_axis <- paste0("Total ", care_type_var, " Encounters")
+  }
+  else if (metric == "crh_encounters"){
+    y_axis <- paste0(care_type_var, " CRH Encounters")
+  }
+  else {
+    y_axis <- paste0(care_type_var, " CRH Encounters per 1,000 ", care_type_var, " Encounters")
+  }
+  type_sta5a_df %>%
+    filter(parent_visn == visn_var & avg_crh_per_qtr > 100 & care_type == care_type_var) %>% 
+    select(-care_type) %>%
+    mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                           fyqtr, crh_encounters)) %>%
+    select(-c(sta5a, parent_visn, short_name)) %>%
+    pivot_longer(-c(fyqtr, sta5a_lab)) %>%
+    filter(name == metric) %>%
+    ggplot(data = .,
+           aes(y = value, x = fyqtr, group = sta5a_lab, color = sta5a_lab)) +
+    geom_line(size = 1) +
+    geom_point(size = 1) +
+    scale_y_continuous(limits = c(0, NA),
+                       labels = scales::comma_format(accuracy = 1)) +
+    theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    labs(color = "Sta5a",
+         x = "FY-Quarter",
+         y = y_axis,
+         caption = "*Legend is ordered by the last datapoint") +
+    guides(color = guide_legend(override.aes = list(size = 1.25)))
+}
+#-------
+crh_plot_fxn_2 <- function(visn_var, care_type_var, metric){
+  if (metric == "total"){
+    y_axis <- paste0("Total ", care_type_var, " Encounters")
+  }
+  else if (metric == "crh_encounters"){
+    y_axis <- paste0(care_type_var, " CRH Encounters")
+  }
+  else {
+    y_axis <- paste0(care_type_var, " CRH Encounters per 1,000 ", care_type_var, " Encounters")
+  }
+  type_sta5a_df %>%
+    filter(parent_visn == visn_var & avg_crh_per_qtr <= 100 & care_type == care_type_var) %>% 
+    select(-care_type) %>%
+    mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                           fyqtr, crh_encounters)) %>%
+    select(-c(sta5a, parent_visn, short_name)) %>%
+    pivot_longer(-c(fyqtr, sta5a_lab)) %>%
+    filter(name == metric) %>%
+    ggplot(data = .,
+           aes(y = value, x = fyqtr, group = sta5a_lab, color = sta5a_lab)) +
+    geom_line(size = 1) +
+    geom_point(size = 1) +
+    scale_y_continuous(limits = c(0, NA),
+                       labels = scales::comma_format(accuracy = 1)) +
+    theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    labs(color = "Sta5a",
+         x = "FY-Quarter",
+         y = y_axis,
+         caption = "*Legend is ordered by the last datapoint") +
+    guides(color = guide_legend(override.aes = list(size = 1.25)))
+}
+#=====
+crh_table_fxn <- function(visn_var, care_type_var){
+  type_sta5a_df %>% 
+    filter(parent_visn == visn_var & care_type == care_type_var) %>%
+    select(fyqtr, sta5a_lab, crh_encounters, total, crh_per_1k_total) %>%
+    mutate(crh_encounters = format(crh_encounters, digits = 0, big.mark = ","),
+           total = format(total, digits = 0, big.mark = ","),
+           crh_per_1k_total = format(round(crh_per_1k_total, 1), digits = 1)) %>%
+    pivot_longer(-c(fyqtr, sta5a_lab)) %>%
+    mutate(
+      name_lab = case_when(
+        name == "total" ~ "Total",
+        name == "crh_per_1k_total" ~ "CRH per 1,000",
+        name == "crh_encounters" ~ "CRH"),
+      value = if_else(str_trim(value) == "NA", NA_character_, value)
+    ) %>%
+    select(-name) %>%
+    pivot_wider(names_from = c(name_lab, fyqtr), values_from = value) %>%
+    select(sta5a_lab, contains("20-1"), contains("20-2"), contains("20-3"), contains("20-4"),
+           contains("21-1"), contains("21-2"), contains("21-3"), contains("21-4")) %>%
+    kbl(col.names = c("Sta5a", rep(c("CRH Encounters", "Total", "CRH per 1,000"), 8)),
+        align = c("l", rep("r", 24))) %>%
+    kable_classic("striped") %>%
+    add_header_above(bold = TRUE,
+                     c(" ",
+                       "2020-1" = 3, "2020-2" = 3, "2020-3" = 3, "2020-4" = 3,
+                       "2021-1" = 3, "2021-2" = 3, "2021-3" = 3, "2021-4" = 3)) %>%
+    column_spec(c(1, 4, 7, 10, 13, 16, 19, 22, 25), border_right = TRUE)
+}
+#========================
+access_plot_1 <- function(visn_var, visn_var_quote, metric_var, metric_var_quote){
+  if ({{metric_var_quote}} == "established_pt_waitTime"){
+    y_axis <- "Established Patient Wait Time (days)"
+  }
+  else if ({{metric_var_quote}} == "new_pt_waitTime"){
+    y_axis <- "New Patient Wait Time (days)"
+  }
+  else if ({{metric_var_quote}} == "obs_exp_panelSize_ratio"){
+    y_axis <- "Observed:Expected Panel Size Ratio"
+  }
+  else {
+    y_axis <- "Timely Care Success Rate"
+  }
+  #-
+  if({{metric_var_quote}} == "established_pt_waitTime"){
+    access_metrics_sta5a <- access_metrics_sta5a %>%
+      group_by({{visn_var_quote}}) %>%
+      mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                      fy_qtr, established_pt_waitTime)) %>%
+      ungroup
+  }
+  else if({{metric_var_quote}} == "new_pt_waitTime"){
+    access_metrics_sta5a <- access_metrics_sta5a %>%
+      group_by({{visn_var_quote}}) %>%
+      mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                      fy_qtr, new_pt_waitTime)) %>%
+      ungroup
+  }
+  else if({{metric_var_quote}} == "obs_exp_panelSize_ratio"){
+    access_metrics_sta5a <- access_metrics_sta5a %>%
+      group_by({{visn_var_quote}}) %>%
+      mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                      fy_qtr, obs_exp_panelSize_ratio)) %>%
+      ungroup
+  }
+  else {
+    access_metrics_sta5a <- access_metrics_sta5a %>%
+      group_by({{visn_var_quote}}) %>%
+      mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                      fy_qtr, tc_pc_success_prop)) %>%
+      ungroup
+  }
+  #-
+  if ({{metric_var_quote}} == "tc_pc_success_prop"){
+  access_metrics_sta5a %>%
+    filter(parent_visn == {{visn_var}}) %>%
+    select(fy_qtr, sta5a_lab, {{metric_var_quote}}, avg_crh_per_qtr) %>%
+    filter(avg_crh_per_qtr > 100) %>%
+    ggplot(data = .,
+           aes(x = fy_qtr, y = {{metric_var}}, color = sta5a_lab, group = sta5a_lab)) +
+    geom_line(size = 1) +
+    scale_y_continuous(limits = c(0, 1),
+                       labels = scales::percent_format(accuracy = 1)) +
+    theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    labs(color = "Sta5a",
+         x = "FY-Quarter",
+         y = y_axis,
+         caption = "*Legend is ordered by the last datapoint") +
+    guides(color = guide_legend(override.aes = list(size = 1.25)))
+  }
+  else {
+    access_metrics_sta5a %>%
+      filter(parent_visn == {{visn_var}}) %>%
+      select(fy_qtr, sta5a_lab, {{metric_var_quote}}, avg_crh_per_qtr) %>%
+      filter(avg_crh_per_qtr > 100) %>%
+      ggplot(data = .,
+             aes(x = fy_qtr, y = {{metric_var}}, color = sta5a_lab, group = sta5a_lab)) +
+      geom_line(size = 1) +
+      scale_y_continuous(limits = c(0, NA),
+                         labels = scales::comma_format(accuracy = 1)) +
+      theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+      labs(color = "Sta5a",
+           x = "FY-Quarter",
+           y = y_axis,
+           caption = "*Legend is ordered by the last datapoint") +
+      guides(color = guide_legend(override.aes = list(size = 1.25)))
+  }
+}
+#----
+access_plot_2 <- function(visn_var, visn_var_quote, metric_var, metric_var_quote){
+  if ({{metric_var_quote}} == "established_pt_waitTime"){
+    y_axis <- "Established Patient Wait Time (days)"
+  }
+  else if ({{metric_var_quote}} == "new_pt_waitTime"){
+    y_axis <- "New Patient Wait Time (days)"
+  }
+  else if ({{metric_var_quote}} == "obs_exp_panelSize_ratio"){
+    y_axis <- "Observed:Expected Panel Size Ratio"
+  }
+  else {
+    y_axis <- "Timely Care Success Rate"
+  }
+  #-
+  if({{metric_var_quote}} == "established_pt_waitTime"){
+    access_metrics_sta5a <- access_metrics_sta5a %>%
+      group_by({{visn_var_quote}}) %>%
+      mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                      fy_qtr, established_pt_waitTime)) %>%
+      ungroup
+  }
+  else if({{metric_var_quote}} == "new_pt_waitTime"){
+    access_metrics_sta5a <- access_metrics_sta5a %>%
+      group_by({{visn_var_quote}}) %>%
+      mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                      fy_qtr, new_pt_waitTime)) %>%
+      ungroup
+  }
+  else if({{metric_var_quote}} == "obs_exp_panelSize_ratio"){
+    access_metrics_sta5a <- access_metrics_sta5a %>%
+      group_by({{visn_var_quote}}) %>%
+      mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                      fy_qtr, obs_exp_panelSize_ratio)) %>%
+      ungroup
+  }
+  else {
+    access_metrics_sta5a <- access_metrics_sta5a %>%
+      group_by({{visn_var_quote}}) %>%
+      mutate(sta5a_lab = fct_reorder2(factor(sta5a_lab),
+                                      fy_qtr, tc_pc_success_prop)) %>%
+      ungroup
+  }
+  #-
+  if ({{metric_var_quote}} == "tc_pc_success_prop"){
+  access_metrics_sta5a %>%
+    filter(parent_visn == {{visn_var}}) %>%
+    select(fy_qtr, sta5a_lab, {{metric_var_quote}}, avg_crh_per_qtr) %>%
+    filter(avg_crh_per_qtr <= 100) %>%
+    ggplot(data = .,
+           aes(x = fy_qtr, y = {{metric_var}}, color = sta5a_lab, group = sta5a_lab)) +
+    geom_line(size = 1) +
+    scale_y_continuous(limits = c(0, 1),
+                       labels = scales::percent_format(accuracy = 1)) +
+    theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    labs(color = "Sta5a",
+         x = "FY-Quarter",
+         y = y_axis,
+         caption = "*Legend is ordered by the last datapoint") +
+    guides(color = guide_legend(override.aes = list(size = 1.25)))
+  }
+  else {
+    access_metrics_sta5a %>%
+      filter(parent_visn == {{visn_var}}) %>%
+      select(fy_qtr, sta5a_lab, {{metric_var_quote}}, avg_crh_per_qtr) %>%
+      filter(avg_crh_per_qtr <= 100) %>%
+      ggplot(data = .,
+             aes(x = fy_qtr, y = {{metric_var}}, color = sta5a_lab, group = sta5a_lab)) +
+      geom_line(size = 1) +
+      scale_y_continuous(limits = c(0, NA),
+                         labels = scales::comma_format(accuracy = 1)) +
+      theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+      labs(color = "Sta5a",
+           x = "FY-Quarter",
+           y = y_axis,
+           caption = "*Legend is ordered by the last datapoint") +
+      guides(color = guide_legend(override.aes = list(size = 1.25)))
+  }
+}
+#=================
+access_table_fxn <- function(visn_var, metric_var_quote){
+  access_metrics_sta5a %>%
+    filter(parent_visn == visn_var) %>%
+    select(fy_qtr, sta5a_lab, established_pt_waitTime, new_pt_waitTime,
+           obs_exp_panelSize_ratio, tc_pc_success_prop) %>%
+    mutate(established_pt_waitTime = format(established_pt_waitTime, 
+                                            big.mark = ",", digits = 2),
+           new_pt_waitTime = format(round(new_pt_waitTime, 1), 
+                                    big.mark = ",", digits = 2),
+           obs_exp_panelSize_ratio = format(obs_exp_panelSize_ratio, 
+                                            big.mark = ",", digits = 1),
+           tc_pc_success_prop = paste0(format(round(tc_pc_success_prop * 100, 1), nsmall = 2), "%")) %>%
+    pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+    filter(name == metric_var_quote) %>%
+    pivot_wider(names_from = c(fy_qtr, name), values_from = value) %>%
+    kbl(col.names = c("Sta5a", "2020-1", "2020-2", "2020-3", "2020-4",
+                      "2021-1", "2021-2", "2021-3", "2021-4"),
+        align = c("l", rep("r", 8))) %>%
+    kable_classic("striped")
+}
+```
+
+## Primary Care   
+### PC CRH Encounters - I    
+```{r}
+crh_plot_fxn_1(visn_var = 6, "Primary Care", "crh_encounters")
+```
+
+### PC CRH Encounters - II    
+```{r}
+crh_plot_fxn_2(visn_var = 6, "Primary Care", "crh_encounters")
+```
+
+### Total PC Encounters - I    
+```{r}
+crh_plot_fxn_1(visn_var = 6, "Primary Care", "total")
+```
+
+### Total PC Encounters - II    
+```{r}
+crh_plot_fxn_2(visn_var = 6, "Primary Care", "crh_encounters")
+```
+
+### PC CRH Encounters per 1,000 Total PC Encounters - I    
+```{r}
+crh_plot_fxn_1(visn_var = 6, "Primary Care", "crh_per_1k_total")
+```
+
+### PC CRH Encounters per 1,000 Total PC Encounters - II    
+```{r}
+crh_plot_fxn_2(visn_var = 6, "Primary Care", "crh_per_1k_total")
+```
+
+### As a Table  
+```{r}
+crh_table_fxn(visn_var = 6, "Primary Care")
+```
+
+## Primary Care Access Metrics  
+### Established Patient Wait Time - I  
+```{r}
+access_plot_1(visn_var = 6, visn_var_quote = "6", established_pt_waitTime, "established_pt_waitTime")
+```
+  
+### Established Patient Wait Time - II  
+```{r}
+access_plot_2(visn_var = 6, visn_var_quote = "6", established_pt_waitTime, "established_pt_waitTime")
+```
+
+### As a Table  
+```{r}
+access_table_fxn(visn_var = 6, "established_pt_waitTime")
+```
+ 
+### New Patient Wait Time - I  
+```{r}
+access_plot_1(visn_var = 6, visn_var_quote = "6", new_pt_waitTime, "new_pt_waitTime")
+```
+  
+### New Patient Wait Time - II  
+```{r}
+access_plot_2(visn_var = 6, visn_var_quote = "6", new_pt_waitTime, "new_pt_waitTime")
+```
+
+### As a Table  
+```{r}
+access_table_fxn(visn_var = 6, "new_pt_waitTime")
+```
+ 
+### Observed:Expected Panel Size Ratio - I  
+```{r}
+access_plot_1(visn_var = 6, visn_var_quote = "6", obs_exp_panelSize_ratio, "obs_exp_panelSize_ratio")
+```
+  
+### Observed:Expected Panel Size Ratio - II  
+```{r}
+access_plot_2(visn_var = 6, visn_var_quote = "6", obs_exp_panelSize_ratio, "obs_exp_panelSize_ratio")
+```
+ 
+### As a Table  
+```{r}
+access_table_fxn(visn_var = 6, "obs_exp_panelSize_ratio")
+```
+
+### Timely Care Success Rate - I  
+```{r}
+access_plot_1(visn_var = 6, visn_var_quote = "6", tc_pc_success_prop, "tc_pc_success_prop")
+```
+  
+### Timely Care Success Rate - II  
+```{r}
+access_plot_2(visn_var = 6, visn_var_quote = "6", tc_pc_success_prop, "tc_pc_success_prop")
+```
+
+### As a Table  
+```{r}
+access_table_fxn(visn_var = 6, "tc_pc_success_prop")
+``` 
+
+
+## Pharmacy   
+### CPS CRH Encounters - I    
+```{r}
+crh_plot_fxn_1(visn_var = 6, "Pharmacy", "crh_encounters")
+```
+
+### CPS CRH Encounters - II    
+```{r}
+crh_plot_fxn_2(visn_var = 6, "Pharmacy", "crh_encounters")
+```
+
+### Total CPS Encounters - I    
+```{r}
+crh_plot_fxn_1(visn_var = 6, "Pharmacy", "total")
+```
+
+### Total CPS Encounters - II    
+```{r}
+crh_plot_fxn_2(visn_var = 6, "Pharmacy", "crh_encounters")
+```
+
+### CPS CRH Encounters per 1,000 Total CPS Encounters - I    
+```{r}
+crh_plot_fxn_1(visn_var = 6, "Pharmacy", "crh_per_1k_total")
+```
+
+### CPS CRH Encounters per 1,000 Total CPS Encounters - II    
+```{r}
+crh_plot_fxn_2(visn_var = 6, "Pharmacy", "crh_per_1k_total")
+```
+
+### As a Table  
+```{r}
+crh_table_fxn(visn_var = 6, "Pharmacy")
+```

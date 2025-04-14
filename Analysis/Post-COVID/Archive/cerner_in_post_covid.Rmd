@@ -1,0 +1,385 @@
+---
+title: "PC CRH - Cerner in Post-COVID"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v6_post_COVID.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+# penetration rate
+pen_rate <- dbGetQuery(oabi_con,
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  mutate(crh_month = ymd(crh_month))
+#cerner pc encounters
+cerner_pc <- dbGetQuery(oabi_con,
+                        "select *
+                        from [OABI_MyVAAccess].[crh_eval].A1_pc_enc_scrssn_count") %>%
+  mutate(visitMonth = ymd(visitMonth),
+         sta5a = Sta6a)
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+# covariates <- dbGetQuery(oabi_con,
+#                          "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+#   rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+#   mutate(vssc_month = ymd(vssc_month)) %>%
+#   mutate(pct_male = male_count / scrssn_count * 100,
+#          pct_white = race_white_count / scrssn_count * 100,
+#          pct_rural = urh_rural_count / scrssn_count * 100) %>%
+#   select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+#          avg_age_oct1_2022, sta5a, vssc_month, 
+#          parent_visn, census_division,
+#          nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+#          pcmm_count_fy_qtr,
+#          adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+#          shep_access_metric)
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+sta5as_to_include <- access_metrics %>%
+  select(sta5a) %>%
+  distinct %>%
+  left_join(., crh_flag %>% 
+              select(sta5a, not_enough_crh_before_oct_21, had_pccrh_after_sep_21)) %>%
+  mutate(crh_group = case_when(
+    not_enough_crh_before_oct_21 == 1 ~ "Some PC CRH",
+    had_pccrh_after_sep_21 == 1 ~ "PC CRH",
+    TRUE ~ "No PC CRH"
+  )) %>% 
+  left_join(., vast %>% select(sta5a, s_abbr)) %>% 
+  mutate(s_abbr2 = case_when(
+    s_abbr %in% c("VAMC", "HCC") ~ "VAMC/HCC",
+    str_detect(s_abbr, "CBOC") ~ "CBOC",
+    s_abbr == "OOS" ~ "OOS",
+    TRUE ~ "Uh-Oh!"
+  )) %>%
+  filter(is.na(s_abbr) == F) %>% 
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F
+         & scrssn_count_cat != "< 450")
+#=================
+crh_sta5as <- sta5as_to_include %>%
+  filter(had_pccrh_after_sep_21 == T)
+```
+
+# Front Matter  
+* This document takes a look at several potential data issues that we may encounter in the post-COVID PC CRH analysis:
+    + How many sites have switched to Cerner, and can we obtain encounter data from these sites?
+    + Among sites that have switched to Cerner, how many are PC CRH sites in the post-COVID analysis?
+    + Are we capturing PC CRH encounters at sites that have switched to Cerner?
+
+```{r}
+sta5as_w_cerner <- cerner_pc %>%
+  group_by(sta5a) %>%
+  filter(!all(is.na(encounter_count_cerner))) %>%
+  select(sta5a) %>%
+  distinct()
+#
+cerner_counts <- cerner_pc %>%
+  filter(sta5a %in% sta5as_w_cerner$sta5a) %>%
+  group_by(sta5a) %>%
+  summarise(total_cerner_pc = comma(sum(encounter_count_cerner, na.rm = T)),
+            total_cerner_pc_num = sum(encounter_count_cerner, na.rm = T)) %>%
+  arrange(desc(total_cerner_pc_num))
+#
+first_month <- cerner_pc %>%
+  filter(is.na(encounter_count_cerner) == F) %>%
+  group_by(sta5a) %>%
+  summarise(first_cerner_month = min(visitMonth))
+```
+
+
+## Cerner Sites  
+
+* There are `r nrow(sta5as_w_cerner)` sta5as that have at least one month with more than zero Cerner PC encounters: 
+
+```{r}
+sta5as_w_cerner %>%
+  left_join(., vast %>% select(sta5a, short_name, parent_visn)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name)) %>%
+  ungroup %>%
+  left_join(., cerner_counts) %>%
+  left_join(., first_month) %>%
+  arrange(desc(total_cerner_pc_num)) %>%
+  select(parent_visn, lab_name, total_cerner_pc, first_cerner_month) %>%
+  kbl(col.names = c("VISN", "Sta5a", "Total Cerner PC Encounters", "First Month w/ Cerner"),
+      align = c("c", "l", "r", "l")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+## Over Time I    
+
+```{r}
+top_8 <- cerner_counts[1:8,1]
+cerner_pc %>%
+  filter(sta5a %in% top_8$sta5a
+         & visitMonth > ymd("2020-09-01")) %>%
+  left_join(., vast %>% select(sta5a, short_name)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name)) %>%
+  select(lab_name, visitMonth, encounter_count_cerner, pc_encounter_cdw, pc_encounter_total) %>%
+  pivot_longer(-c(lab_name, visitMonth))  %>%
+  mutate(name2 = case_when(name == "pc_encounter_cdw" ~ "CDW",
+                           name == "encounter_count_cerner" ~ "Cerner",
+                           name == "pc_encounter_total" ~ "Total")) %>%
+  ggplot(data = .,
+         aes(x = visitMonth,
+             y = value, 
+             group = name2,
+             color = name2)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~lab_name) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title = element_blank())
+```
+
+## Over Time II    
+
+```{r}
+middle_8 <- cerner_counts[9:16,1]
+cerner_pc %>%
+  filter(sta5a %in% middle_8$sta5a
+         & visitMonth > ymd("2020-09-01")) %>%
+  left_join(., vast %>% select(sta5a, short_name)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name)) %>%
+  select(lab_name, visitMonth, encounter_count_cerner, pc_encounter_cdw, pc_encounter_total) %>%
+  pivot_longer(-c(lab_name, visitMonth))  %>%
+  mutate(name2 = case_when(name == "pc_encounter_cdw" ~ "CDW",
+                           name == "encounter_count_cerner" ~ "Cerner",
+                           name == "pc_encounter_total" ~ "Total")) %>%
+  ggplot(data = .,
+         aes(x = visitMonth,
+             y = value, 
+             group = name2,
+             color = name2)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~lab_name) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title = element_blank())
+```
+
+## Over Time III    
+
+```{r}
+bottom_9 <- cerner_counts[17:25,1]
+cerner_pc %>%
+  filter(sta5a %in% bottom_9$sta5a
+         & visitMonth > ymd("2020-09-01")) %>%
+  left_join(., vast %>% select(sta5a, short_name)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name)) %>%
+  select(lab_name, visitMonth, encounter_count_cerner, pc_encounter_cdw, pc_encounter_total) %>%
+  pivot_longer(-c(lab_name, visitMonth))  %>%
+  mutate(name2 = case_when(name == "pc_encounter_cdw" ~ "CDW",
+                           name == "encounter_count_cerner" ~ "Cerner",
+                           name == "pc_encounter_total" ~ "Total")) %>%
+  ggplot(data = .,
+         aes(x = visitMonth,
+             y = value, 
+             group = name2,
+             color = name2)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~lab_name) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title = element_blank())
+```
+
+
+# CRH Sites With Cerner Only  
+
+```{r}
+cerner_sta5a_w_crh <- cerner_counts %>%
+  filter(sta5a %in% crh_sta5as$sta5a)
+```
+
+* There are `r nrow(cerner_sta5a_w_crh)` __Pre-COVID__ PC CRH sta5as that switched to Cerner
+* As we saw above, none of these sites switched before the end of our study period (i.e., February 29th, 2020)
+
+
+## Top 6  
+```{r}
+top_6 <- cerner_counts %>% 
+  filter(sta5a %in% cerner_sta5a_w_crh$sta5a) %>%
+  slice_head(., n = 6)
+#--
+cerner_pc %>%
+  filter(sta5a %in% top_6$sta5a
+         & visitMonth > ymd("2020-09-01")) %>%
+  left_join(., vast %>% select(sta5a, short_name)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name)) %>%
+  select(lab_name, visitMonth, encounter_count_cerner, pc_encounter_cdw, pc_encounter_total) %>%
+  pivot_longer(-c(lab_name, visitMonth))  %>%
+  mutate(name2 = case_when(name == "pc_encounter_cdw" ~ "CDW",
+                           name == "encounter_count_cerner" ~ "Cerner",
+                           name == "pc_encounter_total" ~ "Total")) %>%
+  ggplot(data = .,
+         aes(x = visitMonth,
+             y = value, 
+             group = name2,
+             color = name2)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~lab_name) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title = element_blank())
+```
+
+## Bottom 11   
+```{r}
+bottom_11 <- cerner_counts %>% 
+  filter(sta5a %in% cerner_sta5a_w_crh$sta5a) %>%
+  slice_tail(., n = 11)
+#--
+cerner_pc %>%
+  filter(sta5a %in% bottom_11$sta5a
+         & visitMonth > ymd("2020-09-01")) %>%
+  left_join(., vast %>% select(sta5a, short_name)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name)) %>%
+  select(lab_name, visitMonth, encounter_count_cerner, pc_encounter_cdw, pc_encounter_total) %>%
+  pivot_longer(-c(lab_name, visitMonth))  %>%
+  mutate(name2 = case_when(name == "pc_encounter_cdw" ~ "CDW",
+                           name == "encounter_count_cerner" ~ "Cerner",
+                           name == "pc_encounter_total" ~ "Total")) %>%
+  ggplot(data = .,
+         aes(x = visitMonth,
+             y = value, 
+             group = name2,
+             color = name2)) +
+  geom_line(linewidth = 0.8) +
+  facet_wrap(~lab_name) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title = element_blank())
+```
+
+# PC CRH Encounters vs. Total PC Encounters    
+## Top 6  
+
+```{r}
+pen_rate %>%
+  left_join(., vast %>% select(sta5a, parent_visn, short_name)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name)) %>%
+  filter(sta5a %in% top_6$sta5a) %>%
+  rename("PC CRH Encounters" = crh_encounter_count,
+         "PC Encounters" = pc_encounter_total) %>%
+  select(lab_name, crh_month, "PC CRH Encounters", "PC Encounters") %>%
+  pivot_longer(-c(lab_name, crh_month)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = value, group = name, color = name)) +
+  geom_line() +
+  facet_wrap(~lab_name) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.title = element_blank())
+```
+
+## Bottom 11    
+
+```{r}
+pen_rate %>%
+  left_join(., vast %>% select(sta5a, parent_visn, short_name)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name)) %>%
+  filter(sta5a %in% bottom_11$sta5a) %>%
+  rename("PC CRH Encounters" = crh_encounter_count,
+         "PC Encounters" = pc_encounter_total) %>%
+  select(lab_name, crh_month, "PC CRH Encounters", "PC Encounters") %>%
+  pivot_longer(-c(lab_name, crh_month)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = value, group = name, color = name)) +
+  geom_line() +
+  facet_wrap(~lab_name) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.title = element_blank())
+```

@@ -1,0 +1,142 @@
+---
+title: "PC CRH Stop Codes With New PCAT Restrictions"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 8, fig.height = 8)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].[C2_vast_from_a06]")
+#
+sc_count <- dbGetQuery(oabi_con,
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].temp_sc_comparison") %>%
+  arrange(desc(sc_count))
+```
+
+# Top 50 (out of 464) Stop Code Combinations Included With PCAT Criteria  
+
+```{r}
+color.me <- which(sc_count[1:50,6] == "Other")
+#
+grand_total <- sc_count %>% 
+  summarise(total = sum(sc_count, na.rm = T)) %>%
+  pull
+#
+sc_count %>%
+  select(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName,
+         sc_count) %>%
+  mutate(primaryStopCode = as.character(primaryStopCode),
+         secondaryStopCode = as.character(secondaryStopCode),
+         prop_total = sc_count / grand_total) %>%
+  slice_head(n = 50) %>%
+  adorn_totals() %>%
+  mutate(sc_count = comma(sc_count, accuracy = 1),
+         prop_total = percent(prop_total, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "Count", "Proportion"),
+      align = c("c", "l", "c", "l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(color.me, color = "white", background = "red") %>%
+  row_spec(0, bold = TRUE)
+```
+
+# Included Stop Codes  
+
+```{r}
+include_total <- sc_count %>% 
+  filter(encounter_type != "Other") %>%
+  summarise(total = sum(sc_count, na.rm = T)) %>%
+  pull
+#
+sc_count %>%
+  filter(encounter_type != "Other") %>%
+  select(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName,
+         sc_count) %>%
+  mutate(primaryStopCode = as.character(primaryStopCode),
+         secondaryStopCode = as.character(secondaryStopCode),
+         prop = sc_count / include_total,
+         prop_total = sc_count / grand_total) %>%
+  slice_head(n = 50) %>%
+  adorn_totals() %>%
+  mutate(sc_count = comma(sc_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1),
+         prop_total = percent(prop_total, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "Count", "Proportion of Included", "Proportion of Total"),
+      align = c("c", "l", "c", "l", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+
+```
+
+# Excluded Stop Codes  
+
+```{r}
+noInclude_total <- sc_count %>% 
+  filter(encounter_type == "Other") %>%
+  summarise(total = sum(sc_count, na.rm = T)) %>%
+  pull
+#
+sc_count %>%
+  filter(encounter_type == "Other") %>%
+  select(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName,
+         sc_count) %>%
+  mutate(primaryStopCode = as.character(primaryStopCode),
+         secondaryStopCode = as.character(secondaryStopCode),
+         prop = sc_count / noInclude_total,
+         prop_total = sc_count / grand_total) %>%
+  slice_head(n = 50) %>%
+  adorn_totals() %>%
+  mutate(sc_count = comma(sc_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1),
+         prop_total = percent(prop_total, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "Count", "Proportion of Not Included", "Proportion of Total"),
+      align = c("c", "l", "c", "l", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+
+```

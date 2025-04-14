@@ -1,0 +1,201 @@
+---
+title: "VISN 23 - CRH Encounters Over Time"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = TRUE,
+                      fig.width = 12, fig.height = 12)
+
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(ggthemes)
+library(kableExtra)
+library(lubridate)
+library(scales)
+library(grid)
+library(DT)
+library(RODBC)
+library(DBI)
+library(janitor)
+library(here)
+#
+options(scipen = 999)
+###
+`%ni%` <- negate(`%in%`)
+#
+theme_update(
+  strip.text = element_text(size = 20),
+  axis.text = element_text(size = 15),
+  axis.title.y = element_text(size = 18),
+  axis.title.x = element_blank(),
+  axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+  legend.text = element_text(size = 14),
+  plot.title = element_text(size = 20),
+  legend.title = element_blank()
+)
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Truested_Connection = "true")
+```
+
+```{r reading-in}
+crh_cdw <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].crh_encounters_deDup") %>%
+  mutate(crh_month = ymd(crh_month)) %>%
+  filter(crh_month > ymd("2019-09-01"))
+#
+access_metrics <- read_csv(here("Input", "Data", "pc_access_metrics.csv"))
+vast <- read_csv(here("Input","Data","VAST_from_A06_11jan21.csv"))
+#
+crh_vssc_fy21 <- read_csv(here("Input", "Data", "CRHWkld_PatDetailsTrblShoot_visn23_fy21.csv"),
+                            skip = 5)
+#
+crh_vssc <- read_csv(here("Input", "Data", "CRHWkld_PatDetailsTrblShoot_visn23_fy20.csv"),
+                            skip = 5) %>%
+  bind_rows(., crh_vssc_fy21) %>%
+  mutate(VisitDateTime1 = parse_date_time(VisitDateTime1, "mdY HMS"),
+         visitDate = as_date(VisitDateTime1, "mdY HMS"),
+         viz_month = ymd(str_c(year(visitDate), month(visitDate), "01", sep = "-")),
+         viz_fy = case_when(month(visitDate) > 9 ~ year(visitDate) + 1,
+                            month(visitDate) < 10 ~ year(visitDate)),
+         viz_qtr = case_when(month(visitDate) %in% c(10, 11, 12) ~ 1,
+                             month(visitDate) %in% c(1, 2, 3) ~ 2,
+                             month(visitDate) %in% c(4, 5, 6) ~ 3,
+                             month(visitDate) %in% c(7, 8, 9) ~ 4),
+         fy_qtr = str_c(viz_fy, viz_qtr, sep = "_"),
+         care_type =
+           case_when(
+             (Pat_Visit_PrimStopCode %in% c(156, 176, 177, 178, 301, 322, 323, 338, 348)
+              & (Pat_Visit_SecStopCode != 160 | is.na(Pat_Visit_SecStopCode) == T))
+             | (Pat_Visit_PrimStopCode != 160
+                & Pat_Visit_SecStopCode %in% c(156, 176, 177, 178, 301, 322, 323, 338, 348))    ~ "Primary Care",
+             (Pat_Visit_PrimStopCode %in% c(502, 509, 510, 513, 516, 527, 538, 545, 550, 562, 576, 579, 586, 587)
+              & (Pat_Visit_SecStopCode %ni% c(160, 534) | is.na(Pat_Visit_SecStopCode) == T))
+             | (Pat_Visit_PrimStopCode %ni% c(160, 534)
+                & Pat_Visit_SecStopCode %in% c(502, 509, 510, 513, 516, 527, 538, 545, 550,
+                                    562, 576, 579, 586, 587))                  ~ "Mental Health",
+             (Pat_Visit_PrimStopCode %in% c(534, 539)
+              & (Pat_Visit_SecStopCode != 160 | is.na(Pat_Visit_SecStopCode) == T))
+             | (Pat_Visit_PrimStopCode != 160 & Pat_Visit_SecStopCode %in% c(534, 539)) ~ "PCMHI",
+             Pat_Visit_PrimStopCode == 160 | Pat_Visit_SecStopCode == 160  ~ "Pharmacy",
+             is.na(Pat_Visit_PrimStopCode) == T ~ "Missing",
+             TRUE                                                                                  ~ "Specialty"))
+#
+v23_dina_check <- read_xlsx(here("Input", "Data", "CRH_PCAT_Check.xlsx")) %>%
+  rename_all(tolower) %>%
+  mutate(psc = str_sub(stopcodename, start = 2, end = 4),
+         ssc = str_sub(creditstopname, start = 2, end = 4),
+         care_type =
+           case_when(
+             (psc %in% c(156, 176, 177, 178, 301, 322, 323, 338, 348)
+              & (ssc != 160 | is.na(ssc) == T))
+             | (psc != 160
+                & ssc %in% c(156, 176, 177, 178, 301, 322, 323, 338, 348))    ~ "Primary Care",
+             (psc %in% c(502, 509, 510, 513, 516, 527, 538, 545, 550, 562, 576, 579, 586, 587)
+              & (ssc %ni% c(160, 534) | is.na(ssc) == T))
+             | (psc %ni% c(160, 534)
+                & ssc %in% c(502, 509, 510, 513, 516, 527, 538, 545, 550,
+                                    562, 576, 579, 586, 587))                  ~ "Mental Health",
+             (psc %in% c(534, 539)
+              & (ssc != 160 | is.na(ssc) == T))
+             | (psc != 160 & ssc %in% c(534, 539)) ~ "PCMHI",
+             psc == 160 | ssc == 160  ~ "Pharmacy",
+             is.na(psc) == T ~ "Missing",
+             TRUE                                                                                  ~ "Specialty"),
+         viz_month = ymd(str_c(year(as_date(visitdatetime)), month(as_date(visitdatetime)), "01", sep = "-")),
+         viz_fy = case_when(month(visitdatetime) > 9 ~ year(visitdatetime) + 1,
+                            month(visitdatetime) < 10 ~ year(visitdatetime)),
+         viz_qtr = case_when(month(visitdatetime) %in% c(10, 11, 12) ~ 1,
+                             month(visitdatetime) %in% c(1, 2, 3) ~ 2,
+                             month(visitdatetime) %in% c(4, 5, 6) ~ 3,
+                             month(visitdatetime) %in% c(7, 8, 9) ~ 4),
+         fy_qtr = str_c(viz_fy, viz_qtr, sep = "_"))
+```
+
+# Comparing Methods for CRH Encounters Over Time
+
+## Total
+
+```{r}
+crh_cdw_visn23 <- crh_cdw %>%
+  filter(care_type %ni% c("Missing crh", "Specialty crh") & parent_visn == 23) %>%
+  rename(viz_month = crh_month) %>%
+  group_by(viz_month) %>%
+  summarise(value = n()) %>%
+  mutate(name = "PCAT")
+#--
+crh_vssc_visn23 <- crh_vssc %>%
+  filter(care_type != "Specialty") %>%
+  group_by(viz_month) %>% 
+  summarise(value = n()) %>%
+  mutate(name = "VSSC")
+#
+crh_dina <- v23_dina_check %>%
+  filter(care_type != "Specialty") %>%
+  group_by(viz_month) %>%
+  summarise(value = n()) %>%
+  mutate(name = "VISN 23 CRH Team")
+#====
+crh_v23_all3 <- crh_cdw_visn23 %>%
+  bind_rows(., crh_vssc_visn23) %>%
+  bind_rows(., crh_dina)
+#===---===
+ggplot(data = crh_v23_all3,
+       aes(x = viz_month, y = value, group = name, color = name)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), labels = scales::comma_format()) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "Month",
+       y = "Count per Month") +
+  theme(legend.title = element_blank())
+```
+
+## By Care Type
+
+```{r}
+crh_cdw_visn23_type <- crh_cdw %>%
+  filter(parent_visn == 23 & care_type %ni% c("Specialty crh", "Missing crh")) %>%
+  rename(viz_month = crh_month) %>%
+  group_by(viz_month, care_type) %>%
+  summarise(value = n()) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  mutate(name = "PCAT")
+#--
+crh_vssc_visn23_type <- crh_vssc %>%
+  filter(care_type %ni% c("Specialty", "Missing")) %>%
+  group_by(viz_month, care_type) %>% 
+  summarise(value = n()) %>%
+  mutate(name = "VSSC")
+#--
+crh_dina_type <- v23_dina_check %>%
+  filter(care_type != "Specialty") %>%
+  group_by(viz_month, care_type) %>%
+  summarise(value = n()) %>%
+  mutate(name = "VISN 23 CRH Team")
+#====
+crh_v23_all3_type <- crh_cdw_visn23_type %>%
+  bind_rows(., crh_vssc_visn23_type) %>%
+  bind_rows(., crh_dina_type) %>%
+  mutate(five_pct_below = value - (value * 0.05),
+         five_pct_above = value + (value * 0.05))
+#==========
+ggplot(data = crh_v23_all3_type,
+       aes(x = viz_month, y = value, group = name, color = name)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), labels = scales::comma_format()) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "Month",
+       y = "Count per Month") +
+  theme(legend.title = element_blank()) +
+  facet_wrap(~care_type)
+```

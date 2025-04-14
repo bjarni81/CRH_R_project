@@ -1,0 +1,845 @@
+---
+title: "Primary Care CRH Encounters & Primary Care Access Metrics"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+
+
+```{r reading-in}
+hubs <- dbGetQuery(oabi_con,
+                   "select distinct hub_sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY20]
+                    UNION 
+                    select distinct Hub_Sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY21_working]") %>%
+  pull
+#--
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#==
+all_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].all_encounters_E_counts") %>%
+  select(-contains("Vax")) %>%
+  mutate(vizMonth = ymd(vizMonth)) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name),
+         spoke_flag = if_else(sta6a %in% spokes_v, TRUE, FALSE),
+         fy = if_else(month(vizMonth) > 9, year(vizMonth) + 1, year(vizMonth)),
+         qtr = case_when(month(vizMonth) %in% c(10, 11, 12) ~ 1,
+                         month(vizMonth) %in% c(1, 2, 3) ~ 2,
+                         month(vizMonth) %in% c(4, 5, 6) ~ 3,
+                         month(vizMonth) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  filter(is.na(parent_visn) == F & fy %in% c(2020, 2021)) %>%
+  rename("Primary Care" = pc_encounters,
+         "Mental Health" = mh_encounters,
+         "Pharmacy" = pharmacy_encounters,
+         "PCMHI" = pcmhi_encounters)
+#
+all_qtrs <- all_encounters %>% select(fyqtr) %>% distinct
+#
+spoke_encounters <- all_encounters %>% filter(spoke_flag == T)
+#-----
+crh_encounters <- dbGetQuery(oabi_con,
+                         "select * from [PACT_CC].[CRH].[crh_full_utilization_final_fy20_21]") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  filter(fy %in% c(2020, 2021) & care_type %in% c("Primary Care", "Pharmacy")) %>%
+  left_join(., vast, by = c("spoke_sta5a_combined_cdw" = "sta5a"))
+#--==================
+access_metrics_sta5a <- read_csv(here("Input", "Data", "pc_access_metrics_sta5a_qtr.csv")) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_visn <- read_csv(here("Input", "Data", "pc_access_metrics_visn_qtr.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_nat <- read_csv(here("Input", "Data", "pc_access_metrics_nat_qtr.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+```
+
+```{r creating_nat_data_frames}
+#--TOTAL
+crh_nat_total <- crh_encounters %>%
+  group_by(fyqtr) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup
+#
+all_nat_total <- spoke_encounters %>%
+  select(3:6, 23) %>%
+  pivot_longer(-c(fyqtr)) %>%
+  group_by(fyqtr) %>%
+  summarise(total = sum(value, na.rm = T)) %>%
+  ungroup
+#
+total_nat_df <- all_qtrs %>%
+  full_join(., crh_nat_total) %>%
+  full_join(., all_nat_total, by = c("fyqtr" = "fyqtr")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  ungroup
+#==BY CARE TYPE
+crh_nat_type <- crh_encounters %>%
+  group_by(fyqtr, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup
+#
+all_nat_type <- spoke_encounters %>%
+  select(3:6, fyqtr) %>%
+  pivot_longer(-c(fyqtr)) %>%
+  group_by(fyqtr, name) %>%
+  summarise(total = sum(value, na.rm = T)) %>%
+  ungroup
+#
+type_nat_df <- all_qtrs %>%
+  full_join(., crh_nat_type) %>%
+  full_join(., all_nat_type, by = c("fyqtr" = "fyqtr", "care_type" = "name")) %>%
+  mutate(crh_per_1k_total = round(crh_encounters / total * 1000, 1)) %>%
+  ungroup
+```
+
+```{r creating_visn_data_frames}
+#--TOTAL
+crh_visn_total <- crh_encounters %>%
+  group_by(fyqtr, parent_visn) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup
+#
+all_visn_total <- all_qtrs %>% left_join(., spoke_encounters) %>%
+  select(4:7, parent_visn, fyqtr) %>%
+  pivot_longer(-c(fyqtr, parent_visn)) %>%
+  group_by(fyqtr, parent_visn) %>%
+  summarise(total = sum(value, na.rm = T)) %>%
+  ungroup
+#
+total_visn_df <- all_qtrs %>%
+  full_join(., crh_visn_total) %>%
+  full_join(., all_visn_total, by = c("fyqtr" = "fyqtr", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ungroup
+#==BY CARE TYPE
+crh_visn_type <- crh_encounters %>%
+  group_by(fyqtr, parent_visn, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup
+#
+all_visn_type <- all_qtrs %>% left_join(., spoke_encounters) %>%
+  select(4:7, parent_visn, fyqtr) %>%
+  pivot_longer(-c(fyqtr, parent_visn)) %>%
+  group_by(fyqtr, parent_visn, name) %>%
+  summarise(total = sum(value, na.rm = T)) %>%
+  ungroup
+#
+type_visn_df <- all_qtrs %>%
+  full_join(., crh_visn_type) %>%
+  full_join(., all_visn_type, by = c("fyqtr" = "fyqtr", "care_type" = "name", 
+                                     "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ungroup
+```
+
+# National  
+## Primary Care CRH    
+```{r}
+type_nat_df %>%
+  filter(care_type == "Primary Care") %>%
+  select(-care_type) %>%
+  pivot_longer(-fyqtr) %>%
+  mutate(name_lab = case_when(
+    name == "total" ~ "Total",
+    name == "crh_per_1k_total" ~ "CRH/1,000",
+    name == "crh_encounters" ~ "CRH"
+  )) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_lancet()+
+  theme(axis.title.y = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  facet_wrap_custom(~name_lab, scales = 'free', ncol = 2,
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0, 60000), 
+                                                           labels = scales::comma_format())),
+                      scale_override(2, scale_y_continuous(limits = c(0, 16), 
+                                                           labels = scales::comma_format(accuracy = 1))),
+                      scale_override(3, scale_y_continuous(limits = c(0, 4000000), 
+                                                           labels = scales::comma_format()))
+                    )) +
+  labs(x = "FY-Qtr")
+```
+
+## CRH Per 1,000 Total  
+
+```{r}
+type_nat_df %>%
+  filter(care_type == "Primary Care") %>%
+  select(-care_type) %>%
+  pivot_longer(-fyqtr) %>%
+  mutate(name_lab = case_when(
+    name == "total" ~ "Total",
+    name == "crh_per_1k_total" ~ "CRH/1,000",
+    name == "crh_encounters" ~ "CRH"
+  )) %>%
+  filter(name == "crh_per_1k_total") %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1, color = "blue") +
+  ggsci::scale_color_lancet()+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(x = "FY-Qtr",
+       y = "PC CRH Encounters per 1,000 Total PC Encounters") +
+  scale_y_continuous(limits = c(0, 15))
+```
+
+## CRH PC Encounters    
+
+```{r}
+type_nat_df %>%
+  filter(care_type == "Primary Care") %>%
+  select(-care_type) %>%
+  pivot_longer(-fyqtr) %>%
+  mutate(name_lab = case_when(
+    name == "total" ~ "Total",
+    name == "crh_per_1k_total" ~ "CRH/1,000",
+    name == "crh_encounters" ~ "CRH"
+  )) %>%
+  filter(name == "crh_encounters") %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1, color = "forestgreen") +
+  ggsci::scale_color_lancet()+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(x = "FY-Qtr",
+       y = "PC CRH Encounters") +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1))
+```
+
+### As a Table  
+
+```{r}
+type_nat_df %>% filter(care_type == "Primary Care") %>%
+  mutate(crh_encounters = format(crh_encounters, digits = 0, big.mark = ","),
+         total = format(total, digits = 0, big.mark = ","),
+         crh_per_1k_total = format(crh_per_1k_total, digits = 2)) %>%
+  select(-care_type) %>%
+  pivot_longer(-fyqtr) %>%
+  mutate(name_lab = case_when(
+    name == "total" ~ "Total",
+    name == "crh_per_1k_total" ~ "CRH/1,000",
+    name == "crh_encounters" ~ "CRH"
+  )) %>%
+  select(-name) %>%
+  pivot_wider(names_from = fyqtr, values_from = value) %>%
+  kbl(col.names = c(" ", "2020-1", "2020-2", "2020-3", "2020-4",
+                              "2021-1", "2021-2", "2021-3", "2021-4"),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped")
+```
+
+## Primary Care Access Metrics  
+```{r}
+access_metrics_nat %>%
+  pivot_longer(-fy_qtr) %>%
+  mutate(name_lab = case_when(
+    name == "established_pt_waitTime" ~ "Established Pt WT",
+    name == "new_pt_waitTime" ~ "New Pt WT",
+    name == "obs_exp_panelSize_ratio" ~ "Obs:Exp Panel Size",
+    name == "tc_pc_success_prop" ~ "Timely Care Success"
+  )) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_uchicago() +
+  theme(axis.title.y = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  facet_wrap_custom(~name_lab, scales = 'free', ncol = 2,
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0, 60), 
+                                                           labels = scales::comma_format())),
+                      scale_override(2, scale_y_continuous(limits = c(0, 60), 
+                                                           labels = scales::comma_format(accuracy = 1))),
+                      scale_override(3, scale_y_continuous(limits = c(0, 1), 
+                                                           labels = scales::comma_format())),
+                      scale_override(4, scale_y_continuous(limits = c(0, 1), 
+                                                           labels = scales::percent_format(accuracy = 1)))
+                    ))
+```
+
+### As a Table  
+```{r}
+access_metrics_nat %>%
+  mutate(obs_exp_panelSize_ratio = round(obs_exp_panelSize_ratio, 2),
+         tc_pc_success_prop = round(tc_pc_success_prop * 100, 1)) %>%
+  pivot_longer(-fy_qtr) %>%
+  mutate(name_lab = case_when(
+    name == "established_pt_waitTime" ~ "Established Patient WT",
+    name == "new_pt_waitTime" ~ "New Patient WT",
+    name == "obs_exp_panelSize_ratio" ~ "Obs:Exp Panel Size Ratio",
+    name == "tc_pc_success_prop" ~ "Timely Care Success (%)"
+  )) %>%
+  select(-name) %>%
+  mutate(value = round(value, 1)) %>%
+  pivot_wider(names_from = fy_qtr, values_from = value) %>%
+  kbl(col.names = c(" ", "2020-1", "2020-2", "2020-3", "2020-4",
+                              "2021-1", "2021-2", "2021-3", "2021-4")) %>%
+  kable_classic("striped")
+```
+
+## Pharmacy CRH    
+```{r}
+type_nat_df %>%
+  filter(care_type == "Pharmacy") %>%
+  select(-care_type) %>%
+  pivot_longer(-fyqtr) %>%
+  mutate(name_lab = case_when(
+    name == "total" ~ "Total",
+    name == "crh_per_1k_total" ~ "CRH/1,000",
+    name == "crh_encounters" ~ "CRH"
+  )) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_lancet()+
+  theme(axis.title.y = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  facet_wrap_custom(~name_lab, scales = 'free', ncol = 2,
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0, 25000), 
+                                                           labels = scales::comma_format())),
+                      scale_override(2, scale_y_continuous(limits = c(0, 20), 
+                                                           labels = scales::comma_format(accuracy = 1))),
+                      scale_override(3, scale_y_continuous(limits = c(0, 1500000), 
+                                                           labels = scales::comma_format()))
+                    )) +
+  labs(x = "FY-Qtr")
+```
+
+### CRH Per 1,000 Total  
+
+```{r}
+type_nat_df %>%
+  filter(care_type == "Pharmacy") %>%
+  select(-care_type) %>%
+  pivot_longer(-fyqtr) %>%
+  mutate(name_lab = case_when(
+    name == "total" ~ "Total",
+    name == "crh_per_1k_total" ~ "CRH/1,000",
+    name == "crh_encounters" ~ "CRH"
+  )) %>%
+  filter(name == "crh_per_1k_total") %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1, color = "blue") +
+  ggsci::scale_color_lancet()+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(x = "FY-Qtr",
+       y = "CPS CRH Encounters per 1,000 Total CPS Encounters") +
+  scale_y_continuous(limits = c(0, 20))
+```
+
+### CRH CPS Encounters    
+
+```{r}
+type_nat_df %>%
+  filter(care_type == "Pharmacy") %>%
+  select(-care_type) %>%
+  pivot_longer(-fyqtr) %>%
+  mutate(name_lab = case_when(
+    name == "total" ~ "Total",
+    name == "crh_per_1k_total" ~ "CRH/1,000",
+    name == "crh_encounters" ~ "CRH"
+  )) %>%
+  filter(name == "crh_encounters") %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1, color = "forestgreen") +
+  ggsci::scale_color_lancet()+
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(x = "FY-Qtr",
+       y = "CPS CRH Encounters") +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1))
+```
+
+### As a Table  
+
+```{r}
+type_nat_df %>% filter(care_type == "Pharmacy") %>%
+  mutate(crh_encounters = format(crh_encounters, digits = 0, big.mark = ","),
+         total = format(total, digits = 0, big.mark = ","),
+         crh_per_1k_total = format(crh_per_1k_total, digits = 2)) %>%
+  select(-care_type) %>%
+  pivot_longer(-fyqtr) %>%
+  mutate(name_lab = case_when(
+    name == "total" ~ "Total",
+    name == "crh_per_1k_total" ~ "CRH/1,000",
+    name == "crh_encounters" ~ "CRH"
+  )) %>%
+  select(-name) %>%
+  pivot_wider(names_from = fyqtr, values_from = value) %>%
+  kbl(col.names = c(" ", "2020-1", "2020-2", "2020-3", "2020-4",
+                              "2021-1", "2021-2", "2021-3", "2021-4"),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped")
+```
+
+
+
+
+# VISN  
+## Primary Care CRH  
+### CRH per 1,000 Total          
+```{r}
+type_visn_df %>% 
+  filter(care_type == "Primary Care") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_per_1k_total, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 35),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "CRH PC Encounters per 1,000 Total PC Encounters",
+       caption = "*Legend is ordered by the last datapoint") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+### CRH Encounters    
+```{r}
+type_visn_df %>% 
+  filter(care_type == "Primary Care") %>% 
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_encounters)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "CRH PC Encounters",
+       caption = "*Legend is ordered by the last datapoint") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+### Total Encounters    
+```{r}
+type_visn_df %>% 
+  filter(care_type == "Primary Care") %>% 
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = total, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "Total PC Encounters",
+       caption = "*Legend is ordered by the last datapoint") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+### As a Table  
+```{r}
+type_visn_df %>% 
+  filter(care_type == "Primary Care") %>%
+  select(-care_type) %>%
+  mutate(parent_visn = str_pad(parent_visn, side = "left", width = 2, pad = "0"),
+         crh_encounters = format(crh_encounters, digits = 0, big.mark = ","),
+         total = format(total, digits = 0, big.mark = ","),
+         crh_per_1k_total = format(crh_per_1k_total, digits = 1)) %>%
+  pivot_longer(-c(parent_visn, fyqtr)) %>%
+  pivot_wider(names_from = c(fyqtr, name), values_from = value) %>%
+  arrange(parent_visn) %>%
+  kbl(col.names = c("VISN", rep(c("CRH Encounters", "Total", "CRH per 1,000"), 8)),
+      align = c("l", rep("r", 24))) %>%
+  kable_classic("striped") %>%
+  add_header_above(c(" ",
+                     "2020-1" = 3, "2020-2" = 3, "2020-3" = 3, "2020-4" = 3,
+                     "2021-1" = 3, "2021-2" = 3, "2021-3" = 3, "2021-4" = 3)) %>%
+  column_spec(c(1, 4, 7, 10, 13, 16, 19, 22, 25), border_right = TRUE)
+```
+
+## Primary Care Access Metrics  
+
+### Established Patient Wait Time - I    
+```{r}
+access_metrics_visn %>%
+  mutate(visn = fct_reorder2(factor(visn),
+                                         fy_qtr, established_pt_waitTime),
+         fy_qtr = str_replace(fy_qtr, "_", "-")) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = established_pt_waitTime, group = visn,
+             color = visn)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Established Patient Wait Time (days)",
+       caption = "*Legend is ordered by the last datapoint",
+       color = "VISN")
+
+```
+
+### Established Patient Wait Time - II    
+```{r}
+access_metrics_visn %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = established_pt_waitTime, group = visn)) +
+  geom_line(size = 1, color = "blue3") +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Established Patient Wait Time (days)") +
+  facet_wrap(~visn)
+```
+
+### As a Table  
+```{r}
+access_metrics_visn %>%
+  select(-parent_visn) %>%
+  mutate(established_pt_waitTime = format(established_pt_waitTime, digits = 3),
+         new_pt_waitTime = format(new_pt_waitTime, digits = 2),
+         obs_exp_panelSize_ratio = format(obs_exp_panelSize_ratio, digits = 2),
+         tc_pc_success_prop = paste0(format(round(tc_pc_success_prop * 100, 1), nsmall = 1), "%")) %>%
+  select(visn, fy_qtr, established_pt_waitTime) %>%
+  pivot_longer(-c(visn, fy_qtr)) %>%
+  pivot_wider(names_from = c(fy_qtr, name), values_from = value) %>%
+  arrange(visn) %>%
+  kbl(col.names = c("VISN", "2020-1", "2020-2", "2020-3", "2020-4",
+                              "2021-1", "2021-2", "2021-3", "2021-4"),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped")
+
+```
+
+
+### New Patient Wait Time - I    
+```{r}
+access_metrics_visn %>%
+  mutate(visn = fct_reorder2(factor(visn),
+                                         fy_qtr, new_pt_waitTime),
+         fy_qtr = str_replace(fy_qtr, "_", "-")) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = new_pt_waitTime, group = visn,
+             color = visn)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "New Patient Wait Time (days)",
+       caption = "*Legend is ordered by the last datapoint",
+       color = "VISN")
+
+```
+
+### New Patient Wait Time - II    
+```{r}
+access_metrics_visn %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = new_pt_waitTime, group = visn)) +
+  geom_line(size = 1, color = "blue3") +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "New Patient Wait Time (days)") +
+  facet_wrap(~visn)
+```
+
+### As a Table  
+```{r}
+access_metrics_visn %>%
+  select(-parent_visn) %>%
+  mutate(established_pt_waitTime = format(established_pt_waitTime, digits = 2),
+         new_pt_waitTime = format(new_pt_waitTime, digits = 2),
+         obs_exp_panelSize_ratio = format(obs_exp_panelSize_ratio, digits = 2),
+         tc_pc_success_prop = paste0(format(round(tc_pc_success_prop * 100, 1), nsmall = 1), "%")) %>%
+  select(visn, fy_qtr, new_pt_waitTime) %>%
+  pivot_longer(-c(visn, fy_qtr)) %>%
+  pivot_wider(names_from = c(fy_qtr, name), values_from = value) %>%
+  arrange(visn) %>%
+  kbl(col.names = c("VISN", "2020-1", "2020-2", "2020-3", "2020-4",
+                              "2021-1", "2021-2", "2021-3", "2021-4"),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped")
+
+```
+
+### Observed:Expected Panel Size Ratio - I    
+```{r}
+access_metrics_visn %>%
+  mutate(visn = fct_reorder2(factor(visn),
+                                         fy_qtr, obs_exp_panelSize_ratio),
+         fy_qtr = str_replace(fy_qtr, "_", "-")) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = obs_exp_panelSize_ratio, group = visn,
+             color = visn)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0.5, 1),
+                     labels = scales::comma_format(accuracy = 0.1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Observed:Expected Panel Size Ratio",
+       caption = "*Legend is ordered by the last datapoint",
+       color = "VISN")
+
+```
+
+### Observed:Expected Panel Size Ratio - II    
+```{r}
+access_metrics_visn %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = obs_exp_panelSize_ratio, group = visn)) +
+  geom_line(size = 1, color = "blue3") +
+  scale_y_continuous(limits = c(0.5, 1),
+                     labels = scales::comma_format(accuracy = 0.1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Observed:Expected Panel Size Ratio") +
+  facet_wrap(~visn)
+```
+
+### As a Table  
+```{r}
+access_metrics_visn %>%
+  select(-parent_visn) %>%
+  mutate(established_pt_waitTime = format(established_pt_waitTime, digits = 2),
+         new_pt_waitTime = format(new_pt_waitTime, digits = 2),
+         obs_exp_panelSize_ratio = format(obs_exp_panelSize_ratio, digits = 2),
+         tc_pc_success_prop = paste0(format(round(tc_pc_success_prop * 100, 1), nsmall = 1), "%")) %>%
+  select(visn, fy_qtr, obs_exp_panelSize_ratio) %>%
+  pivot_longer(-c(visn, fy_qtr)) %>%
+  pivot_wider(names_from = c(fy_qtr, name), values_from = value) %>%
+  arrange(visn) %>%
+  kbl(col.names = c("VISN", "2020-1", "2020-2", "2020-3", "2020-4",
+                              "2021-1", "2021-2", "2021-3", "2021-4"),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped")
+
+```
+
+### Timely Care Success Rate - I    
+```{r}
+access_metrics_visn %>%
+  mutate(visn = fct_reorder2(factor(visn),
+                                         fy_qtr, tc_pc_success_prop),
+         fy_qtr = str_replace(fy_qtr, "_", "-")) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = tc_pc_success_prop, group = visn,
+             color = visn)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0.5, 1),
+                     labels = scales::percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Timely Care Success Rate",
+       caption = "*Legend is ordered by the last datapoint",
+       color = "VISN")
+
+```
+
+### Timely Care Success Rate - II    
+```{r}
+access_metrics_visn %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = tc_pc_success_prop, group = visn)) +
+  geom_line(size = 1, color = "blue3") +
+  scale_y_continuous(limits = c(0.5, 1),
+                     labels = scales::percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "FY-Quarter",
+       y = "Timely Care Success Rate") +
+  facet_wrap(~visn)
+```
+
+### As a Table  
+```{r}
+access_metrics_visn %>%
+  select(-parent_visn) %>%
+  mutate(established_pt_waitTime = format(established_pt_waitTime, digits = 2),
+         new_pt_waitTime = format(new_pt_waitTime, digits = 2),
+         obs_exp_panelSize_ratio = format(obs_exp_panelSize_ratio, digits = 2),
+         tc_pc_success_prop = paste0(format(round(tc_pc_success_prop * 100, 1), nsmall = 1), "%")) %>%
+  select(visn, fy_qtr, tc_pc_success_prop) %>%
+  pivot_longer(-c(visn, fy_qtr)) %>%
+  pivot_wider(names_from = c(fy_qtr, name), values_from = value) %>%
+  arrange(visn) %>%
+  kbl(col.names = c("VISN", "2020-1", "2020-2", "2020-3", "2020-4",
+                              "2021-1", "2021-2", "2021-3", "2021-4"),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped")
+
+```
+
+## Pharmacy CRH  
+### CRH per 1,000 Total          
+```{r}
+type_visn_df %>% 
+  filter(care_type == "Pharmacy") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_per_1k_total, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 35),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "CRH CPS Encounters per 1,000 Total Encounters",
+       caption = "*Legend is ordered by the last datapoint") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+### CRH Encounters    
+```{r}
+type_visn_df %>% 
+  filter(care_type == "Pharmacy") %>% 
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, crh_encounters)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "CRH CPS Encounters",
+       caption = "*Legend is ordered by the last datapoint") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+### Total Encounters    
+```{r}
+type_visn_df %>% 
+  filter(care_type == "Pharmacy") %>% 
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         fyqtr, total)) %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = total, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "FY-Quarter",
+       y = "Total CPS Encounters",
+       caption = "*Legend is ordered by the last datapoint") +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+### As a Table  
+```{r}
+type_visn_df %>% 
+  filter(care_type == "Pharmacy") %>%
+  select(-care_type) %>%
+  mutate(parent_visn = str_pad(parent_visn, side = "left", width = 2, pad = "0"),
+         crh_encounters = format(crh_encounters, digits = 0, big.mark = ","),
+         total = format(total, digits = 0, big.mark = ","),
+         crh_per_1k_total = format(crh_per_1k_total, digits = 1)) %>%
+  pivot_longer(-c(parent_visn, fyqtr)) %>%
+  pivot_wider(names_from = c(fyqtr, name), values_from = value) %>%
+  arrange(parent_visn) %>%
+  kbl(col.names = c("VISN", rep(c("CRH Encounters", "Total", "CRH per 1,000"), 8)),
+      align = c("l", rep("r", 24))) %>%
+  kable_classic("striped") %>%
+  add_header_above(c(" ",
+                     "2020-1" = 3, "2020-2" = 3, "2020-3" = 3, "2020-4" = 3,
+                     "2021-1" = 3, "2021-2" = 3, "2021-3" = 3, "2021-4" = 3)) %>%
+  column_spec(c(1, 4, 7, 10, 13, 16, 19, 22, 25), border_right = TRUE)
+```

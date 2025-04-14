@@ -1,0 +1,317 @@
+---
+title: "Primary Care CRH: Penetration rate"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.width = 8, fig.height = 8)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+```
+
+```{r reading-in}
+# VAST
+vast <- read_csv(here("Input", "Data", "vast_from_a06_17mar22.csv")) 
+#
+vast_to_include <- vast %>%
+  filter(is.na(s_abbr) == F)
+#==--
+# CRH Penetration rate
+pen_rate_month <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].crh_penRate_month") %>%
+  inner_join(., vast_to_include)
+#---------------
+#making Yoon flag
+all_months <- pen_rate_month %>%
+  select(crh_month) %>%
+  distinct
+#
+all_sta5a <- pen_rate_month %>%
+  select(sta5a) %>%
+  distinct
+#----
+# crh flags
+crh_flags <- dbGetQuery(oabi_con,
+                        "select * from [crh_eval].yoon_flag")
+```
+
+# Penetration Rate X CRH Status  
+
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = crh_encounter_count / pc_encounter_total * 1000) %>%
+  ggplot(data = .,
+         aes(x = table_1_columns, y = pc_crh_per_1k_pc_total, fill = table_1_columns)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "PC CRH per 1,000 Total PC (encounters)")
+```
+
+* Hmmmm...    
+
+## Ignoring 1 observation at 78,000  
+
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = crh_encounter_count / pc_encounter_total * 1000) %>%
+  filter(pc_crh_per_1k_pc_total < 75000) %>%
+  ggplot(data = .,
+         aes(x = table_1_columns, y = pc_crh_per_1k_pc_total, fill = table_1_columns)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "PC CRH per 1,000 Total PC (encounters)")
+```
+
+## Top 25 as a Table  
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  filter(table_1_columns == "CRH") %>%
+  mutate(pc_crh_per_1k_pc_total = round(crh_encounter_count / pc_encounter_total * 1000, 1)) %>%
+  ungroup() %>%
+  slice_max(., pc_crh_per_1k_pc_total, n = 25) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_total, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC CRH Encounters", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+### Let's look at 668  
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = round(crh_encounter_count / pc_encounter_total * 1000, 1)) %>%
+  filter(table_1_columns == "CRH" & sta5a == "668") %>%
+  arrange(crh_month) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_total, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC CRH Encounters", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+### Let's look at 554GH    
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = round(crh_encounter_count / pc_encounter_total * 1000, 1)) %>%
+  filter(table_1_columns == "CRH" & sta5a == "554GH") %>%
+  arrange(crh_month) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_total, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC CRH Encounters", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+### Let's look at 504BZ    
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = round(crh_encounter_count / pc_encounter_total * 1000, 1)) %>%
+  filter(table_1_columns == "CRH" & sta5a == "504BZ") %>%
+  arrange(crh_month) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_total, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC CRH Encounters", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+## Bottom 25 as a Table  
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  filter(table_1_columns == "CRH") %>%
+  mutate(pc_crh_per_1k_pc_total = round(crh_encounter_count / pc_encounter_total * 1000, 1)) %>%
+  ungroup() %>%
+  arrange(desc(pc_crh_per_1k_pc_total)) %>%
+  slice_tail(., n = 25) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_total, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC CRH Encounters", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+* Hmmmm...   
+
+
+### Let's look at 644BY  
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = round(crh_encounter_count / pc_encounter_total * 1000, 1)) %>%
+  filter(table_1_columns == "CRH" & sta5a == "644BY") %>%
+  arrange(crh_month) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_total, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC CRH Encounters", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+### Let's look at 552    
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = round(crh_encounter_count / pc_encounter_total * 1000, 1)) %>%
+  filter(table_1_columns == "CRH" & sta5a == "552") %>%
+  arrange(crh_month) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_total, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC CRH Encounters", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+### Let's look at 630A4    
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = round(crh_encounter_count / pc_encounter_total * 1000, 1)) %>%
+  filter(table_1_columns == "CRH" & sta5a == "630A4") %>%
+  arrange(crh_month) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_total, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC Encounters", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+# Penetration Rate by Clinic Type ("CRH" only)  
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(pc_crh_per_1k_pc_total = crh_encounter_count / pc_encounter_total * 1000) %>%
+  filter(pc_crh_per_1k_pc_total < 75000 & table_1_columns == "CRH") %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  ggplot(data = .,
+         aes(x = s_abbr, y = pc_crh_per_1k_pc_total, fill = s_abbr)) +
+  geom_boxplot() +
+  ggsci::scale_fill_aaas() +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "PC CRH per 1,000 Total PC (encounters)")
+```

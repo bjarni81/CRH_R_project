@@ -1,0 +1,1232 @@
+---
+title: "CRH Encounters per 1,000 Total Encounters - VISN"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = '')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(ggrepel)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 24),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+hubs <- dbGetQuery(oabi_con,
+                     "select hub_sta3n from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select hub_sta3n from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#==
+all_months <- seq.Date(ymd('2019-10-01'),ymd('2021-09-01'), by = 'month')
+#--
+all_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].all_encounters_E_counts") %>%
+  select(-contains("Vax")) %>%
+  mutate(vizMonth = ymd(vizMonth)) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name),
+         spoke_flag = if_else(sta6a %in% spokes_v, TRUE, FALSE),
+         fy = if_else(month(vizMonth) > 9, year(vizMonth) + 1, year(vizMonth)),
+         qtr = case_when(month(vizMonth) %in% c(10, 11, 12) ~ 1,
+                         month(vizMonth) %in% c(1, 2, 3) ~ 2,
+                         month(vizMonth) %in% c(4, 5, 6) ~ 3,
+                         month(vizMonth) %in% c(7, 8, 9) ~ 4)) %>%
+  filter(is.na(parent_visn) == F & fy %in% c(2020, 2021)) %>%
+  rename("Primary Care" = pc_encounters,
+         "Mental Health" = mh_encounters,
+         "Pharmacy" = pharmacy_encounters,
+         "PCMHI" = pcmhi_encounters)
+#
+spoke_encounters <- all_encounters %>% filter(spoke_flag == T)
+#==
+crh_encounters_v1 <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].encounters_D_deDup") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(visitdate) > 9, year(visitdate) + 1, year(visitdate)),
+         sta5a_to_use = if_else(spoke_sta5a %in% hubs$hub_sta3n | is.na(spoke_sta5a) == T, sta5a_most_freq, spoke_sta5a),
+         version = "Version 1") %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  left_join(., vast, by = c("sta5a_to_use" = "sta5a")) %>%
+  filter(is.na(parent_visn) == FALSE)
+#--
+crh_encounters_v2 <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].encounters_D_deDup_v2") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(visitdate) > 9, year(visitdate) + 1, year(visitdate)),
+         sta5a_to_use = if_else(spoke_sta5a %in% hubs$hub_sta3n | is.na(spoke_sta5a) == T, sta5a_most_freq, spoke_sta5a),
+         version = "Version 2") %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  left_join(., vast, by = c("sta5a_to_use" = "sta5a")) %>%
+  filter(is.na(parent_visn) == FALSE)
+#
+crh_encounters <- crh_encounters_v1 %>%
+  bind_rows(., crh_encounters_v2)
+```
+
+```{r creating_data_frames}
+#--TOTAL
+crh_visn_total <- crh_encounters %>%
+  group_by(crh_month, parent_visn, version) %>%
+  summarise(crh_encounters = n())
+#
+all_visn_total <- spoke_encounters %>%
+  select(2:6, parent_visn) %>%
+  pivot_longer(-c(vizMonth, parent_visn)) %>%
+  group_by(vizMonth, parent_visn) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+total_visn_df <- crh_visn_total %>%
+  left_join(., all_visn_total, by = c("crh_month" = "vizMonth", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ungroup %>%
+  complete(crh_month = all_months, nesting(parent_visn))
+#==BY CARE TYPE
+crh_visn_type <- crh_encounters %>%
+  group_by(crh_month, parent_visn, care_type) %>%
+  summarise(crh_encounters = n())
+#
+all_visn_type <- spoke_encounters %>%
+  select(2:6, parent_visn) %>%
+  pivot_longer(-c(vizMonth, parent_visn)) %>%
+  group_by(vizMonth, parent_visn, name) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+type_visn_df <- crh_visn_type %>%
+  left_join(., all_visn_type, by = c("crh_month" = "vizMonth", "care_type" = "name", "parent_visn" = "parent_visn")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ungroup %>%
+  complete(crh_month = all_months, nesting(parent_visn, care_type))
+```
+
+
+# All VISNs  
+## Total - I    
+```{r total_1}
+ggplot(data = total_visn_df,
+         aes(x = crh_month, y = crh_per_1k_total, group = parent_visn, color = "1")) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 50),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+\newpage
+
+## Total - II  
+```{r total_2}
+total_visn_df %>% 
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         crh_month, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_per_1k_total, group = parent_visn_char, 
+             color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 50),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(color = "VISN",
+       x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+\newpage
+
+## By Care Type - I   
+### No PCMHI  
+```{r type_no_pcmhi}
+ggplot(data = subset(type_visn_df, care_type != "PCMHI"),
+         aes(x = crh_month, y = crh_per_1k_total, group = care_type, color = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 80),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+\newpage
+
+### PCMHI  
+```{r type_pcmhi}
+ggplot(data = subset(type_visn_df, care_type == "PCMHI"),
+         aes(x = crh_month, y = crh_per_1k_total, group = care_type, color = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  guides(color = guide_legend(override.aes = list(size = 1.25)))
+```
+
+
+\newpage
+## By Care Type - II  
+### Mental Health  
+```{r mental_health} 
+type_visn_df %>% filter(care_type == "Mental Health") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         crh_month, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_per_1k_total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 80),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "Month",
+       y = "CRH Mental Health Encounters/1,000 Mental Health Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+\newpage
+### Primary Care  
+```{r primary_care} 
+type_visn_df %>% filter(care_type == "Primary Care") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         crh_month, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_per_1k_total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 40),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "Month",
+       y = "CRH Primary Care Encounters/1,000 Primary Care Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+\newpage
+### Pharmacy    
+```{r pharmacy} 
+type_visn_df %>% filter(care_type == "Pharmacy") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         crh_month, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_per_1k_total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, 10),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "Month",
+       y = "CRH Pharmacy Encounters/1,000 Pharmacy Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+
+\newpage
+### PCMHI    
+```{r pcmhi} 
+type_visn_df %>% filter(care_type == "PCMHI") %>%
+  mutate(parent_visn_char = fct_reorder2(factor(str_pad(parent_visn, side = "left", width = 2, pad = 0)),
+                                         crh_month, crh_per_1k_total)) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_per_1k_total, group = parent_visn_char, color = parent_visn_char)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  guides(color = guide_legend(override.aes = list(size = 1.25))) +
+  labs(x = "Month",
+       y = "CRH PCMHI Encounters/1,000 PCMHI Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+```
+
+
+\newpage
+
+```{r functions}
+total_plot_fxn <- function(visn_var){
+  ggplot(data = subset(total_visn_df, parent_visn == visn_var),
+         aes(x = crh_month, y = crh_per_1k_total, group = parent_visn, color = "1")) +
+    geom_line(size = 1) +
+    geom_point() +
+    scale_y_continuous(limits = c(0, 50),
+                       labels = scales::comma_format(accuracy = 1)) +
+    ggsci::scale_color_aaas() +
+    guides(color = guide_legend(override.aes = list(size = 1.25))) +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    labs(x = "Month",
+         y = "CRH Encounters per 1,000 Total Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+    geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2)
+}
+#----
+total_table_fxn <- function(visn_var){
+  total_visn_df %>% filter(parent_visn == visn_var) %>%
+    select(-parent_visn) %>%
+    mutate(crh_per_1k_total = round(crh_per_1k_total, 1)) %>%
+    rename("CRH Encounters" = crh_encounters,
+           "Total" = total,
+           "CRH/1,000 total" = crh_per_1k_total) %>%
+    kbl(col.names = c("Month", "CRH Encounters", "Total Encounters", "CRH/1,000 Total"),
+        format.args = list(big.mark = ","),
+        align = c("l", rep("r", 4))) %>%
+    kable_classic(latex_options = c("striped", "hold_position"))
+}
+#----
+type_plot_fxn <- function(visn_var){
+  ggplot(data = subset(type_visn_df, care_type != "PCMHI" & parent_visn == visn_var),
+         aes(x = crh_month, y = crh_per_1k_total, group = care_type, color = care_type)) +
+    geom_line(size = 1) +
+    geom_point() +
+    scale_y_continuous(limits = c(0, 80),
+                       labels = scales::comma_format(accuracy = 1)) +
+    ggsci::scale_color_aaas() +
+    theme(legend.position = "none",
+          axis.text.x = element_text(angle = 270, vjust = 0.5)) +
+    labs(x = "Month",
+         y = "CRH Encounters per 1,000 Total Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+    geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+    facet_wrap(~care_type)
+}
+#----
+type_plot_fxn2 <- function(visn_var){
+  ggplot(data = subset(type_visn_df, care_type == "PCMHI" & parent_visn == visn_var),
+         aes(x = crh_month, y = crh_per_1k_total, group = care_type, color = care_type)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, 275),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.position = "none",
+        axis.text.x = element_text(angle = 270, vjust = 0.5)) +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters",
+       caption = "*Vertical line at March 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-03-01")), lty = 2) +
+  facet_wrap(~care_type)
+}
+#----
+type_table_fxn <- function(visn_var){
+  type_visn_df %>%
+  filter(parent_visn == visn_var) %>%
+  ungroup %>%
+  select(-parent_visn) %>%
+  mutate(crh_per_1k_total = round(crh_per_1k_total, 1)) %>%
+  pivot_longer(-c(crh_month, care_type)) %>%
+  pivot_wider(names_from = c(care_type, name), values_from = value) %>%
+  select(crh_month, contains("Mental"), contains("Primary")) %>%
+  kbl(col.names = c("Month",
+                    rep(c("CRH", "Total", "CRH/1,000"), 2)),
+      align = c("l", rep("r", 6)),
+      format.args = list(big.mark = ",")) %>%
+  column_spec(c(4), border_right = T) %>%
+  kable_classic(latex_options = c("striped", "hold_position")) %>%
+  add_header_above(c(" " = 1, "Mental Health" = 3, "Primary Care" = 3))
+}
+#----
+type_table_fxn2 <- function(visn_var){
+    type_visn_df %>%
+    filter(parent_visn == visn_var) %>%
+    ungroup %>%
+    select(-parent_visn) %>%
+    mutate(crh_per_1k_total = round(crh_per_1k_total, 1)) %>%
+    pivot_longer(-c(crh_month, care_type)) %>%
+    pivot_wider(names_from = c(care_type, name), values_from = value) %>%
+    select(crh_month, contains("Pharmacy"), contains("PCMHI")) %>%
+    kbl(col.names = c("Month",
+                      rep(c("CRH", "Total", "CRH/1,000"), 2)),
+        align = c("l", rep("r", 6)),
+        format.args = list(big.mark = ",")) %>%
+    column_spec(c(4), border_right = T) %>%
+    kable_classic(latex_options = c("striped", "hold_position")) %>%
+    add_header_above(c(" " = 1, "Pharmacy" = 3, "PCMHI" = 3))
+}
+```
+
+# VISN 1   
+## Total  
+```{r}
+total_plot_fxn(1)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(1)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(1)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(1)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(1)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(1)
+```
+
+\newpage
+
+# VISN 2   
+## Total  
+```{r}
+total_plot_fxn(2)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(2)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(2)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(2)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(2)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(2)
+```
+
+\newpage
+
+# VISN 4   
+## Total  
+```{r}
+total_plot_fxn(4)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(4)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(4)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(4)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(4)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(4)
+```
+
+# VISN 5   
+## Total  
+```{r}
+total_plot_fxn(5)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(5)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(5)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(5)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(5)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(5)
+```
+
+# VISN 6   
+## Total  
+```{r}
+total_plot_fxn(6)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(6)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(6)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(6)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(6)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(6)
+```
+
+\newpage
+
+# VISN 7   
+## Total  
+```{r}
+total_plot_fxn(7)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(7)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(7)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(7)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(1)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(7)
+```
+
+\newpage
+
+# VISN 8   
+## Total  
+```{r}
+total_plot_fxn(8)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(8)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(8)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(8)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(8)
+```
+
+\newpage
+
+```{r}
+type_table_fxn(8)
+```
+
+\newpage
+
+# VISN 9   
+## Total  
+```{r}
+total_plot_fxn(9)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(9)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(9)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(9)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(9)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(9)
+```
+
+\newpage
+
+# VISN 10   
+## Total  
+```{r}
+total_plot_fxn(10)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(10)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(10)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(10)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(10)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(10)
+```
+
+\newpage
+
+# VISN 12   
+## Total  
+```{r}
+total_plot_fxn(12)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(12)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(12)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(12)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(12)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(12)
+```
+
+\newpage
+
+# VISN 15   
+## Total  
+```{r}
+total_plot_fxn(15)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(15)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(15)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(15)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(15)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(15)
+```
+
+\newpage
+
+
+# VISN 16   
+## Total  
+```{r}
+total_plot_fxn(16)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(16)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(16)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(16)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(16)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(16)
+```
+
+\newpage
+
+# VISN 17   
+## Total  
+```{r}
+total_plot_fxn(17)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(17)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(17)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(17)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(17)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(17)
+```
+
+\newpage
+
+
+# VISN 19   
+## Total  
+```{r}
+total_plot_fxn(19)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(19)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(19)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(19)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(19)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(19)
+```
+
+\newpage
+
+# VISN 20   
+## Total  
+```{r}
+total_plot_fxn(20)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(20)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(20)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(20)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(20)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(20)
+```
+
+\newpage
+
+
+# VISN 21   
+## Total  
+```{r}
+total_plot_fxn(21)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(21)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(21)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(21)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(21)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(21)
+```
+
+\newpage
+
+# VISN 22   
+## Total  
+```{r}
+total_plot_fxn(22)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(22)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(22)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(22)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(22)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(22)
+```
+
+\newpage
+
+# VISN 23   
+## Total  
+```{r}
+total_plot_fxn(23)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+total_table_fxn(23)
+```
+
+\newpage
+
+## By Care Type  
+
+```{r}
+type_plot_fxn(23)
+```
+
+\newpage
+
+
+```{r}
+type_plot_fxn2(23)
+```
+
+\newpage
+
+### As a Table  
+
+```{r}
+type_table_fxn(23)
+```
+
+\newpage
+
+```{r}
+type_table_fxn2(23)
+```

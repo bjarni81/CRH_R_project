@@ -1,0 +1,266 @@
+---
+title: "CRH Encounters: New Set of CHAR4 Codes"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(lmerTest)
+library(sjPlot)
+library(cowplot)
+library(stargazer)
+library(starpolishr)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+```
+
+
+```{r}
+crh_df = dbGetQuery(oabi_con,
+                    "select *
+                    from [PACT_CC].[CRH].[C_crh_utilization_final]")
+#
+crh_new_df = dbGetQuery(oabi_con,
+                    "select *
+                    from [PACT_CC].[CRH].[C_crh_utilization_final_new]")
+```
+
+```{r}
+crh_new_df %>% 
+  group_by(care_type) %>% 
+  summarise(count = n()) %>% 
+  left_join(., crh_df %>% 
+              group_by(care_type) %>% 
+              summarise(count2 = n())) %>% 
+  mutate(change = count - count2, 
+         prop = change / count2) %>%
+  select(care_type, count2, count, change, prop) %>%
+  mutate(count = comma(count),
+         count2 = comma(count2),
+         change = comma(change),
+         prop = percent(prop)) %>%
+  kbl(col.names = c("Care Type", "V1.0 Count", "V2.0 Count", "Change", "Proportion"),
+      align = c("l", rep("r", 4)),
+      full_width = FALSE) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+# CRH Encounters Over Time - National  
+
+## Total  
+
+```{r}
+tot_crh_nat = crh_df %>%
+  mutate(visitMonth = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  group_by(visitMonth) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(source = "v1.0")
+#
+tot_crh_new_nat = crh_new_df %>%
+  mutate(visitMonth = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  group_by(visitMonth) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(source = "v2.0")
+#--
+tot_crh_nat %>%
+  bind_rows(., tot_crh_new_nat) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = crh_encounters, color = source)) + 
+  geom_line(linewidth = 0.67) +
+  labs(x = "Months",
+       y = "CRH Encounters") +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = comma_format()) +
+  ggsci::scale_color_d3()
+```
+
+## By Type    
+
+```{r}
+type_crh_nat = crh_df %>%
+  mutate(visitMonth = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  group_by(visitMonth, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(source = "v1.0")
+#
+type_crh_new_nat = crh_new_df %>%
+  mutate(visitMonth = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  group_by(visitMonth, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(source = "v2.0")
+#--
+type_crh_nat %>%
+  bind_rows(., type_crh_new_nat) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = crh_encounters, color = source)) + 
+  geom_line(linewidth = 0.67) +
+  labs(x = "Months",
+       y = "CRH Encounters") +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = comma_format()) +
+  facet_wrap(~care_type) +
+  ggsci::scale_color_d3()
+```
+
+# CRH Encounters Over Time - VISN  
+
+## Total  
+
+```{r}
+tot_crh_visn = crh_df %>%
+  mutate(visitMonth = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  group_by(visitMonth, hub_visn) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(source = "v1.0")
+#
+tot_crh_new_visn = crh_new_df %>%
+  mutate(visitMonth = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  group_by(visitMonth, hub_visn) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(source = "v2.0")
+#--
+tot_crh_visn %>%
+  bind_rows(., tot_crh_new_visn) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = crh_encounters, color = source)) + 
+  geom_line(linewidth = 0.67) +
+  labs(x = "Months",
+       y = "CRH Encounters") +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = comma_format()) +
+  facet_wrap(~hub_visn) +
+  ggsci::scale_color_d3()
+```
+
+## By Type    
+
+### Mental Health  
+
+```{r}
+type_crh_visn = crh_df %>%
+  mutate(visitMonth = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  group_by(visitMonth, hub_visn, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(source = "v1.0")
+#
+type_crh_new_visn = crh_new_df %>%
+  mutate(visitMonth = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  group_by(visitMonth, hub_visn, care_type) %>%
+  summarise(crh_encounters = n()) %>%
+  mutate(source = "v2.0")
+#--
+type_crh_visn %>%
+  bind_rows(., type_crh_new_visn) %>%
+  filter(care_type == "Mental Health") %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = crh_encounters, color = source)) + 
+  geom_line(linewidth = 0.67) +
+  labs(x = "Months",
+       y = "CRH Encounters") +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = comma_format()) +
+  facet_wrap(~hub_visn) +
+  ggsci::scale_color_d3()
+```
+
+### PCMHI  
+
+```{r}
+type_crh_visn %>%
+  bind_rows(., type_crh_new_visn) %>%
+  filter(care_type == "PCMHI") %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = crh_encounters, color = source)) + 
+  geom_line(linewidth = 0.67) +
+  labs(x = "Months",
+       y = "CRH Encounters") +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = comma_format()) +
+  facet_wrap(~hub_visn) +
+  ggsci::scale_color_d3()
+```
+
+### Pharmacy    
+
+```{r}
+type_crh_visn %>%
+  bind_rows(., type_crh_new_visn) %>%
+  filter(care_type == "Pharmacy") %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = crh_encounters, color = source)) + 
+  geom_line(linewidth = 0.67) +
+  labs(x = "Months",
+       y = "CRH Encounters") +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = comma_format()) +
+  facet_wrap(~hub_visn) +
+  ggsci::scale_color_d3()
+```
+
+### Primary Care      
+
+```{r}
+type_crh_visn %>%
+  bind_rows(., type_crh_new_visn) %>%
+  filter(care_type == "Primary Care") %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = crh_encounters, color = source)) + 
+  geom_line(linewidth = 0.67) +
+  labs(x = "Months",
+       y = "CRH Encounters") +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = comma_format()) +
+  facet_wrap(~hub_visn) +
+  ggsci::scale_color_d3()
+```
+
+### Specialty        
+
+```{r}
+type_crh_visn %>%
+  bind_rows(., type_crh_new_visn) %>%
+  filter(care_type == "Specialty") %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = crh_encounters, color = source)) + 
+  geom_line(linewidth = 0.67) +
+  labs(x = "Months",
+       y = "CRH Encounters") +
+  theme(legend.title = element_blank()) +
+  scale_y_continuous(labels = comma_format()) +
+  facet_wrap(~hub_visn) +
+  ggsci::scale_color_d3()
+```

@@ -1,0 +1,109 @@
+---
+title: "PC CRH Encounters"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             plot.title = element_text(size = 24),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+pc_crh <- dbGetQuery(oabi_con,
+                     "select *
+                     from [PACT_CC].[CRH].C_crh_utilization_final
+                     where care_type = 'Primary care'")
+```
+
+# Logic  
+* The encounters were categorized by stop code thusly:
+    + IF (Primary SC IN(301, 322, 323, 348) AND Secondary SC IN(179, 673, 690, 692, 693, 697)) OR Primary SC IN(156, 176, 177, 674) THEN "Video"
+    + IF Primary SC IN(178, 324, 338) THEN "Telephone"
+    + IF Secondary SC = 719 THEN "Secure Message"
+    + ELSE "In-Person"
+    
+
+```{r}
+pc_crh %>%
+  filter(fy > 2019) %>%
+  mutate(modality = case_when(
+    (primarystopcode %in% c(301, 322, 323, 348) & secondarystopcode %in% c(179, 673, 690, 692, 693, 697))
+      | primarystopcode %in% c(156, 176, 177, 674) ~ "Video",
+    primarystopcode %in% c(178, 324, 338) ~ "Telephone",
+    secondarystopcode == 719 ~ "Secure message",
+    TRUE ~ "In-person"
+  )) %>%
+  group_by(fyqtr, modality) %>%
+  tally() %>%
+  pivot_wider(names_from = fyqtr, values_from = n) %>%
+  adorn_totals("both") %>%
+  mutate(across(2:18, ~comma(.x, accuracy = 1))) %>%
+  kbl(align = c("l", rep("r", 17))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T) %>%
+  row_spec(5, bold = T)
+```
+
+```{r class.source = 'fold-show'}
+pc_crh %>%
+  filter(fy > 2019) %>%
+  mutate(modality = case_when(
+    (primarystopcode %in% c(301, 322, 323, 348) & secondarystopcode %in% c(179, 673, 690, 692, 693, 697))
+      | primarystopcode %in% c(156, 176, 177, 674) ~ "Video",
+    primarystopcode %in% c(178, 324, 338) ~ "Telephone",
+    secondarystopcode == 719 ~ "Secure message",
+    TRUE ~ "In-person"
+  )) %>%
+  group_by(fyqtr, modality) %>%
+  tally() %>%
+  pivot_wider(names_from = fyqtr, values_from = n) %>%
+  adorn_totals("both") %>%
+  write_csv(., 
+            here("Input", "pc_crh_modality.csv"))
+```

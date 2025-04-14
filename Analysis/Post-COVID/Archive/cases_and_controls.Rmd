@@ -1,0 +1,181 @@
+---
+title: "How many cases & controls?"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2018-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+```{r}
+# a vector of sta5as that:
+    #1. have at least 451 average unique scrssns in pcmm FY20
+    #2. are a CBOC, OOS, VAMC, or HCC
+sta5as_to_include <- vast %>%
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F
+         & scrssn_count_cat != "< 450"
+         & s_abbr %in% c("PCCBOC", "MSCBOC", "VAMC", "OOS", "HCC")) %>%
+  select(sta5a, s_abbr, scrssn_count_cat)
+#-----
+months_meeting_inclusion_criteria <- pen_rate %>%
+  arrange(sta5a, vssc_month) %>%#ordering by station and month
+  group_by(sta5a) %>%#grouping by station
+  mutate(this_mo_mt9_pc_crh = if_else(crh_encounter_count > 9, 1, 0),#flag for this month meeting criteria 
+         last_mo_mt9_pc_crh = if_else(lag(crh_encounter_count) > 9, 1, 0),#flag for last month
+         next_mo_mt9_pc_crh = if_else(lead(crh_encounter_count) > 9, 1, 0),#flag for next month
+         meets_inc_crit = if_else(this_mo_mt9_pc_crh == 1 & # IF this month meets criteria
+                                    (last_mo_mt9_pc_crh == 1 | next_mo_mt9_pc_crh == 1),#AND either this or last month
+                                  1, 0),#THEN 1, ELSE 0
+         meets_inc_crit = replace_na(meets_inc_crit, 0)) %>%#replacing NA with 0
+  mutate(
+    period_meeting_citeria = factor(case_when(
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month < ymd("2020-03-01") #AND month < march 2020
+      ~ "Before March 2020",#label
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month >= ymd("2020-03-01")#AND month between March 2020
+      & vssc_month <= ymd("2020-09-01") #AND September 2020
+      ~ "Between March and September 2020",#label
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month > ymd("2020-09-01") #AND month > Setember 2020
+      ~ "After September 2020",#label
+      TRUE ~ "Not Enough PC CRH"),#ELSE
+      ordered = TRUE,
+      levels = c("Before March 2020", 
+                 "Between March and September 2020",
+                 "After September 2020",
+                 "Not Enough PC CRH")))
+#--
+sta5a_month_inc <- months_meeting_inclusion_criteria %>%
+  group_by(sta5a, period_meeting_citeria) %>%
+  summarise(count = n()) %>%
+  filter(period_meeting_citeria != "Not Enough PC CRH") %>%
+  group_by(sta5a) %>%
+  summarise(period1_inc = sum(if_else(period_meeting_citeria == "Before March 2020" & count > 1, 1, 0)),
+            period2_inc = sum(if_else(period_meeting_citeria == "Between March and September 2020" & count > 1, 1, 0)),
+            period3_inc = sum(if_else(period_meeting_citeria == "After September 2020" & count > 1, 1, 0)))
+#--
+analytic_df <- sta5as_to_include %>%
+  left_join(., sta5a_month_inc) %>%
+  mutate(across(contains("period"), ~replace_na(.x, 0)),
+         not_enough_crh = if_else(period1_inc == 0 & period2_inc == 0 & period3_inc == 0 & sta5a %in% pen_rate$sta5a, 
+                                  1, 0),
+         potential_control = if_else(period1_inc == 0 & period2_inc == 0 & period3_inc == 0 & not_enough_crh == 0, 1, 0),
+         ever_met_criteria = if_else(period1_inc == 1 | period2_inc == 1 | period3_inc == 1, 1, 0))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a closer look at the number of sta5as that we are considering for inclusion as cases in our study, as well as how many sta5as we are then left with that have never used PC CRH
+
+## Decision Points  
+
+* Per our meeting on November 14th I am creating this report to help guide the discussion about propensity score matching
+    
+## Let's Talk About Sta5as    
+
+
+* The world of all potential sta5as:
+    + There are `r nrow(analytic_df) %>% comma()` sta5as total
+    + There are `r sum(analytic_df$ever_met_criteria)` sta5as that ever met our inclusion criteria
+    + There are `r sum(analytic_df$period3_inc)` sta5as that met our inclusion criteria after September 2020
+    + There are `r sum(analytic_df$not_enough_crh)` sta5as that didn't meet our criteria but had more than zero PC CRH encounters during the whole study period
+    + That means that, if we restrict our pool of potential controls to those sta5as that have never had PC CRH, `r nrow(analytic_df) - sum(analytic_df$ever_met_criteria) - sum(analytic_df$not_enough_crh)` sta5as are eligible to be controls
+    
+## Categorizing Sta5as by CRH Experience  
+
+* We have discussed categorizing sta5as by how much experience they have had with CRH
+* The terminology we have been using is early, middle and late adopters
+* Out of the `r sum(analytic_df$period3_inc)` sta5as that met our inclusion criteria after September 2020:
+    + `r sum(analytic_df$period3_inc == 1 & analytic_df$period1_inc == 1)` also met our inclusion before March 2020
+    + `r sum(analytic_df$period3_inc == 1 & analytic_df$period2_inc == 1 & analytic_df$period1_inc == 0)` also met our inclusion criteria between March and September 2020, but __not__ before March 2020
+    + `r sum(analytic_df$period1_inc == 0 & analytic_df$period2_inc == 0 & analytic_df$period3_inc == 1)` sta5as only met our inclusion criteria after September 2020
+    
+

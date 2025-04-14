@@ -1,0 +1,607 @@
+---
+title: "CRH PC Engagement Metrics"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+library(cowplot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+```
+
+```{r reading-in}
+analytic_df = dbGetQuery(oabi_con,
+                         "select *
+                         from [OABI_myVAAccess].[pccrh_eng].Z_analytic_df") %>%
+  filter(always_missing_gap == F & always_missing_pf == F) %>%
+  mutate(vssc_month = ymd(vssc_month),
+         gap_cat = factor(case_when(
+           gap_metric < 1.0 ~ "< 1.0",
+           gap_metric >= 1.0 & gap_metric <= 1.2 ~ "1.0 - 1.2",
+           gap_metric > 1.2 ~ "> 1.2",
+           TRUE ~ "Missing"
+         ), 
+         ordered = TRUE,
+         levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing")),
+         pf_cat = factor(case_when(
+           panel_fullness > 1.0 ~ "> 100%",
+           panel_fullness >= 0.8 & panel_fullness <= 1.0 ~ "80% - 100%",
+           panel_fullness < 0.8 ~ "< 80%",
+           TRUE ~ "Missing"
+         ),
+         ordered = TRUE,
+         levels = c("< 80%", "80% - 100%", "> 100%", "Missing")),
+         period_initiating_crh = factor(period_initiating_crh,
+                                        ordered = TRUE,
+                                        levels = c("Before March 2020", 
+                                                   "March to September 2020",
+                                                   "After September 2020")))
+#
+vast = DBI::dbGetQuery(oabi_con,
+                  "--
+select distinct sta5a = stationno, parent_station = par_sta_no, visn = newvisn, city, st, stationname, s_abbr
+from [PACT_CC].[Dim].VAST
+where extractdate = '8-16-2022'
+	AND s_abbr IN('HCC', 'VAMC', 'MSCBOC', 'PCCBOC', 'OOS')
+	AND stationname NOT LIKE '%Mobile Clinic%'
+	AND stationno IN(select distinct sta6aid from PACT_CC.Dim.VAST_Historic where snapshotDate = '2022-07-01')") %>%
+  filter(sta5a %in% analytic_df$sta5a) %>%
+  mutate(visn = str_pad(visn, width = 2, side = "left", pad = "0"))
+```
+
+
+# Timeframe  
+
+* The first month of observation is `r min(analytic_df$vssc_month)`
+* The last month of observation is `r max(analytic_df$vssc_month)`
+
+# Sta5as  
+
+* There are `r n_distinct(analytic_df$sta5a) %>% comma()` unique sta5as  
+* I have excluded:
+    + Sites with < 450 uniques all 4 years
+    + Sites that are not HCC, VAMC, CBOC, or OOS
+    + Sites with the phrase "Mobile Clinic" in their name
+    + Sites that are missing Gap Metric or Panel Fullness for all 48 months
+
+## Period Initiating PC CRH  
+
+```{r}
+analytic_df %>%
+  select(sta5a, period_initiating_crh) %>%
+  distinct() %>%
+  filter(is.na(period_initiating_crh) == F) %>%
+  tabyl(period_initiating_crh) %>%
+  adorn_totals() %>%
+  mutate(percent = percent(percent, accuracy = 0.1)) %>%
+  kbl(col.names = c("Period Initiating PC CRH", "Sta5a", "%"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = F) 
+```
+
+# Site Type  
+
+```{r}
+analytic_df %>%
+  select(sta5a, s_abbr) %>%
+  distinct() %>%
+  tabyl(s_abbr) %>%
+  adorn_totals() %>%
+  mutate(percent = percent(percent, accuracy = 0.1),
+         n = comma(n)) %>%
+  kbl(col.names = c("Site Type", "n", "%"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = F)
+```
+
+# Outcomes  
+
+## Established Patient Wait Time  
+
+```{r}
+outcome_fxn = function(outcome, ymax, label){
+  bp = ggplot(data = analytic_df,
+              aes(x = "a", y = {{outcome}})) +
+    geom_boxplot(fill = "skyblue") +
+    theme(axis.title.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.x = element_blank()) +
+    scale_y_continuous(limits = c(0, {{ymax}})) +
+    labs(y = label)
+  #--
+  lp = analytic_df %>%
+    group_by(sta5a) %>%
+    slice_sample(., prop = 0.25) %>%
+    ggplot(data = .,
+           aes(x = vssc_month, y = {{outcome}}, group = sta5a)) +
+    geom_line(alpha = 0.4) +
+    scale_y_continuous(limits = c(0, {{ymax}})) +
+    scale_x_date(breaks = "4 months") +
+    labs(y = label) +
+    theme(axis.text.x = element_text(angle = 270, vjust = 0.3))
+  #
+  if(str_detect({{label}}, 'Timely|Fullness')){
+    plot_grid(bp + scale_y_continuous(labels = percent_format(),
+              limits = c(0, {{ymax}})), lp + scale_y_continuous(labels = percent_format(), limits = c(0, {{ymax}})))}
+  else {plot_grid(bp, lp)}
+}
+outcome_fxn(est_pt_wt_pid, 30, "Established Pt Wt (PID)")
+```
+
+## New Patient Wait Time  
+
+```{r}
+outcome_fxn(new_pt_wt, 50, "New Pt Wt")
+```
+
+## Third Next Available  
+
+```{r}
+outcome_fxn(tna, 40, "3rd Next Available")
+```
+
+## Timely Care  
+
+```{r}
+outcome_fxn(tc_pc_success_prop, NA, "Timely Care Success")
+```
+
+# Engagement Measures  
+
+## Gap   
+### Continuous    
+```{r}
+outcome_fxn(gap_metric, 2.5, "Gap Metric")
+```
+
+### Categorical Sta5a-month  
+```{r}
+analytic_df %>%
+  tabyl(gap_cat) %>%
+  adorn_totals() %>%
+  mutate(n = comma(n),
+         percent = percent(percent, accuracy = 0.1)) %>%
+  kbl(col.names = c("Gap Category", "Sta5a-Months", "%"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = F)
+```
+
+### Categorical Average  
+```{r}
+analytic_df %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T)) %>%
+  mutate(mean_gap_cat = factor(case_when(
+    mean_gap < 1.0 ~ "< 1.0",
+    mean_gap >= 1.0 & mean_gap <= 1.2 ~ "1.0 - 1.2",
+    mean_gap > 1.2 ~ "> 1.2",
+    TRUE ~ "Missing all Gap Obs."
+  ), ordered = TRUE,
+  levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing all Gap Obs.")),
+  mean_gap_cat = fct_drop(mean_gap_cat)) %>%
+  tabyl(mean_gap_cat) %>%
+  adorn_totals() %>%
+  mutate(n = comma(n),
+         percent = percent(percent, accuracy = 0.1)) %>%
+  kbl(col.names = c("Gap Category", "Sta5a", "%"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = F) 
+```
+
+## Panel Fullness  
+### Continuous  
+```{r}
+outcome_fxn(panel_fullness, 1.5, "Panel Fullness")
+```
+
+### Categorical Sta5a-month  
+```{r}
+analytic_df %>%
+  tabyl(pf_cat) %>%
+  adorn_totals() %>%
+  mutate(n = comma(n),
+         percent = percent(percent, accuracy = 0.1)) %>%
+  kbl(col.names = c("Panel Fullness Category", "Sta5a-Months", "%"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = F) 
+```
+
+### Categorical Average  
+```{r}
+analytic_df %>%
+  group_by(sta5a) %>%
+  summarise(pf_mean = mean(panel_fullness, na.rm = T),
+            pf_cat = factor(case_when(
+              pf_mean > 1.0 ~ "> 100%",
+              pf_mean >= 0.8 & pf_mean <= 1.0 ~ "80% - 100%",
+              pf_mean < 0.8 ~ "< 80%",
+              TRUE ~ "Missing"
+            ),
+            ordered = TRUE,
+            levels = c("< 80%", "80% - 100%", "> 100%", "Missing"))) %>%
+  mutate(pf_cat = fct_drop(pf_cat))%>%
+  tabyl(pf_cat) %>%
+  adorn_totals() %>%
+  mutate(n = comma(n),
+         percent = percent(percent, accuracy = 0.1)) %>%
+  kbl(col.names = c("Panel Fullness Category", "Sta5a", "%"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = F) 
+```
+
+
+## Joint Definition  
+### Sta5a-Months  
+```{r}
+analytic_df %>%
+  mutate(joint_def = fct_drop(factor(
+    case_when(pf_cat == "> 100%" | gap_cat == "< 1.0" ~ 
+                "PF > 100% OR Gap < 1.0",
+              pf_cat == "< 80%" | gap_cat == "> 1.2" ~
+                "PF < 80% OR Gap > 1.2",
+              pf_cat == "80% - 100%" | gap_cat == "1.0 - 1.2" ~
+                "PF 80%-100% OR Gap 1.0-1.2",
+              TRUE ~ "Missing"),
+    ordered = TRUE,
+    levels = c("PF > 100% OR Gap < 1.0", "PF 80%-100% OR Gap 1.0-1.2",
+               "PF < 80% OR Gap > 1.2", "Missing")
+  ))) %>%
+  tabyl(joint_def) %>%
+  mutate(n = comma(n),
+         percent = percent(percent, accuracy = 0.1)) %>%
+  kbl(col.names = c("Joint Definition", "Obs.", "%"),
+      align = c("l", rep("r", 2))) %>%
+  kable_classic("striped")
+```
+
+### Average  
+
+```{r}
+analytic_df %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T),
+            pf_mean = mean(panel_fullness, na.rm = T)) %>%
+  mutate(joint_def = fct_drop(factor(
+    case_when(pf_mean > 1.0 | mean_gap < 1.0 ~ 
+                "PF > 100% OR Gap < 1.0",
+              pf_mean < 0.8 | mean_gap > 1.2 ~
+                "PF < 80% OR Gap > 1.2",
+              (pf_mean >= 0.8 & pf_mean <= 1.0) | 
+                (mean_gap <= 1.2 & mean_gap >= 1.0) ~
+                "PF 80%-100% OR Gap 1.0-1.2",
+              TRUE ~ "Missing"),
+    ordered = TRUE,
+    levels = c("PF > 100% OR Gap < 1.0", "PF 80%-100% OR Gap 1.0-1.2",
+               "PF < 80% OR Gap > 1.2", "Missing")
+  ))) %>%
+  tabyl(joint_def) %>%
+  adorn_totals() %>%
+  mutate(percent = percent(percent, accuracy = 0.1),
+         n = comma(n)) %>%
+  kbl(col.names = c("Joint Definition", "Obs.", "%"),
+      align = c("l", rep("r", 2))) %>%
+  kable_classic("striped")
+```
+
+## Meaningful CRH Use 
+### Sta5a-Months  
+```{r}
+crh_sta5as = analytic_df %>%
+  filter(crh_flag == 1) %>%
+  select(sta5a) %>%
+  distinct() %>%
+  pull
+#
+analytic_df %>%
+  filter(sta5a %in% crh_sta5as) %>%
+  mutate(joint_def = fct_drop(factor(
+    case_when(pf_cat == "> 100%" | gap_cat == "< 1.0" ~ 
+                "PF > 100% OR Gap < 1.0",
+              pf_cat == "< 80%" | gap_cat == "> 1.2" ~
+                "PF < 80% OR Gap > 1.2",
+              pf_cat == "80% - 100%" | gap_cat == "1.0 - 1.2" ~
+                "PF 80%-100% OR Gap 1.0-1.2",
+              TRUE ~ "Missing"),
+    ordered = TRUE,
+    levels = c("PF > 100% OR Gap < 1.0", "PF 80%-100% OR Gap 1.0-1.2",
+               "PF < 80% OR Gap > 1.2", "Missing")
+  ))) %>%
+  tabyl(joint_def) %>%
+  mutate(n = comma(n),
+         percent = percent(percent, accuracy = 0.1)) %>%
+  kbl(col.names = c("Joint Definition", "Obs.", "%"),
+      align = c("l", rep("r", 2))) %>%
+  kable_classic("striped")
+```
+
+### Average  
+
+```{r}
+analytic_df %>%
+  filter(sta5a %in% crh_sta5as) %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T),
+            pf_mean = mean(panel_fullness, na.rm = T)) %>%
+  mutate(joint_def = fct_drop(factor(
+    case_when(pf_mean > 1.0 | mean_gap < 1.0 ~ 
+                "PF > 100% OR Gap < 1.0",
+              pf_mean < 0.8 | mean_gap > 1.2 ~
+                "PF < 80% OR Gap > 1.2",
+              (pf_mean >= 0.8 & pf_mean <= 1.0) | 
+                (mean_gap <= 1.2 & mean_gap >= 1.0) ~
+                "PF 80%-100% OR Gap 1.0-1.2",
+              TRUE ~ "Missing"),
+    ordered = TRUE,
+    levels = c("PF > 100% OR Gap < 1.0", "PF 80%-100% OR Gap 1.0-1.2",
+               "PF < 80% OR Gap > 1.2", "Missing")
+  ))) %>%
+  tabyl(joint_def) %>%
+  adorn_totals() %>%
+  mutate(percent = percent(percent, accuracy = 0.1),
+         n = comma(n)) %>%
+  kbl(col.names = c("Joint Definition", "Obs.", "%"),
+      align = c("l", rep("r", 2))) %>%
+  kable_classic("striped")
+```
+
+# Confounders  
+
+## Nosos  
+
+* Nosos is measured at the sta5a-month  
+
+```{r}
+outcome_fxn(nosos, 2, "Average Nosos")
+```
+
+### ADI  
+
+```{r}
+covar_fxn = function(covar, label, time, maxval){
+  
+  hp = analytic_df %>%
+    select(sta5a, {{time}}, {{covar}}) %>%
+    distinct() %>%
+    ggplot(data = .,
+           aes(x = {{covar}})) +
+    geom_histogram(color = "black") +
+    labs(y = "Observations",
+         x = label)
+  #--
+  bp = analytic_df %>%
+    select(sta5a, {{time}}, {{covar}}) %>%
+    distinct() %>%
+    ggplot(data = .,
+           aes(y = {{covar}}, x = "a")) +
+    geom_boxplot(fill = "darkorchid") +
+    theme(axis.title.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.text.x = element_blank()) +
+    labs(y = label)
+  #--
+  lp = if(time == "fy"){analytic_df %>%
+      group_by(sta5a) %>%
+      slice_sample(., prop = 0.25) %>%
+      mutate(timevar = fy) %>%
+      ggplot(data = .,
+             aes(x = timevar, y = {{covar}}, group = sta5a)) +
+      geom_line(alpha = 0.4) +
+      scale_y_continuous(limits = c(0, {{maxval}})) +
+      labs(y = label) +
+      theme(axis.title.x = element_blank())}
+    else{analytic_df %>%
+        group_by(sta5a) %>%
+        slice_sample(., prop = 0.25) %>%
+        mutate(timevar = vssc_month) %>%
+        ggplot(data = .,
+               aes(x = timevar, y = {{covar}}, group = sta5a)) +
+        geom_line(alpha = 0.4) +
+        scale_y_continuous(limits = c(0, {{maxval}})) +
+        labs(y = label) +
+        theme(axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+        scale_x_date(breaks = "4 months")}
+  #--
+  if(str_detect(label, "Urban|Rural|Prop")){
+    plot_grid(
+      hp + scale_x_continuous(labels = percent_format(),
+                              limits = c(NA, {{maxval}})) +
+        scale_y_continuous(labels = comma_format()), 
+      bp + scale_y_continuous(labels = percent_format(), 
+                              limits = c(NA, {{maxval}})), 
+      lp + scale_y_continuous(labels = percent_format(), 
+                              limits = c(NA, {{maxval}})))}
+  else{plot_grid(
+    hp + scale_x_continuous(limits = c(NA, {{maxval}}),
+                            labels = comma_format()) +
+      scale_y_continuous(labels = comma_format()), 
+    bp + scale_y_continuous(limits = c(NA, {{maxval}}),
+                            labels = comma_format()), 
+    lp + scale_y_continuous(limits = c(NA, {{maxval}}),
+                            labels = comma_format()))}
+}
+#
+covar_fxn(adi_natrank_mean, "ADI","fy", NA)
+```
+
+### Gender  
+
+```{r}
+covar_fxn(prop_male, "Proportion Male", "fy", NA)
+```
+
+### Age    
+
+```{r}
+covar_fxn(age_jan1_mean, "Average Age", "fy", NA)
+```
+
+### URH  
+
+```{r}
+covar_fxn(urban_prop, "Urban", "fy", NA)
+covar_fxn(rural_prop, "Rural", "fy", NA)
+```
+
+### Observed to Expected PC Panel Size Ratio  
+
+```{r}
+covar_fxn(obs_exp, "Observed:Expected", "vssc_month", 3)
+```
+
+### Uniques in PCMM  
+
+```{r}
+covar_fxn(scrssn_count, "Uniques in PCMM", "fy", NA)
+```
+
+### Total Primary Care Provider FTE  
+
+```{r}
+covar_fxn(pcp_fte_tot, "PCP FTE", "vssc_month", NA)
+```
+
+### CRH Primary Care Provider FTE  
+
+```{r}
+covar_fxn(pcp_fte_crh, "CRH PCP FTE", "vssc_month", NA)
+```
+
+### CRH-Corrected Primary Care Provider FTE  
+
+```{r}
+covar_fxn(crh_corr_pcp_fte, "CRH-Corrected PCP FTE", "vssc_month", NA)
+```
+
+### Primary Care CC Referral Rate  
+
+* This metric is calculated as $\frac{\text{PC CC Referrals}}{\text{Total PC Encounters}}\times 1,000$
+* There are `r sum(analytic_df$pc_cc_refs_per_1k_tot_pc > 1000, na.rm = TRUE)` observations with a value > 1,000
+
+```{r}
+covar_fxn(pc_cc_refs_per_1k_tot_pc, "PC CC Referrals per 1,000 Total PC Encounters", "vssc_month", 1000)
+```
+
+### Primary Care Staffing Ratio  
+
+* There are `r sum(analytic_df$teamlet_staff_ratio > 10, na.rm = T)` observations with a value > 10
+
+```{r}
+covar_fxn(teamlet_staff_ratio, "Core Teamlet Staffing Ratio", "vssc_month",
+          10)
+```
+
+## CAN  
+
+* Below is the sta5a-month average CAN score of sta5a-fy-specific PCMM ScrSSNs
+
+
+```{r}
+covar_fxn(cHosp_90d_mean, "Mean 90-Day Hospitalization Percentile", "vssc_month", NA)
+```
+
+```{r}
+covar_fxn(cMort_90d_mean, "Mean 90-Day Mortality Percentile", "vssc_month", NA)
+```
+
+
+
+## Proportion of patients with a CAN > 95  
+
+```{r}
+analytic_df %>%
+  select(sta5a, vssc_month, contains("gt95")) %>%
+  pivot_longer(-c(sta5a, vssc_month)) %>%
+  ggplot(data = .,
+         aes(x = value, fill = name)) +
+  geom_histogram(color = "black") +
+  facet_wrap(~name) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = percent_format(),
+                     limits = c(0, 0.2)) +
+  labs(y = "Observations",
+       x = "Proportion of Patients")
+```
+
+## Proportion of patients with a CAN > 90  
+
+```{r}
+analytic_df %>%
+  select(sta5a, vssc_month, contains("gt90")) %>%
+  pivot_longer(-c(sta5a, vssc_month)) %>%
+  ggplot(data = .,
+         aes(x = value, fill = name)) +
+  geom_histogram(color = "black") +
+  facet_wrap(~name) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = percent_format(),
+                     limits = c(0, 0.4)) +
+  labs(y = "Observations",
+       x = "Proportion of Patients")
+```
+
+## Proportion of patients with a CAN > 80  
+
+```{r}
+analytic_df %>%
+  select(sta5a, vssc_month, contains("gt80")) %>%
+  pivot_longer(-c(sta5a, vssc_month)) %>%
+  ggplot(data = .,
+         aes(x = value, fill = name)) +
+  geom_histogram(color = "black") +
+  facet_wrap(~name) +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = percent_format(),
+                     limits = c(0, 0.6)) +
+  labs(y = "Observations",
+       x = "Proportion of Patients")
+```

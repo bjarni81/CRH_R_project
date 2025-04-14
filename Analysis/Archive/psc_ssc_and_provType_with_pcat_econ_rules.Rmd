@@ -1,0 +1,311 @@
+---
+title: "PCAT Primary Care: Primary and Secondary Stop Codes & Provider Type"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 8, fig.height = 8)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#--
+colorize <- function(x, color) {
+  if (knitr::is_latex_output()) {
+    sprintf("\\textcolor{%s}{%s}", color, x)
+  } else if (knitr::is_html_output()) {
+    sprintf("<span style='color: %s;'>%s</span>", color,
+      x)
+  } else x
+}
+```
+
+```{r}
+psc_ssc_count <- dbGetQuery(oabi_con,
+                            "select * from [OABI_MyVAAccess].[crh_eval].psc_ssc")
+#
+psc_ssc_sum <- sum(psc_ssc_count$psc_ssc_count, na.rm = T)
+#--
+psc_count <- psc_ssc_count %>%
+  group_by(primaryStopCode, pStopCodeName) %>%
+  summarise(psc_count = sum(psc_ssc_count, na.rm = T)) %>%
+  arrange(desc(psc_count))
+#--
+provType_psc_ssc_count <- dbGetQuery(oabi_con,
+                                     "select * from [OABI_MyVAAccess].[crh_eval].provType_psc_ssc")
+#--
+provType_psc_ssc_sum <- sum(provType_psc_ssc_count$provType_psc_ssc_count, na.rm = T)
+```
+
+# PCAT/ECON Primary Care Inclusion Criteria  
+
+* The PCAT/ECON Primary Care inclusion criteria is a workload outpatient encounter in CDW where:
+    + PrimaryStopCode IN(322, 323, 338, 348, 350, 704) 
+        + AND SecondaryStopCode NOT IN(107, 115, 152, 311, 321, 328, 329, 333, 334, 430, 435, 474, 999)
+        
+    + OR SecondaryStopCode IN(322, 323, 348, 350, 704)
+    
+* This yields `r psc_ssc_sum %>% comma(accuracy = 1)` encounters with `r nrow(psc_count)` Primary Stop Codes in FYs 19, 20 and 21. Below are the first 25:
+
+```{r}
+psc_count %>%
+  ungroup %>%
+  slice_head(., n = 25) %>%
+  mutate(prop = psc_count / psc_ssc_sum,
+         primaryStopCode = as.character(primaryStopCode)) %>%
+  adorn_totals() %>%
+  mutate(psc_count = comma(psc_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.01)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Count", "Proportion"),
+      align = c("l", "l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+
+* This yields `r nrow(psc_ssc_count)` Primary and Secondary Stop Code combinations. Below are the top 40:
+```{r}
+psc_ssc_count %>%
+  arrange(desc(psc_ssc_count)) %>%
+  ungroup %>%
+  slice_head(., n = 40) %>%
+  mutate(prop = psc_ssc_count / psc_ssc_sum,
+         primaryStopCode = as.character(primaryStopCode),
+         secondaryStopCode = as.character(secondaryStopCode)) %>%
+  select(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName, psc_ssc_count, prop) %>%
+  adorn_totals() %>%
+  mutate(psc_ssc_count = comma(psc_ssc_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.01)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "Count", "Proportion"),
+      align = c(rep("l", 4), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+* And for funsies, here are the bottom 25:
+```{r}
+psc_ssc_count %>%
+  arrange(desc(psc_ssc_count)) %>%
+  ungroup %>%
+  slice_tail(., n = 25) %>%
+  mutate(prop = psc_ssc_count / psc_ssc_sum,
+         primaryStopCode = as.character(primaryStopCode),
+         secondaryStopCode = as.character(secondaryStopCode)) %>%
+  select(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName, psc_ssc_count, prop) %>%
+  adorn_totals() %>%
+  mutate(psc_ssc_count = comma(psc_ssc_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.01)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "Count", "Proportion"),
+      align = c(rep("l", 4), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+# By Provider Type  
+
+```{r}
+provType_psc_ssc_count %>%
+  group_by(provTypeCat) %>%
+  summarise(provType_count = sum(provType_psc_ssc_count, na.rm = T)) %>%
+  arrange(desc(provType_count)) %>%
+  mutate(prop = provType_count / psc_ssc_sum) %>%
+  adorn_totals() %>%
+  mutate(provType_count = comma(provType_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Provider Type", "Count", "Proportion"),
+      full_width = F,
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+## Nursing Primary and Secondary Stop Codes  
+```{r}
+nursing_sum <- provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "Nursing") == T) %>%
+  summarise(total = sum(provType_psc_ssc_count)) %>%
+  pull
+#
+provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "Nursing") == T) %>%
+  group_by(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName) %>%
+  summarise(provType_count = sum(provType_psc_ssc_count, na.rm = T)) %>%
+  ungroup %>%
+  arrange(desc(provType_count)) %>%
+  mutate(prop = provType_count / nursing_sum) %>%
+  slice_head(., n = 25) %>%
+  adorn_totals() %>%
+  mutate(provType_count = comma(provType_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary Stop Code", "SSC Name", "Count", "Proportion"),
+      full_width = F,
+      align = c(rep("l", 4), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+## MD/DO Primary and Secondary Stop Codes  
+```{r}
+md_do_sum <- provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "MD/DO") == T) %>%
+  summarise(total = sum(provType_psc_ssc_count)) %>%
+  pull
+#
+provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "MD/DO") == T) %>%
+  group_by(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName) %>%
+  summarise(provType_count = sum(provType_psc_ssc_count, na.rm = T)) %>%
+  ungroup %>%
+  arrange(desc(provType_count)) %>%
+  mutate(prop = provType_count / md_do_sum) %>%
+  slice_head(., n = 25) %>%
+  adorn_totals() %>%
+  mutate(provType_count = comma(provType_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary Stop Code", "SSC Name", "Count", "Proportion"),
+      full_width = F,
+      align = c(rep("l", 4), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+
+## PA/APN Primary and Secondary Stop Codes  
+```{r}
+pa_apn_sum <- provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "PA/APN") == T) %>%
+  summarise(total = sum(provType_psc_ssc_count)) %>%
+  pull
+#
+provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "PA/APN") == T) %>%
+  group_by(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName) %>%
+  summarise(provType_count = sum(provType_psc_ssc_count, na.rm = T)) %>%
+  ungroup %>%
+  arrange(desc(provType_count)) %>%
+  mutate(prop = provType_count / pa_apn_sum) %>%
+  slice_head(., n = 25) %>%
+  adorn_totals() %>%
+  mutate(provType_count = comma(provType_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary Stop Code", "SSC Name", "Count", "Proportion"),
+      full_width = F,
+      align = c(rep("l", 4), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+
+
+## Pharmacy Primary and Secondary Stop Codes  
+```{r}
+pharm_sum <- provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "Pharm") == T) %>%
+  summarise(total = sum(provType_psc_ssc_count)) %>%
+  pull
+#
+provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "Pharm") == T) %>%
+  group_by(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName) %>%
+  summarise(provType_count = sum(provType_psc_ssc_count, na.rm = T)) %>%
+  ungroup %>%
+  arrange(desc(provType_count)) %>%
+  mutate(prop = provType_count / pharm_sum) %>%
+  slice_head(., n = 25) %>%
+  adorn_totals() %>%
+  mutate(provType_count = comma(provType_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary Stop Code", "SSC Name", "Count", "Proportion"),
+      full_width = F,
+      align = c(rep("l", 4), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+
+
+## Psychologist, etc. Primary and Secondary Stop Codes  
+```{r}
+psych_sum <- provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "Psych") == T) %>%
+  summarise(total = sum(provType_psc_ssc_count)) %>%
+  pull
+#
+provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "Psych") == T) %>%
+  group_by(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName) %>%
+  summarise(provType_count = sum(provType_psc_ssc_count, na.rm = T)) %>%
+  ungroup %>%
+  arrange(desc(provType_count)) %>%
+  mutate(prop = provType_count / psych_sum) %>%
+  slice_head(., n = 25) %>%
+  adorn_totals() %>%
+  mutate(provType_count = comma(provType_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary Stop Code", "SSC Name", "Count", "Proportion"),
+      full_width = F,
+      align = c(rep("l", 4), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+## "Other" Primary and Secondary Stop Codes  
+```{r}
+other_sum <- provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "Other") == T) %>%
+  summarise(total = sum(provType_psc_ssc_count)) %>%
+  pull
+#
+provType_psc_ssc_count %>%
+  filter(str_detect(provTypeCat, "Other") == T) %>%
+  group_by(primaryStopCode, pStopCodeName, secondaryStopCode, sStopCodeName) %>%
+  summarise(provType_count = sum(provType_psc_ssc_count, na.rm = T)) %>%
+  ungroup %>%
+  arrange(desc(provType_count)) %>%
+  mutate(prop = provType_count / other_sum) %>%
+  slice_head(., n = 25) %>%
+  adorn_totals() %>%
+  mutate(provType_count = comma(provType_count, accuracy = 1),
+         prop = percent(prop, accuracy = 0.1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary Stop Code", "SSC Name", "Count", "Proportion"),
+      full_width = F,
+      align = c(rep("l", 4), "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```

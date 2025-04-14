@@ -1,0 +1,331 @@
+---
+title: "VISN 6 Gap Report"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#connecting to a06
+a06_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "VHACDWA06.vha.med.va.gov",
+                      Database = "CDWWork",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+vast_fips <- dbGetQuery(a06_con,
+                       "select stationno, fips, lat, lon
+from [CDWWork].[Dim].VAST")
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag) %>%
+  left_join(., vast_fips, by = c("sta5a" = "stationno"))
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2022-10-01"), ymd("2024-03-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+# scrssn_count <- dbGetQuery(oabi_con,
+#                            "with CTE as(
+#                             	select count(distinct ScrSSN_num) as scrssn_count
+#                             		, sta5a, fy, qtr
+#                             	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+#                             	where fy = 2020
+#                             	group by Sta5a, fy, QTR
+#                             	)
+#                             select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+#                             from CTE
+#                             group by Sta5a") %>%
+#   mutate(scrssn_count_cat = factor(case_when(
+#     scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+#     scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+#     scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+#     scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+#   ), ordered = TRUE,
+#   levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness)
+#--
+  
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+#-------
+#nc_map <- tigris::counties(state = "NC", cb = TRUE)
+```
+
+```{r}
+nc_sta5as <- c("558GA", '558GC', '565GA', '565GF', '590', '590GB', '590GC', '590GD', '590GE', '652GF')
+# 
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [PACT_CC].[CRH].vw_gapMetric
+                         where fy > 2022") %>%
+  mutate(month_char = str_to_title(str_sub(mth, end = 3)),
+         month_num = match(month_char, month.abb),
+         cy = if_else(month_num > 9, as.numeric(fy) - 1, as.numeric(fy)),
+         vssc_month = ymd(str_c(cy, month_num, "01", sep = "-")),
+         gap_metric_capped = if_else(gap_metric > 3, 3, gap_metric),
+         gap_metric_capped = na_if(gap_metric_capped, 0)) %>%
+  select(sta5a = sta6a, vssc_month, gap_metric, fy, gap_metric_capped) %>%
+  distinct() %>%
+  inner_join(., vast)
+
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is report looking at the gap metric of 10 sites in Washington County, NC compared to the rest of the nation and the rest of VISN 6
+* All statistics below are using the `r nrow(dates)` months between October 2022 and March 2024, inclusive
+* There are `r nrow(gap_metric)` observations total
+* There are `r sum(gap_metric$gap_metric > 3, na.rm = T)` observations with a gap metric > 3.0  
+    + I have capped the gap metric at 3.0 
+* There are `r sum(gap_metric$gap_metric == 0, na.rm = T)` observations with a gap metric = 0 
+    + I have replaced all zero gap metric values with NA
+
+$$
+\text{Gap Metric}=\frac{(\text{MD FTE}\times 1,200)(\text{APP FTE}\times 900)}{\text{Total Clinic Assigned Panel Size}}=\frac{\text{Maximum Clinic Patient Capacity}}{\text{Total Clinic Assigned Panel Size}}
+$$
+
+    
+# By VISN  
+```{r}
+gap_metric %>%
+  distinct %>%
+  inner_join(., vast) %>%
+  group_by(parent_visn) %>%
+  summarise(sta5a_count = n_distinct(sta5a),
+            mean_gap = mean(gap_metric_capped, na.rm = T),
+            sd_gap = sd(gap_metric_capped, na.rm = T),
+            pct_025 = quantile(gap_metric_capped, 0.025, na.rm = T),
+            pct_975 = quantile(gap_metric_capped, 0.975, na.rm = T),
+            pct_10 = quantile(gap_metric_capped, 0.10, na.rm = T),
+            pct_90 = quantile(gap_metric_capped, 0.90, na.rm = T)) %>%
+  mutate(mean_sd = paste0(comma(mean_gap, accuracy = 0.01), " (", comma(sd_gap, accuracy = 0.01), ")"),
+         qtl_1 = paste0("[", comma(pct_10, accuracy = 0.01), ", ", comma(pct_90, accuracy = 0.01), "]"),
+         qtl_2 = paste0("[", comma(pct_025, accuracy = 0.01), ", ", comma(pct_975, accuracy = 0.01), "]")) %>%
+  select(parent_visn, sta5a_count, mean_sd, qtl_1, qtl_2) %>%
+  adorn_totals() %>%
+  kbl(col.names = c("VISN", "Sta5a Count", "Mean Gap (SD)", "[10th %-ile, 90th %-ile]", "[2.5th%-ile, 97.5th %-ile]"),
+      align = c("c", rep("r", 4))) %>%
+  kable_classic("striped", 
+                full_width = F) %>%
+  row_spec(c(0, 19), bold = T)
+```
+
+## Is VISN 6 Different?  
+
+```{r}
+gap_metric %>%
+  inner_join(., vast) %>%
+  mutate(visn_06_flag = factor(if_else(parent_visn == "06", "VISN 6", "Not VISN 6"), ordered = F)) %>%
+  ggplot(data = .,
+         aes(x = visn_06_flag, y = gap_metric_capped, fill = visn_06_flag)) +
+  geom_boxplot() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "Gap Metric")
+#--
+gap_metric %>%
+  inner_join(., vast) %>%
+  mutate(visn_06_flag = factor(if_else(parent_visn == "06", 1, 0), ordered = F),
+         visn_06_flag = relevel(visn_06_flag, ref = "0")) %>%
+  lm(gap_metric_capped ~ visn_06_flag,
+      data = .) %>%
+  tab_model()
+```
+
+* No, in the period between October 2022 and March 2024 sta5as in VISN 6 had a non-significant 0.01-unit greater Gap Metric than sta5as in the rest of the nation (p=0.36) 
+
+
+# VISN 6  
+
+```{r}
+gap_metric %>%
+  inner_join(., vast) %>%
+  filter(parent_visn == "06") %>%
+  group_by(sta5a, short_name) %>%
+  summarise(mean_gap = mean(gap_metric_capped, na.rm = T),
+            sd_gap = sd(gap_metric_capped, na.rm = T),
+            pct_025 = quantile(gap_metric_capped, 0.025, na.rm = T),
+            pct_975 = quantile(gap_metric_capped, 0.975, na.rm = T),
+            pct_10 = quantile(gap_metric_capped, 0.10, na.rm = T),
+            pct_90 = quantile(gap_metric_capped, 0.90, na.rm = T)) %>%
+  mutate(mean_sd = paste0(comma(mean_gap, accuracy = 0.01), " (", comma(sd_gap, accuracy = 0.01), ")"),
+         qtl_1 = paste0("[", comma(pct_10, accuracy = 0.01), ", ", comma(pct_90, accuracy = 0.01), "]"),
+         qtl_2 = paste0("[", comma(pct_025, accuracy = 0.01), ", ", comma(pct_975, accuracy = 0.01), "]")) %>%
+  arrange(desc(mean_gap)) %>%
+  select(sta5a, short_name, mean_sd, qtl_1, qtl_2) %>%
+  DT::datatable(.,
+                colnames = c("Sta6a", "Site Name", "Mean Gap (SD)", "[10th %-ile, 90th %-ile]", "[2.5th%-ile, 97.5th %-ile]"),
+                options = list(pageLength = 12))
+```
+
+## Is Washington County Different?  
+
+```{r}
+gap_metric %>%
+  inner_join(., vast) %>%
+  mutate(wash_cty_flag = factor(if_else(sta5a %in% nc_sta5as, "Washington County", "Not Washington County"), ordered = F)) %>%
+  ggplot(data = .,
+         aes(x = wash_cty_flag, y = gap_metric_capped, fill = wash_cty_flag)) +
+  geom_boxplot() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "Gap Metric")
+#
+gap_metric %>%
+  inner_join(., vast) %>%
+  mutate(wash_cty_flag = factor(if_else(sta5a %in% nc_sta5as, 1, 0), ordered = F),
+         wash_cty_flag = relevel(wash_cty_flag, ref = "0")) %>%
+  lm(gap_metric_capped ~ wash_cty_flag,
+      data = .) %>%
+  tab_model()
+```
+
+* Yes, in the period between October 2022 and March 2024 the 10 sta5as in Washington County had a 0.21 point lower (i.e., -0.21; p<0.001) Gap Metric compared to sta5as in the rest of the nation
+
+
+# Washington County  
+
+```{r}
+gap_metric %>%
+  inner_join(., vast) %>%
+  filter(sta5a %in% nc_sta5as) %>%
+  group_by(sta5a, short_name) %>%
+  summarise(mean_gap = mean(gap_metric_capped, na.rm = T),
+            sd_gap = sd(gap_metric_capped, na.rm = T),
+            pct_025 = quantile(gap_metric_capped, 0.025, na.rm = T),
+            pct_975 = quantile(gap_metric_capped, 0.975, na.rm = T),
+            pct_10 = quantile(gap_metric_capped, 0.10, na.rm = T),
+            pct_90 = quantile(gap_metric_capped, 0.90, na.rm = T),
+            n_obs = n()) %>%
+  mutate(mean_sd = paste0(comma(mean_gap, accuracy = 0.01), " (", comma(sd_gap, accuracy = 0.01), ")"),
+         qtl_1 = paste0("[", comma(pct_10, accuracy = 0.01), ", ", comma(pct_90, accuracy = 0.01), "]"),
+         qtl_2 = paste0("[", comma(pct_025, accuracy = 0.01), ", ", comma(pct_975, accuracy = 0.01), "]")) %>%
+  arrange(desc(mean_gap)) %>%
+  select(sta5a, short_name, mean_sd, qtl_1, qtl_2) %>%
+  kbl(col.names = c("Sta6a", "Site Name", "Mean Gap (SD)", "[10th %-ile, 90th %-ile]", "[2.5th%-ile, 97.5th %-ile]"),
+      align = c("l", "l", rep("r", 3))) %>%
+  kable_classic("striped", 
+                full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+
+## Is Washington County Different Than The Rest of VISN 6?  
+
+```{r}
+gap_metric %>%
+  inner_join(., vast) %>%
+  filter(parent_visn == "06") %>%
+  mutate(wash_cty_flag = factor(if_else(sta5a %in% nc_sta5as, "Washington County", "Not Washington County"), ordered = F)) %>%
+  ggplot(data = .,
+         aes(x = wash_cty_flag, y = gap_metric_capped, fill = wash_cty_flag)) +
+  geom_boxplot() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "Gap Metric")
+#----
+gap_metric %>%
+  inner_join(., vast) %>%
+  filter(parent_visn == "06") %>%
+  mutate(wash_cty_flag = factor(if_else(sta5a %in% nc_sta5as, 1, 0), ordered = F),
+         wash_cty_flag = relevel(wash_cty_flag, ref = "0")) %>%
+  lm(gap_metric_capped ~ wash_cty_flag,
+      data = .) %>%
+  tab_model()
+```
+
+* Yes, in the period between October 2022 and March 2024 the 10 sta5as in Washington County had a 0.29 point lower (i.e., -0.29; p<0.001) Gap Metric compared to sta5as in the rest of VISN 6

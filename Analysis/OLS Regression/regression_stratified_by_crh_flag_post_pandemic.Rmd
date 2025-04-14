@@ -1,0 +1,937 @@
+---
+title: "PC CRH Analysis: Comparing Regression Slopes"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+pactcc_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         initiated_pc_crh_b4_march_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-03-01"), TRUE, FALSE),
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#
+pilot_sites <- dbGetQuery(pactcc_con,
+                          "select distinct spoke_sta5a, vimpact_pilot
+                          from PACT_CC.CRH.CRH_sites_FY20_working 
+                          UNION
+                          select distinct spoke_sta5a, vimpact_pilot
+                          from PACT_CC.CRH.CRH_sites_FY21_working ") %>%
+  filter(vimpact_pilot == 1) %>%
+  select(sta5a = spoke_sta5a)
+#--
+sta5as_w_gt9 <- crh_flag %>%
+  filter(first_6_mos_w_10_flag == 1) %>%
+  select(sta5a) %>% pull
+#
+ps_matched <- read_csv("H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/CRH_r_project/Input/Data/ps_matched_sta5as.csv")
+#
+ps_groups_w_gt9 <- ps_matched %>%
+  filter(at_least_10_pc_crh_flag == 1
+         & sta5a %in% sta5as_w_gt9) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a) %>%
+  pull
+#
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#==
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#
+dates <- access_metrics %>%
+  filter(vssc_month >= ymd("2021-03-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#
+scrssn_count <- dbGetQuery(pactcc_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2019
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy19, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy19 < 450 ~ "< 450",
+    scrssn_count_avg_fy19 >= 450 & scrssn_count_avg_fy19 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy19 >= 2400 & scrssn_count_avg_fy19 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy19 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#
+vline_xint <- as.numeric(ymd("2019-10-01"))
+```
+
+```{r}
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#
+sta5as_to_include <- access_metrics %>%
+  select(sta5a) %>%
+  inner_join(., vast %>% select(sta5a, s_abbr)) %>%
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, "PC CRH", "No PC CRH")) %>%
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F 
+         & str_detect(s_abbr, "CBOC")
+           & scrssn_count_cat != "< 450")
+#-----
+scrssn_cat_count <- sta5as_to_include %>%
+  group_by(crh_flag, scrssn_count_cat) %>%
+  summarise(count = n()) %>%
+  mutate(count = as.character(count)) %>%
+  pivot_wider(names_from = scrssn_count_cat, values_from = count)
+#=================
+model_1a <- access_metrics %>%
+      inner_join(., sta5as_to_include) %>%
+      filter(vssc_month >= ymd("2021-03-01")) %>%
+      left_join(., dates) %>%
+      left_join(., crh_flag %>% select(sta5a, first_6_mos_w_10_flag)) %>%
+      mutate(all_first_6_months = if_else(sta5a %in% ps_groups_w_gt9, 
+                                          "All First 6 Months", "Not All First 6 Months"),
+             tna_drop = if_else(third_next_avail > 100, TRUE, FALSE)) %>%
+  filter(tna_drop == FALSE)
+```
+
+
+```{r functions}
+table_fxn <- function(access_metric, scrssn_cat){
+  access_metric_var <- ensym(access_metric)
+  #
+  y_axis_lab <- if (str_detect(access_metric, "est") == T){
+    "Established Patient Wait Time"
+  }
+  else if (str_detect(access_metric, "new") == T){
+    "New Patient Wait Time"
+  }
+  else if (str_detect(access_metric, "third") == T){
+    "Third Next Available"
+  }
+  else if (str_detect(access_metric, "tc_success_prop") == T){
+    "Timely Care Success Rate"
+  }
+  #-----
+  scrssn_cat_count <- if(missing(scrssn_cat)){
+    sta5as_to_include %>%
+      group_by(crh_flag, scrssn_count_cat) %>%
+      summarise(count = n()) %>%
+      mutate(count = as.character(count)) %>%
+      pivot_wider(names_from = scrssn_count_cat, values_from = count)
+  }
+  else{
+    sta5as_to_include %>%
+      filter(scrssn_count_cat == !!scrssn_cat) %>%
+      group_by(crh_flag, scrssn_count_cat) %>%
+      summarise(count = n()) %>%
+      mutate(count = as.character(count)) %>%
+      pivot_wider(names_from = scrssn_count_cat, values_from = count)
+  }
+  #--
+  if(missing(scrssn_cat)){
+    ttest_uniques <- t.test(scrssn_count_avg_fy19 ~ crh_flag, data = model_1a)
+    uniques_pval <- if_else(ttest_uniques$p.value < 0.001, "<0.001", comma(ttest_uniques$p.value, accuracy = 0.001))
+    #
+    ttest_value <- if (str_detect(access_metric, "est") == T){
+      t.test(est_pc_pt_wt ~ crh_flag, data = model_1a)
+    }
+    else if (str_detect(access_metric, "new") == T){
+      t.test(new_pc_pt_wt ~ crh_flag, data = model_1a)
+    }
+    else if (str_detect(access_metric, "third") == T){
+      t.test(third_next_avail ~ crh_flag, data = model_1a)
+    }
+    else if (str_detect(access_metric, "tc_success_prop") == T){
+      t.test(tc_success_prop ~ crh_flag, data = model_1a)
+    }
+    value_pval <- if_else(ttest_value$p.value < 0.001, "<0.001", comma(ttest_value$p.value, accuracy = 0.001))
+    #
+    ttest_df <- tibble(
+      table_labs = c("Average Uniques in PCMM (SD)",
+                     paste0("Average ", y_axis_lab, " (SD)"),
+                     paste0("Median ", y_axis_lab),
+                     "25th and 75th percentiles",
+                     "Sta5as with 450 - 2,399 Uniques",
+                     "Sta5as with 2,400 - 9,999 Uniques",
+                     "Sta5as with > 10,000 Uniques"),
+      pvals = c(uniques_pval,
+                value_pval,
+                "-", "-","-", "-", "-")
+    )
+    #
+    model_1a %>%
+      group_by(crh_flag) %>%
+      summarise(avg_pcmm = mean(scrssn_count_avg_fy19, na.rm = T),
+                sd_pcmm = sd(scrssn_count_avg_fy19, na.rm = T),
+                pcmm_lab = paste0(comma(avg_pcmm, accuracy = 1), 
+                                  " (", comma(sd_pcmm, accuracy = 0.1), ")"),
+                avg_val = mean(!!access_metric_var, na.rm = T),
+                sd_val = sd(!!access_metric_var, na.rm = T),
+                val_lab = paste0(comma(avg_val, accuracy = 0.1),
+                                 " (", comma(sd_val, accuracy = 0.1), ")"),
+                median_lab = comma(median(!!access_metric_var, na.rm = T), accuracy = 0.1),
+                qtl_25 = quantile(!!access_metric_var, 0.25, na.rm = T),
+                qtl_75 = quantile(!!access_metric_var, 0.75, na.rm = T),
+                qtl_lab = paste0("[", comma(qtl_25, accuracy = 0.1), ", ",
+                                 comma(qtl_75, accuracy = 0.1), "]")) %>%
+      select(crh_flag, ends_with("_lab")) %>%
+      left_join(., scrssn_cat_count) %>%
+      pivot_longer(-crh_flag) %>%
+      pivot_wider(names_from = crh_flag, values_from = value) %>%
+      mutate(table_labs = case_when(
+        name == "pcmm_lab" ~ "Average Uniques in PCMM (SD)",
+        name == "val_lab" ~ paste0("Average ", y_axis_lab, " (SD)"),
+        name == "median_lab" ~ paste0("Median ", y_axis_lab),
+        name == "qtl_lab" ~ "25th and 75th percentiles",
+        name == "450 - 2,399" ~ "Sta5as with 450 - 2,399 Uniques",
+        name == "2,400 - 9,999" ~ "Sta5as with 2,400 - 9,999 Uniques",
+        name == "10,000+" ~ "Sta5as with > 10,000 Uniques")) %>%
+      select(4, 2, 3) %>%
+      left_join(., ttest_df) %>%
+      kbl(col.names = c("", "No PC CRH", "PC CRH", "p-value"),
+          align = c("l", "r", "r", "r")) %>%
+      kable_classic("striped") %>%
+      row_spec(0, bold = TRUE)
+  }
+  else{
+    model_1a <- model_1a %>%
+      filter(scrssn_count_cat == !!scrssn_cat)
+    #
+    ttest_uniques <- t.test(scrssn_count_avg_fy19 ~ crh_flag, data = model_1a)
+    uniques_pval <- if_else(ttest_uniques$p.value < 0.001, "<0.001", comma(ttest_uniques$p.value, accuracy = 0.001))
+    #
+    ttest_value <- if (str_detect(access_metric, "est") == T){
+      t.test(est_pc_pt_wt ~ crh_flag, data = model_1a)
+    }
+    else if (str_detect(access_metric, "new") == T){
+      t.test(new_pc_pt_wt ~ crh_flag, data = model_1a)
+    }
+    else if (str_detect(access_metric, "third") == T){
+      t.test(third_next_avail ~ crh_flag, data = model_1a)
+    }
+    else if (str_detect(access_metric, "tc_success_prop") == T){
+      t.test(tc_success_prop ~ crh_flag, data = model_1a)
+    }
+    value_pval <- if_else(ttest_value$p.value < 0.001, "<0.001", comma(ttest_value$p.value, accuracy = 0.001))
+    #
+    ttest_df <- tibble(
+      table_labs = c("Average Uniques in PCMM (SD)",
+                     paste0("Average ", y_axis_lab, " (SD)"),
+                     paste0("Median ", y_axis_lab),
+                     "25th and 75th percentiles",
+                     "Sta5as with 450 - 2,399 Uniques",
+                     "Sta5as with 2,400 - 9,999 Uniques",
+                     "Sta5as with > 10,000 Uniques"),
+      pvals = c(uniques_pval,
+                value_pval,
+                "-", "-","-", "-", "-")
+    )
+    #
+    if(str_detect(access_metric, "tc_success") != T){
+      crh_lm <- model_1a %>% 
+        filter(crh_flag == "PC CRH") %>%
+        select(time, metric = !!access_metric_var) %>%
+        lm(metric ~ time, data = .)
+      #
+      pred_crh_df <- tibble(
+        crh_flag = c("PC CRH", "PC CRH"),
+        time = c(1, 17)
+      )
+      #
+      noCrh_lm <- model_1a %>% 
+        filter(crh_flag == "No PC CRH") %>%
+        select(time, metric = !!access_metric_var) %>%
+        lm(metric ~ time, data = .)
+      #
+      pred_noCrh_df <- tibble(
+        crh_flag = c("No PC CRH", "No PC CRH"),
+        time = c(1, 17)
+      )
+      #--
+      value_t1 <- tibble(
+        table_labs = paste0("Predicted ", y_axis_lab, " in March, 2021"),
+        "No PC CRH" = comma(predict.lm(noCrh_lm, pred_noCrh_df)[1], accuracy = 0.1),
+        "PC CRH" = comma(predict.lm(crh_lm, pred_crh_df)[1], accuracy = 0.1),
+        pvals = "-"
+      )
+      #--
+      value_t17 <- tibble(
+        table_labs = paste0("Predicted ", y_axis_lab, " in July, 2022"),
+        "No PC CRH" = comma(predict.lm(noCrh_lm, pred_noCrh_df)[2], accuracy = 0.1),
+        "PC CRH" = comma(predict.lm(crh_lm, pred_crh_df)[2], accuracy = 0.1),
+        pvals = "-"
+      )
+      #
+      model_1a  %>%
+        group_by(crh_flag) %>%
+        summarise(avg_pcmm = mean(scrssn_count_avg_fy19, na.rm = T),
+                  sd_pcmm = sd(scrssn_count_avg_fy19, na.rm = T),
+                  pcmm_lab = paste0(comma(avg_pcmm, accuracy = 1), 
+                                    " (", comma(sd_pcmm, accuracy = 0.1), ")"),
+                  avg_val = mean(!!access_metric_var, na.rm = T),
+                  sd_val = sd(!!access_metric_var, na.rm = T),
+                  val_lab = paste0(comma(avg_val, accuracy = 0.1),
+                                   " (", comma(sd_val, accuracy = 0.1), ")"),
+                  median_lab = comma(median(!!access_metric_var, na.rm = T), accuracy = 0.1),
+                  qtl_25 = quantile(!!access_metric_var, 0.25, na.rm = T),
+                  qtl_75 = quantile(!!access_metric_var, 0.75, na.rm = T),
+                  qtl_lab = paste0("[", comma(qtl_25, accuracy = 0.1), ", ",
+                                   comma(qtl_75, accuracy = 0.1), "]")) %>%
+        select(crh_flag, ends_with("_lab")) %>%
+        left_join(., scrssn_cat_count) %>%
+        pivot_longer(-crh_flag) %>%
+        pivot_wider(names_from = crh_flag, values_from = value) %>%
+        mutate(table_labs = case_when(
+          name == "pcmm_lab" ~ "Average Uniques in PCMM (SD)",
+          name == "val_lab" ~ paste0("Average ", y_axis_lab, " (SD)"),
+          name == "median_lab" ~ paste0("Median ", y_axis_lab),
+          name == "qtl_lab" ~ "25th and 75th percentiles",
+          name == "450 - 2,399" ~ "Sta5as with 450 - 2,399 Uniques",
+          name == "2,400 - 9,999" ~ "Sta5as with 2,400 - 9,999 Uniques",
+          name == "10,000+" ~ "Sta5as with > 10,000 Uniques")) %>%
+        select(4, 2, 3) %>%
+        left_join(., ttest_df) %>%
+        bind_rows(., value_t1) %>%
+        bind_rows(., value_t17) %>%
+        kbl(col.names = c("", "No PC CRH", "PC CRH", "p-value"),
+            align = c("l", "r", "r", "r")) %>%
+        kable_classic("striped") %>%
+        row_spec(0, bold = TRUE)
+    }
+    else{
+      crh_lm <- model_1a %>% 
+        filter(crh_flag == "PC CRH") %>%
+        lm(tc_success_prop ~ time, data = .)
+      #
+      pred_crh_df <- tibble(
+        crh_flag = c("PC CRH", "PC CRH"),
+        time = c(1, 17)
+      )
+      #
+      noCrh_lm <- model_1a %>% 
+        filter(crh_flag == "No PC CRH") %>%
+        lm(tc_success_prop ~ time, data = .)
+      pred_noCrh_df <- tibble(
+        crh_flag = c("No PC CRH", "No PC CRH"),
+        time = c(1, 17)
+      )
+      #--
+      value_t1 <- tibble(
+        table_labs = paste0("Predicted ", y_axis_lab, " in March, 2021"),
+        "No PC CRH" = percent(predict.lm(noCrh_lm, pred_noCrh_df)[1], accuracy = 0.1),
+        "PC CRH" = percent(predict.lm(crh_lm, pred_crh_df)[1], accuracy = 0.1),
+        pvals = "-"
+      )
+      #--
+      value_t17 <- tibble(
+        table_labs = paste0("Predicted ", y_axis_lab, " in July, 2022"),
+        "No PC CRH" = percent(predict.lm(noCrh_lm, pred_noCrh_df)[2], accuracy = 0.1),
+        "PC CRH" = percent(predict.lm(crh_lm, pred_crh_df)[2], accuracy = 0.1),
+        pvals = "-"
+      )
+      #
+      model_1a  %>%
+        group_by(crh_flag) %>%
+        summarise(avg_pcmm = mean(scrssn_count_avg_fy19, na.rm = T),
+                  sd_pcmm = sd(scrssn_count_avg_fy19, na.rm = T),
+                  pcmm_lab = paste0(comma(avg_pcmm, accuracy = 1), 
+                                    " (", comma(sd_pcmm, accuracy = 0.1), ")"),
+                  avg_val = mean(!!access_metric_var, na.rm = T),
+                  sd_val = sd(!!access_metric_var, na.rm = T),
+                  val_lab = paste0(percent(avg_val, accuracy = 0.1),
+                                   " (", percent(sd_val, accuracy = 0.1), ")"),
+                  median_lab = percent(median(!!access_metric_var, na.rm = T), accuracy = 0.1),
+                  qtl_25 = quantile(!!access_metric_var, 0.25, na.rm = T),
+                  qtl_75 = quantile(!!access_metric_var, 0.75, na.rm = T),
+                  qtl_lab = paste0("[", percent(qtl_25, accuracy = 0.1), ", ",
+                                   percent(qtl_75, accuracy = 0.1), "]")) %>%
+        select(crh_flag, ends_with("_lab")) %>%
+        left_join(., scrssn_cat_count) %>%
+        pivot_longer(-crh_flag) %>%
+        pivot_wider(names_from = crh_flag, values_from = value) %>%
+        mutate(table_labs = case_when(
+          name == "pcmm_lab" ~ "Average Uniques in PCMM (SD)",
+          name == "val_lab" ~ paste0("Average ", y_axis_lab, " (SD)"),
+          name == "median_lab" ~ paste0("Median ", y_axis_lab),
+          name == "qtl_lab" ~ "25th and 75th percentiles",
+          name == "450 - 2,399" ~ "Sta5as with 450 - 2,399 Uniques",
+          name == "2,400 - 9,999" ~ "Sta5as with 2,400 - 9,999 Uniques",
+          name == "10,000+" ~ "Sta5as with > 10,000 Uniques")) %>%
+        select(4, 2, 3) %>%
+        left_join(., ttest_df) %>%
+        bind_rows(., value_t1) %>%
+        bind_rows(., value_t17) %>%
+        kbl(col.names = c("", "No PC CRH", "PC CRH", "p-value"),
+            align = c("l", "r", "r", "r")) %>%
+        kable_classic("striped") %>%
+        row_spec(0, bold = TRUE)
+    }
+  }
+}
+
+#===============================
+plot_fxn <- function(access_metric, pcmm_cat){
+  access_metric_var <- ensym(access_metric)
+  #
+  y_axis_lab <- if (str_detect(access_metric, "est") == T){
+    "Established Patient Wait Time"
+  }
+  else if (str_detect(access_metric, "new") == T){
+    "New Patient Wait Time"
+  }
+  else if (str_detect(access_metric, "third") == T){
+    "Third Next Available"
+  }
+  else if (str_detect(access_metric, "tc_success_prop") == T){
+    "Timely Care Success Rate"
+  }
+  #-----
+  model_1a <- if (str_detect(access_metric, "third") != T){access_metrics %>%
+                    select(sta5a, vssc_month, access_metric_var) %>%
+                    inner_join(., sta5as_to_include) %>%
+                    filter(vssc_month >= ymd("2021-03-01")) %>%
+                    left_join(., dates) %>%
+                    left_join(., crh_flag %>% select(sta5a, first_6_mos_w_10_flag)) %>%
+                    mutate(all_first_6_months = if_else(sta5a %in% ps_groups_w_gt9, 
+                                                        "All First 6 Months", "Not All First 6 Months")) %>%
+                    filter(scrssn_count_cat == !!pcmm_cat)}
+              else{access_metrics %>%
+                    select(sta5a, vssc_month, access_metric_var) %>%
+                    inner_join(., sta5as_to_include) %>%
+                    filter(vssc_month >= ymd("2021-03-01")) %>%
+                    left_join(., dates) %>%
+                    left_join(., crh_flag %>% select(sta5a, first_6_mos_w_10_flag)) %>%
+                    mutate(all_first_6_months = if_else(sta5a %in% ps_groups_w_gt9, 
+                                                        "All First 6 Months", "Not All First 6 Months")) %>%
+                    filter(third_next_avail < 100) %>%
+                    filter(scrssn_count_cat == !!pcmm_cat)}
+  #--
+  p2 <- ggplot(data = model_1a,
+               aes(x = vssc_month, y = !!access_metric_var, group = sta5a)) +
+    geom_vline(xintercept = vline_xint,
+               lty = 3) +
+    scale_x_date() +
+    geom_line(alpha = 0.35) +
+    geom_smooth(aes(x = vssc_month, y = !!access_metric_var, group = crh_flag, lty = crh_flag),
+                color = "red",
+                inherit.aes = FALSE,
+                se = TRUE,
+                method = "lm") +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    ggsci::scale_color_d3() +
+    guides(color = guide_legend(override.aes = list(size = 2))) +
+    labs(y = y_axis_lab)
+  #==========================
+  if (str_detect(access_metric, "tc_") == T){
+    print(p2 + scale_y_continuous(labels = percent_format(accuracy = 1)))
+  }
+  else {
+    print(p2)
+  }
+}
+#------------------------
+regression_fxn <- function(access_metric, pcmm_cat){
+   reg_label <- if (str_detect(access_metric, "est") == T){
+    "Established Patient Wait Time"
+  }
+  else if (str_detect(access_metric, "new") == T){
+    "New Patient Wait Time"
+  }
+  else if (str_detect(access_metric, "third") == T){
+    "Third Next Available"
+  }
+  else if (str_detect(access_metric, "tc_success_prop") == T){
+    "Timely Care Success Rate"
+  }
+  #==
+  reg_df_crh <- if(missing(pcmm_cat)){model_1a}
+  else {model_1a %>%
+    filter(scrssn_count_cat == !!pcmm_cat)}
+  #==
+  lm_crh <- if (str_detect(access_metric, "est") == T){
+    lm(est_pc_pt_wt ~ time*crh_flag, data = reg_df_crh)
+  }
+  else if (str_detect(access_metric, "new") == T){
+    lm(new_pc_pt_wt ~ time*crh_flag, data = reg_df_crh)
+  }
+  else if (str_detect(access_metric, "third") == T){
+    lm(third_next_avail ~ time*crh_flag, data = reg_df_crh)
+  }
+  else if (str_detect(access_metric, "tc_success_prop") == T){
+    lm(tc_success_prop ~ time*crh_flag, data = reg_df_crh)
+  }
+  tab_model(lm_crh,
+            show.se = TRUE,
+            dv.labels = reg_label,
+            pred.labels = c(
+              "Intercept", "Time",
+              "PC CRH (vs. No PC CRH)",
+              "Time X PC CRH"
+            ))
+}
+#=============
+regression_table_fxn <- function(access_metric, pcmm_cat){
+  reg_label <- if (str_detect(access_metric, "est") == T){
+    "Established Patient Wait Time"
+  }
+  else if (str_detect(access_metric, "new") == T){
+    "New Patient Wait Time"
+  }
+  else if (str_detect(access_metric, "third") == T){
+    "Third Next Available"
+  }
+  else if (str_detect(access_metric, "tc_success_prop") == T){
+    "Timely Care Success Rate"
+  }
+  #==
+  reg_df_crh <- if(missing(pcmm_cat)){model_1a %>%
+    filter(crh_flag == "PC CRH")}
+  else {model_1a %>%
+    filter(scrssn_count_cat == !!pcmm_cat 
+           & crh_flag == "PC CRH")}
+  #==
+  lm_crh <- if (str_detect(access_metric, "est") == T){
+    lm(est_pc_pt_wt ~ time, data = reg_df_crh)
+  }
+  else if (str_detect(access_metric, "new") == T){
+    lm(new_pc_pt_wt ~ time, data = reg_df_crh)
+  }
+  else if (str_detect(access_metric, "third") == T){
+    lm(third_next_avail ~ time, data = reg_df_crh)
+  }
+  else if (str_detect(access_metric, "tc_success_prop") == T){
+    lm(tc_success_prop ~ time, data = reg_df_crh)
+  }
+  #--
+  reg_df_noCrh <- if(missing(pcmm_cat)){model_1a %>%
+    filter(crh_flag == "No PC CRH")}
+  else {model_1a %>%
+    filter(scrssn_count_cat == !!pcmm_cat 
+           & crh_flag == "No PC CRH")}
+  #==
+  lm_noCrh <- if (str_detect(access_metric, "est") == T){
+    lm(est_pc_pt_wt ~ time, data = reg_df_noCrh)
+  }
+  else if (str_detect(access_metric, "new") == T){
+    lm(new_pc_pt_wt ~ time, data = reg_df_noCrh)
+  }
+  else if (str_detect(access_metric, "third") == T){
+    lm(third_next_avail ~ time, data = reg_df_noCrh)
+  }
+  else if (str_detect(access_metric, "tc_success_prop") == T){
+    lm(tc_success_prop ~ time, data = reg_df_noCrh)
+  }
+  tab_model(lm_crh, lm_noCrh,
+            show.se = TRUE,
+            pred.labels = c("Intercept", "Time (month)"),
+            dv.labels = c("PC CRH", "No PC CRH"))
+}
+```
+
+# Established Patient Wait Time  
+
+```{r}
+ggplot(data = model_1a,
+               aes(x = vssc_month, y = est_pc_pt_wt, group = sta5a)) +
+    geom_vline(xintercept = vline_xint,
+               lty = 3) +
+    scale_x_date() +
+    geom_line(alpha = 0.35) +
+    geom_smooth(aes(x = vssc_month, y = est_pc_pt_wt, group = crh_flag, lty = crh_flag),
+                color = "red",
+                inherit.aes = FALSE,
+                se = TRUE,
+                method = "lm") +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    ggsci::scale_color_d3() +
+    guides(color = guide_legend(override.aes = list(size = 2))) +
+    labs(y = "Established Patient Wait Time")
+```
+
+## Overall  
+```{r, results = 'asis'}
+table_fxn("est_pc_pt_wt")
+```
+
+```{r}
+regression_fxn("est_pc_pt_wt")
+regression_table_fxn("est_pc_pt_wt")
+```
+
+## 450 - 2,399 Uniques in PCMM  
+
+```{r est_table1, results = 'asis'}
+table_fxn("est_pc_pt_wt", "450 - 2,399")
+```
+
+
+```{r est_plot1}
+plot_fxn("est_pc_pt_wt", "450 - 2,399")
+```
+
+```{r est_reg1}
+regression_fxn("est_pc_pt_wt", "450 - 2,399")
+```
+
+```{r}
+regression_table_fxn("est_pc_pt_wt", "450 - 2,399")
+```
+
+## 2,400 - 9,999 Uniques in PCMM  
+```{r est_table2, results = 'asis'}
+table_fxn("est_pc_pt_wt", "2,400 - 9,999")
+```
+
+```{r est_plot2}
+plot_fxn("est_pc_pt_wt", "2,400 - 9,999")
+```
+
+```{r est_reg2}
+regression_fxn("est_pc_pt_wt", "2,400 - 9,999")
+```
+
+```{r}
+regression_table_fxn("est_pc_pt_wt", "2,400 - 9,999")
+```
+
+## 10,000+ Uniques in PCMM  
+```{r est_table3, results = 'asis'}
+table_fxn("est_pc_pt_wt", "10,000+")
+```
+
+```{r est_plot3}
+plot_fxn("est_pc_pt_wt", "10,000+")
+```
+
+```{r est_reg3}
+regression_fxn("est_pc_pt_wt", "10,000+")
+```
+
+```{r}
+regression_table_fxn("est_pc_pt_wt", "10,000+")
+```
+
+# New Patient Wait Time  
+
+```{r}
+ggplot(data = model_1a,
+               aes(x = vssc_month, y = new_pc_pt_wt, group = sta5a)) +
+    geom_vline(xintercept = vline_xint,
+               lty = 3) +
+    scale_x_date() +
+    geom_line(alpha = 0.35) +
+    geom_smooth(aes(x = vssc_month, y = new_pc_pt_wt, group = crh_flag, lty = crh_flag),
+                color = "red",
+                inherit.aes = FALSE,
+                se = TRUE,
+                method = "lm") +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    ggsci::scale_color_d3() +
+    guides(color = guide_legend(override.aes = list(size = 2))) +
+    labs(y = "New Patient Wait Time")
+```
+
+## Overall  
+```{r, results = 'asis'}
+table_fxn("new_pc_pt_wt")
+```
+
+```{r}
+regression_fxn("new_pc_pt_wt")
+regression_table_fxn("new_pc_pt_wt")
+```
+
+## 450 - 2,399 Uniques in PCMM  
+```{r new_table1, results = 'asis'}
+table_fxn("new_pc_pt_wt", "450 - 2,399")
+```
+
+```{r new_plot1}
+plot_fxn("new_pc_pt_wt", "450 - 2,399")
+```
+
+```{r new_reg1}
+regression_fxn("new_pc_pt_wt", "450 - 2,399")
+```
+
+```{r}
+regression_table_fxn("new_pc_pt_wt", "450 - 2,399")
+```
+
+## 2,400 - 9,999 Uniques in PCMM  
+```{r new_table2, results = 'asis'}
+table_fxn("new_pc_pt_wt", "2,400 - 9,999")
+```
+
+```{r new_plot2}
+plot_fxn("new_pc_pt_wt", "2,400 - 9,999")
+```
+
+```{r new_reg2}
+regression_fxn("new_pc_pt_wt", "2,400 - 9,999")
+```
+
+```{r}
+regression_table_fxn("new_pc_pt_wt", "2,400 - 9,999")
+```
+
+## 10,000+ Uniques in PCMM  
+```{r new_table3, results = 'asis'}
+table_fxn("new_pc_pt_wt", "10,000+")
+```
+
+```{r new_plot3}
+plot_fxn("new_pc_pt_wt", "10,000+")
+```
+
+```{r new_reg3}
+regression_fxn("new_pc_pt_wt", "10,000+")
+```
+
+```{r}
+regression_table_fxn("new_pc_pt_wt", "10,000+")
+```
+
+# Third Next Available    
+
+
+```{r}
+ggplot(data = model_1a,
+               aes(x = vssc_month, y = third_next_avail, group = sta5a)) +
+    geom_vline(xintercept = vline_xint,
+               lty = 3) +
+    scale_x_date() +
+    geom_line(alpha = 0.35) +
+    geom_smooth(aes(x = vssc_month, y = third_next_avail, group = crh_flag, lty = crh_flag),
+                color = "red",
+                inherit.aes = FALSE,
+                se = TRUE,
+                method = "lm") +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    ggsci::scale_color_d3() +
+    guides(color = guide_legend(override.aes = list(size = 2))) +
+    labs(y = "Third Next Available")
+```
+
+## Overall  
+```{r, results = 'asis'}
+table_fxn("third_next_avail")
+```
+
+```{r}
+regression_fxn("third_next_avail")
+regression_table_fxn("third_next_avail")
+```
+
+## 450 - 2,399 Uniques in PCMM  
+```{r tna_table1, results = 'asis'}
+table_fxn("third_next_avail", "450 - 2,399")
+```
+
+```{r tna_plot1}
+plot_fxn("third_next_avail", "450 - 2,399")
+```
+
+```{r tna_reg1}
+regression_fxn("third_next_avail", "450 - 2,399")
+```
+
+```{r}
+regression_table_fxn("third_next_avail", "450 - 2,399")
+```
+
+## 2,400 - 9,999 Uniques in PCMM  
+```{r tna_table2, results = 'asis'}
+table_fxn("third_next_avail", "2,400 - 9,999")
+```
+
+```{r tna_plot2}
+plot_fxn("third_next_avail", "2,400 - 9,999")
+```
+
+```{r tna_reg2}
+regression_fxn("third_next_avail", "2,400 - 9,999")
+```
+
+```{r}
+regression_table_fxn("third_next_avail", "2,400 - 9,999")
+```
+
+## 10,000+ Uniques in PCMM  
+```{r tna_table3, results = 'asis'}
+table_fxn("third_next_avail", "10,000+")
+```
+
+```{r tna_plot3}
+plot_fxn("third_next_avail", "10,000+")
+```
+
+```{r tna_reg3}
+regression_fxn("third_next_avail", "10,000+")
+```
+
+```{r}
+regression_table_fxn("third_next_avail", "10,000+")
+```
+
+
+# Timely Care Success Rate      
+
+
+```{r}
+ggplot(data = model_1a,
+               aes(x = vssc_month, y = tc_success_prop, group = sta5a)) +
+    geom_vline(xintercept = vline_xint,
+               lty = 3) +
+    scale_x_date() +
+    geom_line(alpha = 0.35) +
+    geom_smooth(aes(x = vssc_month, y = tc_success_prop, group = crh_flag, lty = crh_flag),
+                color = "red",
+                inherit.aes = FALSE,
+                se = TRUE,
+                method = "lm") +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+    scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+    ggsci::scale_color_d3() +
+    guides(color = guide_legend(override.aes = list(size = 2))) +
+    labs(y = "Timely Care Success")
+```
+
+
+## Overall  
+```{r, results = 'asis'}
+table_fxn("tc_success_prop")
+```
+
+```{r}
+regression_fxn("tc_success_prop")
+regression_table_fxn("tc_success_prop")
+```
+
+## 450 - 2,399 Uniques in PCMM  
+```{r timelyCare_table1, results = 'asis'}
+table_fxn("tc_success_prop", "450 - 2,399")
+```
+
+```{r timelyCare_plot1}
+plot_fxn("tc_success_prop", "450 - 2,399")
+```
+
+```{r timelyCare_reg1}
+regression_fxn("tc_success_prop", "450 - 2,399")
+```
+
+```{r}
+regression_table_fxn("tc_success_prop", "450 - 2,399")
+```
+
+## 2,400 - 9,999 Uniques in PCMM  
+```{r timelyCare_table2, results = 'asis'}
+table_fxn("tc_success_prop", "2,400 - 9,999")
+```
+
+```{r timelyCare_plot2}
+plot_fxn("tc_success_prop", "2,400 - 9,999")
+```
+
+```{r timelyCare_reg2}
+regression_fxn("tc_success_prop", "2,400 - 9,999")
+```
+
+```{r}
+regression_table_fxn("tc_success_prop", "2,400 - 9,999")
+```
+
+## 10,000+ Uniques in PCMM  
+```{r timelyCare_table3, results = 'asis'}
+table_fxn("tc_success_prop", "10,000+")
+```
+
+```{r timelyCare_plot3}
+plot_fxn("tc_success_prop", "10,000+")
+```
+
+```{r timelyCare_reg3}
+regression_fxn("tc_success_prop", "10,000+")
+```
+
+```{r}
+regression_table_fxn("tc_success_prop", "10,000+")
+```

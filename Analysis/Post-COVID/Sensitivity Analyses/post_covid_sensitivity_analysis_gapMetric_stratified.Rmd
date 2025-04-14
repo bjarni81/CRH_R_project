@@ -1,0 +1,562 @@
+---
+title: "Post-COVID PC CRH Analysis: Stratified by Gap Metric"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             plot.title = element_text(size = 24),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0),
+         s_abbr2 = case_when(str_detect(s_abbr, "CBOC") ~ "CBOC",
+                             str_detect(s_abbr, "VAMC|HCC") ~ "VAMC/HCC",
+                             s_abbr == "OOS" ~ "OOS")) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well as 
+  #flags for treated/control
+  #PS matching weights
+  #flags for meeting inclusion criteria in 3 periods
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv")) %>%
+  rename(treated_ever = treated_num)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(tna_new_source = as.numeric(tna_new_source))
+#making a time/date dataset
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time") %>%
+  mutate(fy = if_else(month(vssc_month) > 9, year(vssc_month) + 1, year(vssc_month)),
+         qtr = case_when(month(vssc_month) %in% c(10, 11, 12) ~ 1,
+                         month(vssc_month) %in% c(1, 2, 3) ~ 2,
+                         month(vssc_month) %in% c(4, 5, 6) ~ 3,
+                         month(vssc_month) %in% c(7, 8, 9) ~ 4,
+                         TRUE ~ 99))
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+#average age on october 1st 2022
+age_sta5a_qtr <- dbGetQuery(oabi_con,
+                            "select * from [OABI_MyVAAccess].[crh_eval].D1_age_sta5a_qtr")
+#sta5a-fy-specific counts of gender, race, and urh, as well as total uniques
+race_gender_urh <- dbGetQuery(oabi_con,
+                              "select * from [OABI_MyVAAccess].[crh_eval].D2_race_gender_urh_count") %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100)
+#sta5a-fy_qtr-specific average ADI and quartile counts, as well as total
+adi_sta5a_fy <- dbGetQuery(oabi_con,
+                            "select * from [OABI_MyVAAccess].[crh_eval].D3_adi_sta5a_fy")
+#sta5a-month-specific average Nosos, Obs:Exp, and Team PCP/AP FTE
+nosos_obs_exp_team_fte <- dbGetQuery(oabi_con,
+                                     "select * from [OABI_MyVAAccess].[crh_eval].F1_2_vssc_covars") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#sta5a-fy-specific average drive distance and time to closest PC site
+drive_time <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].D4_avg_drive_time")
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#sta5a-month-specific timely care success rate
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#sta5a-month-specific PC CRH penetration rate and it's components
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month),
+         treated_month = if_else(crh_encounter_count > 9, 1, 0))#time-varying treated
+```
+
+```{r time_varying_treated}
+treated_sta5a <- ps_matched %>%
+  filter(treated_ever == 1) %>%
+  select(sta5a)
+#
+months_meeting_inclusion_criteria <- pen_rate %>%
+  arrange(sta5a, vssc_month) %>%#ordering by station and month
+  group_by(sta5a) %>%#grouping by station
+  mutate(this_mo_mt9_pc_crh = if_else(crh_encounter_count > 9, 1, 0),#flag for this month meeting criteria 
+         last_mo_mt9_pc_crh = if_else(lag(crh_encounter_count) > 9, 1, 0),#flag for last month
+         next_mo_mt9_pc_crh = if_else(lead(crh_encounter_count) > 9, 1, 0),#flag for next month
+         meets_inc_crit = if_else(this_mo_mt9_pc_crh == 1 & # IF this month meets criteria
+                                    ((last_mo_mt9_pc_crh == 1 | is.na(last_mo_mt9_pc_crh)) 
+                                     | (next_mo_mt9_pc_crh == 1 | is.na(next_mo_mt9_pc_crh))),#AND either this or last month
+                                  1, 0),#THEN 1, ELSE 0
+         meets_inc_crit_both = meets_inc_crit,
+         meets_inc_crit_fwd = if_else(this_mo_mt9_pc_crh == TRUE & (next_mo_mt9_pc_crh == 1 | is.na(next_mo_mt9_pc_crh)), 1, 0)
+         ) %>%
+  filter(sta5a %in% treated_sta5a$sta5a) %>%
+  right_join(., dates %>%
+               select(vssc_month) %>%
+               cross_join(., treated_sta5a)) %>%
+  mutate(meets_inc_crit_both = replace_na(meets_inc_crit_both, 0),
+         meets_inc_crit_fwd = replace_na(meets_inc_crit_fwd, 0),
+         crh_enc_count_na = crh_encounter_count,
+         crh_encounter_count = replace_na(crh_encounter_count, 0))
+```
+
+
+
+
+```{r unmatched_analytic_df}
+treated_after_sep2020 <- pen_rate %>%
+  filter(vssc_month > ymd("2020-09-01")) %>%
+  arrange(sta5a, vssc_month) %>%#ordering by station and month
+  group_by(sta5a) %>%#grouping by station
+  mutate(this_mo_mt9_pc_crh = if_else(crh_encounter_count > 9, 1, 0),#flag for this month meeting criteria 
+         last_mo_mt9_pc_crh = if_else(lag(crh_encounter_count) > 9, 1, 0),#flag for last month
+         next_mo_mt9_pc_crh = if_else(lead(crh_encounter_count) > 9, 1, 0),#flag for next month
+         meets_inc_crit = if_else(this_mo_mt9_pc_crh == 1 & # IF this month meets criteria
+                                    ((last_mo_mt9_pc_crh == 1 | is.na(last_mo_mt9_pc_crh)) 
+                                     | (next_mo_mt9_pc_crh == 1 | is.na(next_mo_mt9_pc_crh))),#AND either this or last month
+                                  1, 0),#THEN 1, ELSE 0
+         meets_inc_crit_both = meets_inc_crit,
+         meets_inc_crit_fwd = if_else(this_mo_mt9_pc_crh == TRUE & (next_mo_mt9_pc_crh == 1 | is.na(next_mo_mt9_pc_crh)), 1, 0)
+  ) %>%
+  filter(meets_inc_crit == 1) %>%
+  select(sta5a) %>%
+  distinct
+#--
+analytic_df2 <- vast %>%
+  filter(str_detect(s_abbr, "CBOC|VAMC|HCC|OOS") == T) %>%
+  select(sta5a) %>%
+  inner_join(., scrssn_count %>%
+               filter(is.na(scrssn_count_cat) == F
+                      & scrssn_count_cat != "< 450") %>%
+               select(sta5a)) %>%
+  mutate(treated_ever = if_else(sta5a %in% treated_after_sep2020$sta5a, 1, 0)) %>%
+  cross_join(., dates) %>%
+  left_join(., timely_care %>%
+              select(sta5a, vssc_month, tc_pc_success_prop)) %>%
+  left_join(., access_metrics %>%
+              select(sta5a, vssc_month, est_pc_pt_wt_pid, new_pc_pt_wt_create, tna_new_source, new_0_20_days_create, panel_fullness)) %>%
+  left_join(., adi_sta5a_fy %>%
+              select(sta5a = Sta5a, fy, adi_natRnk_avg)) %>%
+  left_join(., age_sta5a_qtr %>%
+              select(sta5a = Sta5a, fy = FY, qtr = QTR, avg_age_oct1_2022)) %>%
+  left_join(., drive_time %>%
+              select(sta5a = CLOSESTPCSITE, fy, avg_driveTime) %>%
+              bind_rows(., drive_time %>%
+                          filter(fy == 2022) %>%
+                          select(sta5a = CLOSESTPCSITE, fy, avg_driveTime) %>%
+                          mutate(fy = 2023))) %>%
+  left_join(., gap_metric %>%
+              select(sta5a, vssc_month, gap_metric)) %>%
+  left_join(., nosos_obs_exp_team_fte) %>%
+  left_join(., race_gender_urh %>%
+              select(sta5a = Sta5a, fy = FY, pct_male, pct_white, pct_rural)) %>%
+  left_join(., vast %>%
+              select(sta5a, s_abbr, s_abbr2, parent_visn, urh_vast) %>%
+              mutate(urh2 = if_else(urh_vast == "U", "Urban", "Rural"))) %>%
+  left_join(., pen_rate) %>%
+  left_join(., scrssn_count) %>%
+  mutate(treated_ever = relevel(as.factor(treated_ever), ref = "0"),
+         new_0_20_days_create_pct = new_0_20_days_create * 100,
+         #treated = relevel(as.factor(treated), ref = "Control"),
+         treated_month = relevel(as.factor(replace_na(treated_month, 0)), ref = "0"),
+         tc_pc_success_pct = tc_pc_success_prop * 100,
+         time_t = time,
+         gap_metric_cat = factor(case_when(gap_metric >= 1.2 ~ "> 1.2",
+                                    gap_metric < 1 ~ "< 1.0",
+                                    gap_metric < 1.2 & gap_metric >= 1.0 ~ "1.0-1.2")),
+         gap_metric_num = case_when(gap_metric >= 1.2 ~ 3,
+                                    gap_metric < 1 ~ 1,
+                                    gap_metric < 1.2 & gap_metric >= 1.0 ~ 2),
+         gap_x_10 = gap_metric * 10,
+         new_0_20_binary_success = if_else(new_0_20_days_create_pct >= 80, 1, 0),
+         panel_fullness_capped = if_else(panel_fullness > 5, 5, panel_fullness),
+         panel_fullness_pct = panel_fullness_capped * 100,
+         pf_pct_div_10 = panel_fullness_pct / 10,
+         panel_fullness_cat = factor(case_when(panel_fullness_pct < 80 ~ "<80%",
+                                        panel_fullness_pct > 105 ~ ">105%",
+                                        panel_fullness_pct >= 80 & panel_fullness_pct <= 105 ~ "80-105%")),
+         gap_lt_1 = if_else(gap_metric_cat == "< 1.0", 1, 0),
+         gap_1_12 = if_else(gap_metric_cat == "1.0-1.2", 1, 0),
+         gap_gt_12 = if_else(gap_metric_cat == "> 1.2", 1, 0),
+         scrssn_450_2399 = if_else(scrssn_count_cat == "450 - 2,399", 1, 0),
+         scrssn_2400_9999 = if_else(scrssn_count_cat == "2,400 - 9,999", 1, 0),
+         scrssn_ge_10k = if_else(scrssn_count_cat == "10,000+", 1, 0)) %>%
+  fastDummies::dummy_cols(., select_columns = c("parent_visn", "s_abbr"))
+#--
+analytic_panel_noMatch <- analytic_df2 %>%
+  panelr::panel_data(.,
+                     id = sta5a,
+                     wave = time)
+```
+
+
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This is an iteration of the _post-COVID_ analysis
+
+## Decision Points  
+
+* This is the post-COVID analysis stratified by the sta5a-specific average gap metric over the 36 months of our study
+
+
+    
+## Analytic details  
+
+    
+* Description of the unmatched cohort for the W-B model 
+    + The first observation in the data occurs on `r min(analytic_df2$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df2$vssc_month)`
+    + There are `r nrow(analytic_df2) %>% comma()` rows in the data
+    + These rows come from `r analytic_df2 %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df2 %>% select(sta5a, treated_ever) %>% distinct() %>% summarise(tot = sum(if_else(treated_ever == "1", 1, 0)))` of these met our criteria for PC CRH 
+      + `r analytic_df2 %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df2 %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df2 %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+
+```{r set_ref_levs2, class.source = 'fold-show'}
+analytic_panel_noMatch$panel_fullness_cat <- relevel(analytic_panel_noMatch$panel_fullness_cat, ref = ">105%")
+analytic_panel_noMatch$treated_month <- relevel(analytic_panel_noMatch$treated_month, ref = "0")
+analytic_panel_noMatch$gap_metric_cat <- relevel(analytic_panel_noMatch$gap_metric_cat, ref = "< 1.0")
+analytic_panel_noMatch$scrssn_count_cat <- relevel(factor(analytic_panel_noMatch$scrssn_count_cat, ordered = F), ref = "450 - 2,399")
+analytic_panel_noMatch$new_0_20_binary_success <- relevel(factor(analytic_panel_noMatch$new_0_20_binary_success, ordered = F), ref = "0")
+analytic_panel_noMatch$treated_ever <- relevel(factor(analytic_panel_noMatch$treated_ever, ordered = F), ref = "0")
+analytic_panel_noMatch$s_abbr2 <- relevel(factor(analytic_panel_noMatch$s_abbr2, ordered = F), ref = "CBOC")
+```
+
+
+```{r fxns}
+
+mean_gap <- analytic_df2 %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T))
+low_sta5a <- mean_gap %>%
+  filter(mean_gap < 1.0) %>%
+  pull(sta5a)
+med_sta5a <- mean_gap %>%
+  filter(mean_gap >= 1.0
+         & mean_gap <= 1.2) %>%
+  pull(sta5a)
+high_sta5a <- mean_gap %>%
+  filter(mean_gap > 1.2) %>%
+  pull(sta5a)
+#
+low_panel <- analytic_panel_noMatch %>%
+  filter(sta5a %in% low_sta5a)
+#
+med_panel <- analytic_panel_noMatch %>%
+  filter(sta5a %in% med_sta5a)
+#
+high_panel <- analytic_panel_noMatch %>%
+  filter(sta5a %in% high_sta5a)
+#
+wbm_fxn <- function(outcome){
+  fmla_og <- as.formula(paste0(outcome, " ~ treated_month + time_t ", 
+                               "+ gap_metric_cat + adi_natRnk_avg + avg_age_oct1_2022 + avg_driveTime + nosos_risk_score",
+                               "+ team_pcp_ap_fte_total + pct_male + pct_white + pct_rural + scrssn_count_cat", 
+                               "| treated_ever", 
+                               "+ gap_metric_cat + adi_natRnk_avg + avg_age_oct1_2022 + avg_driveTime + nosos_risk_score",
+                               "+ team_pcp_ap_fte_total + pct_male + pct_white + pct_rural + s_abbr2 + scrssn_count_cat + parent_visn", 
+                               " | (1|sta5a)"))
+  fmla <- as.formula(paste0(outcome, " ~ treated_month + time_t ", 
+                               " + adi_natRnk_avg + avg_age_oct1_2022 + avg_driveTime + nosos_risk_score",
+                               "+ team_pcp_ap_fte_total + pct_male + pct_white + pct_rural + scrssn_count_cat", 
+                               "| treated_ever", 
+                               " + adi_natRnk_avg + avg_age_oct1_2022 + avg_driveTime + nosos_risk_score",
+                               "+ team_pcp_ap_fte_total + pct_male + pct_white + pct_rural + s_abbr2 + scrssn_count_cat + parent_visn", 
+                               " | (1|sta5a)"))
+  #
+  mod_og <- 
+    if({{outcome}} == "new_0_20_binary_success")
+    {panelr::wbm(fmla_og,
+                 data = analytic_panel_noMatch,
+                 family = "binomial",
+                 pvals = T,
+                 pR2 = F,
+                 control = glmerControl(calc.derivs = FALSE)) %>%
+        summary()}
+  else
+  {panelr::wbm(fmla_og, 
+               data = analytic_panel_noMatch) %>%
+      summary()}
+  #
+  mod_low <- 
+    if({{outcome}} == "new_0_20_binary_success")
+    {panelr::wbm(fmla,
+                 data = low_panel,
+                 family = "binomial",
+                 pvals = T,
+                 pR2 = F,
+                 control = glmerControl(calc.derivs = FALSE)) %>%
+        summary()}
+  else
+  {panelr::wbm(fmla, 
+               data = low_panel) %>%
+      summary()}
+  #--
+  mod_med <- 
+    if({{outcome}} == "new_0_20_binary_success")
+    {panelr::wbm(fmla,
+                 data = med_panel,
+                 family = "binomial",
+                 pvals = T,
+                 pR2 = F,
+                 control = glmerControl(calc.derivs = FALSE)) %>%
+        summary()}
+  else
+  {panelr::wbm(fmla, 
+               data = med_panel) %>%
+      summary()}
+  #--
+  mod_high <- 
+    if({{outcome}} == "new_0_20_binary_success")
+    {panelr::wbm(fmla,
+                 data = high_panel,
+                 family = "binomial",
+                 pvals = T,
+                 pR2 = F,
+                 control = glmerControl(calc.derivs = FALSE)) %>%
+        summary()}
+  else
+  {panelr::wbm(fmla, 
+               data = high_panel) %>%
+      summary()}
+  #=====
+  col_name <- if({{outcome}} == "new_0_20_binary_success"){"Odds Ratio"}
+  else{"Estimate"}
+  #=====
+  within_og_sum <- if({{outcome}} == "new_0_20_binary_success"){mod_og$within_table %>%
+    rownames_to_column() %>%
+      mutate(`Est.` = exp(`Est.`))}
+  else {mod_og$within_table %>%
+    rownames_to_column()}
+  between_og_sum <- if({{outcome}} == "new_0_20_binary_success"){mod_og$between_table %>%
+    rownames_to_column() %>%
+      mutate(`Est.` = exp(`Est.`))}
+  else {mod_og$between_table %>%
+    rownames_to_column()}
+  #
+  within_low_sum <- if({{outcome}} == "new_0_20_binary_success"){mod_low$within_table %>%
+    rownames_to_column() %>%
+      mutate(`Est.` = exp(`Est.`))}
+  else {mod_low$within_table %>%
+    rownames_to_column()}
+  #
+  between_low_sum <- if({{outcome}} == "new_0_20_binary_success"){mod_low$between_table %>%
+    rownames_to_column() %>%
+      mutate(`Est.` = exp(`Est.`))}
+  else {mod_low$between_table %>%
+    rownames_to_column()}
+  #
+  within_med_sum <- if({{outcome}} == "new_0_20_binary_success"){mod_med$within_table %>%
+    rownames_to_column() %>%
+      mutate(`Est.` = exp(`Est.`))}
+  else {mod_med$within_table %>%
+    rownames_to_column()}
+  #
+  between_med_sum <- if({{outcome}} == "new_0_20_binary_success"){mod_med$between_table %>%
+    rownames_to_column() %>%
+      mutate(`Est.` = exp(`Est.`))}
+  else {mod_med$between_table %>%
+    rownames_to_column()}
+  #
+  within_high_sum <- if({{outcome}} == "new_0_20_binary_success"){mod_high$within_table %>%
+      rownames_to_column() %>%
+      mutate(`Est.` = exp(`Est.`))}
+  else {mod_high$within_table %>%
+      rownames_to_column()}
+  #
+  between_high_sum <- if({{outcome}} == "new_0_20_binary_success"){mod_high$between_table %>%
+      rownames_to_column() %>%
+      mutate(`Est.` = exp(`Est.`))}
+  else {mod_high$between_table %>%
+      rownames_to_column()}
+  #----
+  within_table <- within_og_sum %>%
+    full_join(., within_low_sum,
+              by = "rowname") %>%
+    full_join(., within_med_sum,
+              by = "rowname") %>%
+    full_join(., within_high_sum,
+              by = "rowname") %>%
+    select(rowname, 
+           Est..x, p.x, Est..y, p.y, Est..x.x, p.x.x, Est..y.y, p.y.y) %>%
+    mutate(across(contains("Est"), ~comma(.x, accuracy = 0.001)),
+           across(contains("p"), ~if_else(.x < 0.001, "< 0.001", comma(.x, accuracy = 0.001)))) %>%
+    kbl(col.names = c("Covariate", rep(c(col_name, "p-value"), 4)),
+        align = c("l", rep("r", 8)),
+        caption = "<span style='font-size:22px'><b>Within</b></span>") %>%
+    kable_classic("striped",
+                  full_width = F) %>%
+    row_spec(0, bold = TRUE) %>%
+    column_spec(c(3, 5, 7), border_right = TRUE) %>%
+    add_header_above(c(" ", "Original Analysis" = 2, "Gap Metric < 1.0" = 2, "Gap Metric 1.0-1.2" = 2, "Gap Metric > 1.2" = 2),
+                     bold = T,
+                     font_size = 18)
+  #=======
+  between_table <-  between_og_sum %>%
+    full_join(., between_low_sum,
+              by = "rowname") %>%
+    full_join(., between_med_sum,
+              by = "rowname") %>%
+    full_join(., between_high_sum,
+              by = "rowname") %>%
+    select(rowname, 
+           Est..x, p.x, Est..y, p.y, Est..x.x, p.x.x, Est..y.y, p.y.y) %>%
+    mutate(across(contains("Est"), ~comma(.x, accuracy = 0.001)),
+           across(contains("p"), ~if_else(.x < 0.001, "< 0.001", comma(.x, accuracy = 0.001)))) %>%
+    kbl(col.names = c("Covariate", rep(c(col_name, "p-value"), 4)),
+        align = c("l", rep("r", 8)),
+        caption = "<span style='font-size:22px'><b>Between</b></span>") %>%
+    kable_classic("striped",
+                  full_width = F) %>%
+    row_spec(0, bold = TRUE) %>%
+    column_spec(c(3, 5, 7), border_right = TRUE) %>%
+    add_header_above(c(" ", "Original Analysis" = 2, "Gap Metric < 1.0" = 2, "Gap Metric 1.0-1.2" = 2, "Gap Metric > 1.2" = 2),
+                     bold = T,
+                     font_size = 18)
+  
+  #
+  return(list(slot_1 = within_table, slot_2 = between_table))
+}
+```
+
+
+
+
+# Established Patient Wait Time  
+ 
+```{r}
+est_list <- wbm_fxn("est_pc_pt_wt_pid")
+#
+est_list$slot_1
+#
+est_list$slot_2
+```
+
+# New Patient Wait Time  
+  
+```{r}
+new_list <- wbm_fxn("new_pc_pt_wt_create")
+#
+new_list$slot_1
+#
+new_list$slot_2
+```
+
+
+# Third Next Available    
+  
+```{r}
+tna_list <- wbm_fxn("tna_new_source")
+#
+tna_list$slot_1
+#
+tna_list$slot_2
+```
+
+
+# Timely Care    
+ 
+```{r}
+tc_list <- wbm_fxn("tc_pc_success_pct")
+#
+tc_list$slot_1
+#
+tc_list$slot_2
+```
+
+
+# New Patients Seen in 0-20 days > 80%  
+
+```{r wb_model}
+tictoc::tic()
+bin_list <- wbm_fxn("new_0_20_binary_success")
+#
+bin_list$slot_1
+#
+bin_list$slot_2
+tictoc::toc()
+```
+
+

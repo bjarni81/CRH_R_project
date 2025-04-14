@@ -1,0 +1,487 @@
+---
+title: "SGIM Poster CRH Post-COVID Plots & Tables"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 30),
+             axis.text = element_text(size = 24),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 24),
+             legend.title = element_text(size = 28),
+             plot.caption = element_text(size = 12))
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0),
+         urh_vast2 = if_else(urh_vast == "U", "U", "R")) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month),
+         gap_metric_cat = factor(case_when(gap_metric >= 1.2 ~ "> 1.2",
+                                    gap_metric < 1 ~ "< 1.0",
+                                    gap_metric < 1.2 & gap_metric >= 1.0 ~ "1.0-1.2")))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+```{r}
+
+#=================
+analytic_df <- ps_matched %>%
+  select(sta5a) %>%
+  cross_join(., dates %>% 
+               select(vssc_month)) %>%
+  left_join(., ps_matched %>% 
+              select(sta5a, treated_num)) %>%
+  left_join(., gap_metric %>%
+              select(sta5a, vssc_month, gap_metric)) %>%
+  left_join(., access_metrics %>%
+              select(sta5a, vssc_month, est_pc_pt_wt_pid, new_pc_pt_wt_create, tna_new_source) %>%
+              mutate(tna_new_source = as.numeric(tna_new_source))) %>%
+  left_join(., pen_rate %>%
+              select(sta5a, vssc_month, crh_encounter_count)) %>%
+  left_join(., vast %>%
+              select(sta5a, urh_vast2)) %>%
+  mutate(gap_cat = factor(case_when(gap_metric < 1.0 ~ "Understaffed",
+                                    gap_metric >= 1.0 & gap_metric <= 1.2 ~ "Marginally Staffed",
+                                    gap_metric > 1.2 ~ "Fully Staffed"), 
+                          ordered = T,
+                          levels = c("Understaffed", "Marginally Staffed", "Fully Staffed")))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a collection of potential plots and tables for the post-COVID SGIM poster
+
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, treated_num) %>% distinct() %>% summarise(tot = sum(treated_num))` of these met our criteria for PC CRH 
+    
+* Description of _Propensity Score_ matching
+    + This PS model consists of 
+        + Covariates matched on their average values over Q4 FY20
+        + Outcomes matched on their average values over Q4 FY20
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+
+# Plot #1  
+
+```{r fig.asp=0.5}
+p0 <- analytic_df %>%
+    filter(treated_num == 1) %>%
+    group_by(sta5a) %>%
+    summarise(mean_gap = mean(gap_metric, na.rm = T),
+              sd_gap = sd(gap_metric, na.rm = T),
+              mean_val = mean(est_pc_pt_wt_pid, na.rm = T),
+              sd_val = sd(est_pc_pt_wt_pid, na.rm = T)) %>%
+    filter(is.na(mean_gap) == F) %>%
+    mutate(gap_cat = factor(case_when(mean_gap < 1.0 ~ "< 1.0",
+                                      mean_gap >= 1.0 & mean_gap <= 1.2 ~ "1.0-1.2",
+                                      mean_gap > 1.2 ~ "> 1.2"), 
+                            ordered = T,
+                            levels = c("< 1.0", "1.0-1.2", "> 1.2"))) %>%
+    ggplot(data = .,
+           aes(x = reorder(sta5a, mean_val),
+               y = mean_val,
+               ymin = mean_val - sd_val,
+               ymax = mean_val + sd_val,
+               color = gap_cat)) +
+  geom_point() +
+    labs(x = "Sta5a",
+         color = "Gap Metric") +
+    scale_color_manual(values = c("red", "yellow2", "seagreen")) +
+    theme(legend.position = "bottom",
+          legend.title = element_text(size = 22))
+#
+plot_fxn <- function(outcome, outcome_char){
+  analytic_df %>%
+    filter(treated_num == 1) %>%
+    group_by(sta5a) %>%
+    summarise(mean_gap = mean(gap_metric, na.rm = T),
+              sd_gap = sd(gap_metric, na.rm = T),
+              mean_val = mean({{outcome}}, na.rm = T),
+              sd_val = sd({{outcome}}, na.rm = T)) %>%
+    filter(is.na(mean_gap) == F) %>%
+    mutate(gap_cat = factor(case_when(mean_gap < 1.0 ~ "< 1.0",
+                                      mean_gap >= 1.0 & mean_gap <= 1.2 ~ "1.0-1.2",
+                                      mean_gap > 1.2 ~ "> 1.2"), 
+                            ordered = T,
+                            levels = c("< 1.0", "1.0-1.2", "> 1.2"))) %>%
+    ggplot(data = .,
+           aes(x = reorder(sta5a, mean_val),
+               y = mean_val,
+               ymin = mean_val - sd_val,
+               ymax = mean_val + sd_val,
+               color = gap_cat)) +
+    geom_errorbar(linewidth = 0.5,
+                  alpha = 0.7) +
+    geom_point(alpha = 0.8) +
+    labs(color = "Gap Metric",
+         y = outcome_char) +
+    scale_color_manual(values = c("red", "yellow2", "seagreen")) +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank(),
+          legend.position = "none",
+          axis.title.x = element_blank(),
+          panel.grid.major.x = element_blank(),
+          legend.title = element_text(size = 22))
+}
+#
+p1 <- plot_fxn(est_pc_pt_wt_pid, "Established Patient WT +/- SD")
+p2 <- plot_fxn(new_pc_pt_wt_create, "New Patient WT +/- SD")
+p3 <- plot_fxn(tna_new_source, "Third Next Available +/- SD")
+p_grid <- cowplot::plot_grid(p1, p2, p3, ncol = 3)
+#
+leg_p0 <- cowplot::get_legend(p0)
+#
+cowplot::plot_grid(p_grid, leg_p0, ncol = 1, rel_heights = c(1, 0.1))
+```
+
+
+# Plot #2  
+
+```{r fig.asp=1.25}
+analytic_df %>%
+  filter(treated_num == 1) %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T),
+            mean_crh = mean(crh_encounter_count, na.rm = T),
+            sd_crh = sd(crh_encounter_count, na.rm = T),
+            n_valid_obs = sum(!is.na(crh_encounter_count))) %>%
+  filter(is.na(mean_gap) == F) %>%
+  mutate(gap_cat = factor(case_when(mean_gap < 1.0 ~ "Understaffed",
+                                    mean_gap >= 1.0 & mean_gap <= 1.2 ~ "Marginally Staffed",
+                                    mean_gap > 1.2 ~ "Fully Staffed"), 
+                          ordered = T,
+                          levels = c("Understaffed", "Marginally Staffed", "Fully Staffed"))) %>%
+  ggplot(data = .,
+         aes(x = reorder(sta5a, mean_crh),
+             y = mean_crh,
+             ymin = mean_crh - sd_crh,
+             ymax = mean_crh + sd_crh,
+             color = gap_cat)) +
+  geom_point() +
+  geom_errorbar(linewidth = 0.4) +
+  scale_color_manual(values = c("red", "yellow2", "seagreen")) +
+  labs(y = "Mean PC CRH Encounters per Month +/- SD",
+       color = "Gap Metric") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        axis.title.x = element_blank(),
+        panel.grid.major.x = element_blank(),
+        legend.position = c(0.25, 0.8),
+        legend.title = element_blank())+ 
+  guides(color = guide_legend(override.aes = list(size = 3, linewidth = 1))) 
+```
+
+
+
+# Table 1    
+
+```{r}
+analytic_df$treated_num <- relevel(factor(analytic_df$treated_num, ordered = F), ref = "0")
+#
+trtd_fxn <- function(outcome){
+  analytic_df$treated_num <- relevel(factor(analytic_df$treated_num, ordered = F), ref = "0")
+  fmla <- as.formula(paste0({{outcome}},
+                            "~ treated_num + (1|sta5a)"))
+  #
+  lmer(fmla,
+       data = analytic_df)
+}
+#-----
+fullyStaffed_fxn <- function(outcome){
+  analytic_df$gap_cat <- relevel(factor(analytic_df$gap_cat, ordered = F), ref = "Fully Staffed")
+  #
+  fmla <- as.formula(paste0({{outcome}},
+                            "~ gap_cat + (1|sta5a)"))
+  #
+  lmer(fmla,
+       data = analytic_df)
+}
+#-----
+margStaffed_fxn <- function(outcome){
+  analytic_df$gap_cat <- relevel(factor(analytic_df$gap_cat, ordered = F), ref = "Marginally Staffed")
+  #
+  fmla <- as.formula(paste0({{outcome}},
+                            "~ gap_cat + (1|sta5a)"))
+  #
+  lmer(fmla,
+       data = analytic_df)
+}
+#-----
+rural_fxn <- function(outcome){
+  analytic_df$urh_vast2 <- relevel(factor(analytic_df$urh_vast2, ordered = F), ref = "U")
+  #
+  fmla <- as.formula(paste0({{outcome}},
+                            "~ urh_vast2 + (1|sta5a)"))
+  #
+  lmer(fmla,
+       data = analytic_df)
+}
+#============
+trt_est <- trtd_fxn("est_pc_pt_wt_pid")
+ci_trt_est <- confint(trt_est, "treated_num1", method = "profile")
+#
+full_est <- fullyStaffed_fxn("est_pc_pt_wt_pid")
+ci_full_est <- confint(full_est, "gap_catUnderstaffed", method = "profile")
+#
+marg_est <- margStaffed_fxn("est_pc_pt_wt_pid")
+ci_marg_est <- confint(marg_est, "gap_catUnderstaffed", method = "profile")
+#
+urh_est <- rural_fxn("est_pc_pt_wt_pid")
+ci_urh_est <- confint(urh_est, "urh_vast2R", method = "profile")
+#--
+trt_new <- trtd_fxn("new_pc_pt_wt_create")
+ci_trt_new <- confint(trt_new, "treated_num1", method = "profile")
+#
+full_new <- fullyStaffed_fxn("new_pc_pt_wt_create")
+ci_full_new <- confint(full_new, "gap_catUnderstaffed", method = "profile")
+#
+marg_new <- margStaffed_fxn("new_pc_pt_wt_create")
+ci_marg_new <- confint(marg_new, "gap_catUnderstaffed", method = "profile")
+#
+urh_new <- rural_fxn("new_pc_pt_wt_create")
+ci_urh_new <- confint(urh_new, "urh_vast2R", method = "profile")
+#--
+trt_tna <- trtd_fxn("tna_new_source")
+ci_trt_tna <- confint(trt_tna, "treated_num1", method = "profile")
+#
+full_tna <- fullyStaffed_fxn("tna_new_source")
+ci_full_tna <- confint(full_tna, "gap_catUnderstaffed", method = "profile")
+#
+marg_tna <- margStaffed_fxn("tna_new_source")
+ci_marg_tna <- confint(marg_tna, "gap_catUnderstaffed", method = "profile")
+#
+urh_tna <- rural_fxn("tna_new_source")
+ci_urh_tna <- confint(urh_tna, "urh_vast2R", method = "profile")
+#====
+tibble(name_col = 
+         c("Treated vs. Control", "Gap < 1.0 vs. > 1.2", "Gap < 1.0 vs. 1.0-1.2", "Rural vs. Urban"),
+       est_col = 
+         c(paste0(comma(fixef(trt_est)[2], accuracy = 0.01),
+                  " (", comma(ci_trt_est[1], accuracy = 0.01),
+                  ", ", comma(ci_trt_est[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(full_est)[2], accuracy = 0.01),
+                  " (", comma(ci_full_est[1], accuracy = 0.01),
+                  ", ", comma(ci_full_est[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(marg_est)[2], accuracy = 0.01),
+                  " (", comma(ci_marg_est[1], accuracy = 0.01),
+                  ", ", comma(ci_marg_est[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(urh_est)[2], accuracy = 0.01),
+                  " (", comma(ci_urh_est[1], accuracy = 0.01),
+                  ", ", comma(ci_urh_est[2], accuracy = 0.01),
+                  ")")),
+       new_col = 
+         c(paste0(comma(fixef(trt_new)[2], accuracy = 0.01),
+                  " (", comma(ci_trt_new[1], accuracy = 0.01),
+                  ", ", comma(ci_trt_new[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(full_new)[2], accuracy = 0.01),
+                  " (", comma(ci_full_new[1], accuracy = 0.01),
+                  ", ", comma(ci_full_new[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(marg_new)[2], accuracy = 0.01),
+                  " (", comma(ci_marg_new[1], accuracy = 0.01),
+                  ", ", comma(ci_marg_new[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(urh_new)[2], accuracy = 0.01),
+                  " (", comma(ci_urh_new[1], accuracy = 0.01),
+                  ", ", comma(ci_urh_new[2], accuracy = 0.01),
+                  ")")),
+       tna_col = 
+         c(paste0(comma(fixef(trt_tna)[2], accuracy = 0.01),
+                  " (", comma(ci_trt_tna[1], accuracy = 0.01),
+                  ", ", comma(ci_trt_tna[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(full_tna)[2], accuracy = 0.01),
+                  " (", comma(ci_full_tna[1], accuracy = 0.01),
+                  ", ", comma(ci_full_tna[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(marg_tna)[2], accuracy = 0.01),
+                  " (", comma(ci_marg_tna[1], accuracy = 0.01),
+                  ", ", comma(ci_marg_tna[2], accuracy = 0.01),
+                  ")"),
+           paste0(comma(fixef(urh_tna)[2], accuracy = 0.01),
+                  " (", comma(ci_urh_tna[1], accuracy = 0.01),
+                  ", ", comma(ci_urh_tna[2], accuracy = 0.01),
+                  ")"))) %>%
+  kbl(col.names = c("", "Established", "New", "TNA"),
+      full_width = F) %>%
+  kable_classic() %>%
+  row_spec(0, bold = T)
+```
+
+# Table 2  
+
+```{r}
+analytic_df %>%
+    group_by(sta5a, treated_num) %>%
+    summarise(mean_gap = mean(gap_metric, na.rm = T)) %>%
+    filter(is.na(mean_gap) == F) %>%
+    mutate(gap_cat = factor(case_when(mean_gap < 1.0 ~ "< 1.0",
+                                      mean_gap >= 1.0 & mean_gap <= 1.2 ~ "1.0-1.2",
+                                      mean_gap > 1.2 ~ "> 1.2"), 
+                            ordered = T,
+                            levels = c("< 1.0", "1.0-1.2", "> 1.2"))) %>%
+  left_join(., vast %>%
+              select(sta5a, urh_vast2)) %>%
+  filter(urh_vast2 == "R") %>%
+  tabyl(gap_cat, treated_num) %>%
+  adorn_totals() %>%
+  adorn_percentages("col") %>% 
+  adorn_pct_formatting(rounding = "half up", digits = 1) %>%
+  adorn_ns(position = "front") %>%
+  left_join(., analytic_df %>%
+              group_by(sta5a, treated_num) %>%
+              summarise(mean_gap = mean(gap_metric, na.rm = T)) %>%
+              filter(is.na(mean_gap) == F) %>%
+              mutate(gap_cat = factor(case_when(mean_gap < 1.0 ~ "< 1.0",
+                                                mean_gap >= 1.0 & mean_gap <= 1.2 ~ "1.0-1.2",
+                                                mean_gap > 1.2 ~ "> 1.2"), 
+                                      ordered = T,
+                                      levels = c("< 1.0", "1.0-1.2", "> 1.2"))) %>%
+              left_join(., vast %>%
+                          select(sta5a, urh_vast2)) %>%
+              filter(urh_vast2 == "U") %>%
+              tabyl(gap_cat, treated_num) %>%
+              adorn_totals() %>%
+              adorn_percentages("col") %>% 
+              adorn_pct_formatting(rounding = "half up", digits = 1) %>%
+              adorn_ns(position = "front"),
+            by = "gap_cat") %>%
+  select(gap_cat, `1.x`, `0.x`, `1.y`, `0.y`) %>%
+  kbl(col.names = c("", "Treated", "Control", "Treated", "Control"),
+      align = c("l", rep("r", 4)),
+      full_width = F) %>%
+  kable_classic("striped") %>%
+  row_spec(c(0, 4), bold = T) %>%
+  add_header_above(c("", "Rural" = 2, "Urban" = 2),
+                   bold = TRUE)
+
+```
+

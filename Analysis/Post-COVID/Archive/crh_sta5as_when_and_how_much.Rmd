@@ -1,0 +1,318 @@
+---
+title: "CRH Stations - When and How Much?"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         period_of_first_inclusion = case_when(
+           first_mo_w_mt9_pc_crh < ymd("2020-03-01") ~ "Before March 2020",
+           first_mo_w_mt9_pc_crh >= ymd("2020-03-01") 
+           & first_mo_w_mt9_pc_crh < ymd("2020-10-01") ~ "Between March 2020 and September 2020",
+           first_mo_w_mt9_pc_crh >= ymd("2020-10-01") ~ "After September 2020"
+         ))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v6_post_COVID.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-02-01"), ymd("2022-12-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+```{r}
+sta5as_to_include <- vast %>%
+  select(sta5a) %>%
+  left_join(., scrssn_count %>% select(sta5a, scrssn_count_cat)) %>%
+  filter(scrssn_count_cat != "< 450")
+#--
+sta5as_w_any_crh <- pen_rate %>%
+  filter(is.na(crh_encounter_count) == F) %>%
+  select(sta5a) %>%
+  distinct %>%
+  left_join(., crh_flag %>% select(sta5a, period_of_first_inclusion)) %>%
+  inner_join(., sta5as_to_include %>% select(sta5a)) %>%
+  mutate(period_of_first_inclusion = factor(if_else(is.na(period_of_first_inclusion) == T,
+                                             "Not enough PC CRH",
+                                             period_of_first_inclusion),
+                                            ordered = TRUE,
+                                            levels = c("Before March 2020",
+                                                       "Between March 2020 and September 2020",
+                                                       "After September 2020",
+                                                       "Not enough PC CRH")))
+#=================
+months_meeting_inclusion_criteria <- pen_rate %>%
+  arrange(sta5a, vssc_month) %>%
+  group_by(sta5a) %>%
+  mutate(this_mo_mt9_pcCRH = if_else(crh_encounter_count > 9, 1, 0),
+         next_mo_mt9_pcCRH = if_else(lead(crh_encounter_count, 1) > 9, 1, 0),
+         last_mo_mt9_pcCRH = if_else(lag(crh_encounter_count, 1) > 9, 1, 0),
+         meets_inclusion_criteria = if_else((this_mo_mt9_pcCRH == 1 & next_mo_mt9_pcCRH == 1) | 
+                                              (this_mo_mt9_pcCRH == 1 & last_mo_mt9_pcCRH == 1), 1, 0)) %>%
+  filter(meets_inclusion_criteria == 1) %>%
+  complete(vssc_month = seq(ymd("2020-02-01"), ymd("2022-12-01"), by = "month")) %>%
+  mutate(rowNum = row_number()) %>%
+  select(sta5a, vssc_month, crh_encounter_count, meets_inclusion_criteria, rowNum)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is starting out as a description of PC CRH engagement
+
+## Decision Points  
+
+* Per our discussion on October 4th I am going to make some descriptions of CRH users and when they became users
+    
+
+
+
+# PC CRH Encounters in the 12 months after first meeting our inclusion criteria  
+
+* Below is a table describing these 3 periods of meeting inclusion criteria in terms of the number of total encounters and the proportion of the following 12 months that sta5as received CRH support for PC
+* This does mean that I had to exclude `r crh_flag %>% filter(first_mo_w_mt9_pc_crh > "2021-12-01" & crh_10_flag == 1) %>% nrow()` sta5as that met our inclusion criteria after December 2021  
+
+```{r}
+n_sta5a <- sta5as_w_any_crh %>%
+  group_by(period_of_first_inclusion) %>%
+  tally()
+#--
+months_meeting_inclusion_criteria %>%
+  inner_join(., sta5as_w_any_crh) %>%
+  filter(rowNum <= 12
+         & vssc_month <= ymd("2021-12-01")) %>%
+  summarise(total_crh_encounter_count = sum(crh_encounter_count, na.rm = T),
+           sum_mos = sum(meets_inclusion_criteria, na.rm = T),
+           prop_mos = sum_mos / 12,
+           avg_pc_crh_encounter = total_crh_encounter_count / sum_mos,
+           avg_pc_crh_encounter12 = total_crh_encounter_count / 12
+           ) %>%
+  left_join(., sta5as_w_any_crh) %>%
+  ungroup %>%
+  group_by(period_of_first_inclusion) %>%
+  summarise(total_crh_encounters = sum(total_crh_encounter_count, na.rm = T),
+            avg_prop_mos = mean(prop_mos),
+            avg_mos = mean(sum_mos),
+            avg_pc_crh_encounter = mean(avg_pc_crh_encounter),
+            avg_pc_crh_encounter12 = mean(avg_pc_crh_encounter12)) %>%
+  mutate(across(c(4:6), ~comma(., accuracy = 0.1)),
+         total_crh_encounters = comma(total_crh_encounters, accuracy = 1),
+         avg_prop_mos = percent(avg_prop_mos, accuracy = 0.1)) %>%
+  right_join(., n_sta5a %>%
+               filter(str_detect(period_of_first_inclusion, "enough") == F)) %>%
+  select(c(1, 7, 2, 3, 4, 5, 6)) %>%
+  kbl(col.names = c("Period first meeting inclusion criteria",
+                    "Number of sta5a", 
+                    "Total PC CRH encounters in following 12 months",
+                    "Average % of following 12 months",
+                    "Average number of following 12 months",
+                    "Average number of PC CRH encounters per month",
+                    "Average number of PC CRH encounters out of 12 months"
+                    ),
+      align = c("l", rep("r", 6))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+
+# How many sta5as meet inclusion criteria during each period?  
+
+```{r}
+met_criteria_before_march_20 <- months_meeting_inclusion_criteria %>%
+  filter(vssc_month < ymd("2020-03-01")
+         & meets_inclusion_criteria == 1) %>%
+  select(sta5a) %>%
+  distinct
+#--
+met_criteria_between_march_20_sept_20 <- months_meeting_inclusion_criteria %>%
+  filter(vssc_month >= ymd("2020-03-01")
+         & vssc_month <= ymd("2020-09-01")
+         & meets_inclusion_criteria == 1) %>%
+  select(sta5a) %>%
+  distinct
+#--
+met_criteria_after_sept_20 <- months_meeting_inclusion_criteria %>%
+  filter(vssc_month > ymd("2020-09-01")
+         & meets_inclusion_criteria == 1) %>%
+  select(sta5a) %>%
+  distinct
+```
+
+* Out of the `r months_meeting_inclusion_criteria %>% select(sta5a) %>% n_distinct` sta5as that ever met our inclusion criteria:
+    + `r met_criteria_before_march_20 %>% nrow` met these criteria before March 2020
+    + `r met_criteria_between_march_20_sept_20 %>% nrow` met the criteria between March and September 2020
+    + `r met_criteria_after_sept_20 %>% nrow` met the criteria after September 2020
+
+
+# How many sta5as meet inclusion criteria some periods and not others  
+
+```{r}
+met_1_not_2_3 <- met_criteria_before_march_20 %>%
+  filter(sta5a %ni% met_criteria_between_march_20_sept_20$sta5a
+         & sta5a %ni% met_criteria_after_sept_20$sta5a)
+#
+met_2_not_1_3 <- met_criteria_between_march_20_sept_20 %>%
+  filter(sta5a %ni% met_criteria_before_march_20$sta5a
+         & sta5a %ni% met_criteria_after_sept_20$sta5a)
+#
+met_3_not_1_2 <- met_criteria_after_sept_20 %>%
+  filter(sta5a %ni% met_criteria_before_march_20$sta5a
+         & sta5a %ni% met_criteria_between_march_20_sept_20$sta5a)
+#
+met_1_2_not_3 <- met_criteria_before_march_20 %>%
+  bind_rows(., met_criteria_between_march_20_sept_20) %>%
+  distinct() %>%
+  filter(sta5a %ni% met_criteria_after_sept_20$sta5a)
+#
+met_1_3_not_2 <- met_criteria_before_march_20 %>%
+  bind_rows(., met_criteria_after_sept_20) %>%
+  distinct %>%
+  filter(sta5a %ni% met_criteria_between_march_20_sept_20$sta5a)
+#
+met_2_3_not_1 <- met_criteria_between_march_20_sept_20 %>%
+  bind_rows(., met_criteria_after_sept_20) %>%
+  distinct %>%
+  filter(sta5a %ni% met_criteria_before_march_20)
+#
+met_1_2_3 <- met_criteria_before_march_20 %>%
+  bind_rows(., met_criteria_between_march_20_sept_20) %>%
+  bind_rows(., met_criteria_after_sept_20) %>%
+  distinct %>%
+  filter(sta5a %in% met_criteria_before_march_20$sta5a
+         & sta5a %in% met_criteria_between_march_20_sept_20$sta5a
+         & sta5a %in% met_criteria_after_sept_20$sta5a)
+```
+
+* There are a total of `r months_meeting_inclusion_criteria %>% select(sta5a, meets_inclusion_criteria) %>% distinct() %>% filter(is.na(meets_inclusion_criteria) == F) %>% nrow()` stations that ever met our inclusion criteria
+
+* `r nrow(met_1_not_2_3)` sta5as met inclusion criteria in period 1, but not periods 2 and 3
+* `r nrow(met_2_not_1_3)` sta5as met inclusion criteria in period 2, but not periods 1 and 3
+* `r nrow(met_3_not_1_2)` sta5as met inclusion criteria in period 3, but not periods 1 and 2
+* `r nrow(met_1_2_not_3)` sta5as met inclusion criteria in periods 1 and 2, but not period 3
+* `r nrow(met_1_3_not_2)` sta5as met inclusion criteria in periods 1 and 3, but not period 2
+* `r nrow(met_2_3_not_1)` sta5as met inclusion criteria in periods 2 and 3, but not period 1
+* `r nrow(met_1_2_3)` sta5as met inclusion criteria in periods 1, 2, and 3

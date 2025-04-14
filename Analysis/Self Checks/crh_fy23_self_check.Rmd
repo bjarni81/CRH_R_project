@@ -1,0 +1,328 @@
+---
+title: "A Better Self-Check of FY23 CRH Encounters"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+library(plotly)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#crh encounters
+crh_encounters <- dbGetQuery(oabi_con,
+                             "select *
+                             from [PACT_CC].[CRH].C_crh_utilization_final") %>%
+  rename(sta5a = spoke_sta5a_combined_cdw) %>%
+  mutate(visitdate = ymd(visitdate))
+#
+totals_by_sta5a <- crh_encounters %>%
+  group_by(sta5a) %>%
+  summarise(crh_encounters_total = n())
+#
+totals_by_type_and_sta5a <- crh_encounters %>%
+  group_by(sta5a, care_type) %>%
+  summarise(crh_encounters_type = n())
+#
+sta5a_to_keep <- totals_by_sta5a %>%
+  filter(crh_encounters_total > 25) %>%
+  select(sta5a) %>%
+  pull
+#---
+analytic_df <- crh_encounters %>%
+  filter(sta5a %in% sta5a_to_keep)
+#
+unique_sta5a <- analytic_df %>%
+  select(sta5a) %>%
+  distinct %>%
+  left_join(., vast)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a __better__ self-check of the FY2023 CRH Encounters table(s)
+    + The one I use here is _[PACT_CC].[CRH].C_crh_utilization_final_, but _[PACT_CC].[CRH].crh_utilization_fy23_ contains the same data, restricted to FY2023
+
+## Decision Points  
+
+* There is a drop-off in CRH encounters from September to October 2022, and this report hopes to shed some light on where and (maybe) why that happens
+    
+
+# Encounters By Fiscal Year  
+
+## Total Encounters  
+* In the tables below I am restricting to the `r totals_by_sta5a %>% filter(crh_encounters_total > 25) %>% nrow` sta5as that had __more than 25 CRH encounters__ over these 5 years of data 
+
+```{r}
+tot_col <- analytic_df %>%
+  filter(fy != 2018) %>%
+  group_by(fy) %>%
+  summarise(count_tot = n(),
+            count_sta5a_tot = n_distinct(sta5a)) %>%
+  mutate(fy = as.character(fy),
+         count_sta5a_tot = as.character(count_sta5a_tot))
+#---
+mh_col <- analytic_df %>%
+  filter(fy != 2018 & care_type == "Mental Health") %>%
+  group_by(fy) %>%
+  summarise(count_mh = n(),
+            count_sta5a_mh = n_distinct(sta5a)) %>%
+  mutate(fy = as.character(fy),
+         count_sta5a_mh = as.character(count_sta5a_mh))
+#--
+pc_col <- analytic_df %>%
+  filter(fy != 2018 & care_type == "Primary Care") %>%
+  group_by(fy) %>%
+  summarise(count_pc = n(),
+            count_sta5a_pc = n_distinct(sta5a)) %>%
+  mutate(fy = as.character(fy),
+         count_sta5a_pc = as.character(count_sta5a_pc))
+#--
+ph_col <- analytic_df %>%
+  filter(fy != 2018 & care_type == "Pharmacy") %>%
+  group_by(fy) %>%
+  summarise(count_ph = n(),
+            count_sta5a_ph = n_distinct(sta5a)) %>%
+  mutate(fy = as.character(fy),
+         count_sta5a_ph = as.character(count_sta5a_ph)) 
+#--
+pcmhi_col <- analytic_df %>%
+  filter(fy != 2018 & care_type == "PCMHI") %>%
+  group_by(fy) %>%
+  summarise(count_pcmhi = n(),
+            count_sta5a_pcmhi = n_distinct(sta5a)) %>%
+  mutate(fy = as.character(fy),
+         count_sta5a_pcmhi = as.character(count_sta5a_pcmhi))
+#--
+spec_col <- analytic_df %>%
+  filter(fy != 2018 & care_type == "Specialty") %>%
+  group_by(fy) %>%
+  summarise(count = n(),
+            count_sta5a_spec = n_distinct(sta5a)) %>%
+  mutate(fy = as.character(fy),
+         count_sta5a_spec = as.character(count_sta5a_spec))
+#==--==--
+mh_col %>%
+  left_join(., pc_col) %>%
+  left_join(., ph_col) %>%
+  left_join(., pcmhi_col) %>%
+  left_join(., spec_col) %>%
+  adorn_totals("both") %>%
+  right_join(., tot_col %>%
+               adorn_totals()) %>%
+  select(1, 13, 14, 2:12) %>%
+  mutate(across(where(is.numeric), ~comma(.x))) %>%
+  kbl(col.names = c("FY", rep(c("Encounters", "Unique Stations"), 6), "Total"),
+      align = rep("r", 14)) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T, font_size = 14) %>%
+  add_header_above(c("", 
+                     "Total" = 2,
+                     "Mental Health" = 2,
+                     "Primary Care" = 2,
+                     "Pharmacy" = 2,
+                     "PCMHI" = 2,
+                     "Specialty" = 2,
+                     ""),
+                   font_size = 22,
+                   bold = TRUE)
+```
+
+
+# The Problem   
+
+## CRH Encounters Drop-Off From September to October 2022     
+* The plots below include all sta5as 
+
+```{r}
+pen_rate %>% 
+  filter(vssc_month > ymd("2018-09-01")) %>%
+  group_by(vssc_month) %>%
+  summarise(tot_crh = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = tot_crh)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = comma_format(accuracy = 1)) +
+  labs(x = "Month",
+       y = "Total PC CRH")
+```
+
+### By Type   
+```{r}
+all_encounters_by_type <- dbGetQuery(oabi_con,
+                                     "with CTE as (
+	select *,
+		vizMonth = DATEFROMPARTS(year(visitdate), month(visitdate), '01')
+	from [PACT_CC].[CRH].C_crh_utilization_final
+)
+select vizMonth, care_type, count(*) as encounter_count
+from CTE
+group by vizMonth, care_type") %>%
+  mutate(vizMonth = as.Date(vizMonth)) %>%
+  filter(vizMonth > ymd("2018-09-01"))
+#----
+ggplot(data = all_encounters_by_type,
+       aes(x = vizMonth, y = encounter_count, color = care_type, group = care_type)) + 
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_date(date_breaks = "6 months",
+               date_labels = "%b-%y") +
+  labs(x = "Month",
+       y = "CRH Encounters") +
+  theme(legend.position = "right")
+```
+
+# By VISN  
+```{r}
+all_encounters_type_visn <- dbGetQuery(oabi_con,
+                                       "with CTE as (
+	select *,
+		vizMonth = DATEFROMPARTS(year(visitdate), month(visitdate), '01')
+	from [PACT_CC].[CRH].C_crh_utilization_final
+)
+select vizMonth, care_type, count(*) as encounter_count, b.parent_visn
+from CTE as a
+left join [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06 as b
+on a.spoke_sta5a_combined_cdw = b.sta5a
+group by vizMonth, care_type, parent_visn") %>%
+  mutate(vizMonth = as.Date(vizMonth)) %>%
+  filter(vizMonth > ymd("2018-09-01"))
+```
+
+## All Encounters  
+```{r}
+
+all_encounters_type_visn %>% 
+  group_by(vizMonth, parent_visn) %>%
+  summarise(encounter_count = sum(encounter_count, na.rm = T)) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+       aes(x = vizMonth, y = encounter_count, color = parent_visn, group = parent_visn)) + 
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_date(date_breaks = "6 months",
+               date_labels = "%b-%y") +
+  labs(x = "Month",
+       y = "CRH Encounters") +
+  theme(legend.position = "none") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.Date("2022-10-01"),
+             lty = 2)
+```
+
+## Mental Health  
+```{r}
+all_encounters_type_visn %>%
+  filter(is.na(parent_visn) == F
+         & care_type == "Mental Health") %>%
+  ggplot(data = .,
+       aes(x = vizMonth, y = encounter_count, color = parent_visn, group = parent_visn)) + 
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_date(date_breaks = "6 months",
+               date_labels = "%b-%y") +
+  labs(x = "Month",
+       y = "CRH Encounters") +
+  theme(legend.position = "none") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.Date("2022-10-01"),
+             lty = 2)
+```
+
+## Primary Care    
+```{r}
+all_encounters_type_visn %>%
+  filter(is.na(parent_visn) == F
+         & care_type == "Primary Care") %>%
+  ggplot(data = .,
+       aes(x = vizMonth, y = encounter_count, color = parent_visn, group = parent_visn)) + 
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_date(date_breaks = "6 months",
+               date_labels = "%b-%y") +
+  labs(x = "Month",
+       y = "CRH Encounters") +
+  theme(legend.position = "none") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.Date("2022-10-01"),
+             lty = 2)
+```
+
+## PCMHI, Pharmacy, & Specialty      
+```{r}
+all_encounters_type_visn %>%
+  filter(is.na(parent_visn) == F
+         & care_type %ni% c("Mental Health", "Primary Care")) %>%
+  ggplot(data = .,
+       aes(x = vizMonth, y = encounter_count, color = care_type, group = care_type)) + 
+  geom_line(linewidth = 1) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_date(date_breaks = "6 months",
+               date_labels = "%b-%y") +
+  labs(x = "Month",
+       y = "CRH Encounters") +
+  theme(legend.position = "bottom") +
+  facet_wrap(~parent_visn) +
+  geom_vline(xintercept = as.Date("2022-10-01"),
+             lty = 2)
+```

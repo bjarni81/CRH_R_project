@@ -1,0 +1,414 @@
+---
+title: "CRH Encounters & PC CC Referrals Plotted Together"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+pactcc_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#
+every_nth = function(n) {
+  return(function(x) {x[c(TRUE, rep(FALSE, n - 1))]})
+}
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#Uniques in PCMM, categorized
+scrssn_count <- dbGetQuery(pactcc_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2019
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy19, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy19 < 450 ~ "< 450",
+    scrssn_count_avg_fy19 >= 450 & scrssn_count_avg_fy19 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy19 >= 2400 & scrssn_count_avg_fy19 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy19 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#####
+sta5as_to_include <- scrssn_count %>% 
+  filter(scrssn_count_cat != "< 450") %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  filter(is.na(parent_visn) == F)
+```
+
+```{r crh_penRate}
+# CRH penetration rate and monthly encounters by sta5a
+crh_encounters_month <- dbGetQuery(oabi_con,
+                          "with CTE as(
+                            	select *
+                            		, DATEFROMPARTS(year(visitdate), month(visitdate), '01') as crh_month
+                            	from [PACT_CC].[CRH].C_crh_utilization_final
+                            	where care_type = 'Primary Care'
+                            	)
+                            select count(*) as crh_encounter_count, count(distinct scrssn) as crh_scrssn_count
+                            	, spoke_sta5a_combined_cdw as sta5a
+                            	, crh_month
+                            from CTE
+                            group by spoke_sta5a_combined_cdw
+                            	, crh_month;") %>%
+  mutate(crh_month = ymd(crh_month))
+```
+
+```{r cdw_cc_refs}
+cc_refs_cdw <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].G_pc_communityCare_referrals
+                          where non_va = 1") %>%
+  mutate(ActivityDateTime = ymd_hms(ActivityDateTime),
+         month_n = month(ActivityDateTime),
+         qtr = case_when(month_n %in% c(10, 11, 12) ~ 1,
+                         month_n %in% c(1, 2, 3) ~ 2,
+                         month_n %in% c(4, 5, 6) ~ 3,
+                         month_n %in% c(7, 8, 9) ~ 4),
+         fy = if_else(qtr == 1, year(ActivityDateTime) + 1, year(ActivityDateTime)),
+         fy_qtr = str_c(fy, qtr, sep = "_"),
+         pccc_ref_month = ymd(str_c(year(ActivityDateTime), month(ActivityDateTime), "01", sep = "-"))) %>%
+  rename(sta5a = Sta6a) %>% 
+  filter(fy_qtr != "2022_4") %>%
+  inner_join(., sta5as_to_include)
+#
+pccc_refs_sta5a_month <- cc_refs_cdw %>%
+  group_by(pccc_ref_month, sta5a) %>%
+  summarise(pc_referral_count = n()) %>%
+  inner_join(., sta5as_to_include %>% select(sta5a))
+```
+
+```{r total_pc_encounters}
+total_pc_encounters <- dbGetQuery(oabi_con,
+                                  "select *
+                                  from [OABI_MyVAAccess].[crh_eval].[A1_pc_enc_scrssn_count]") %>%
+  mutate(visitMonth = ymd(visitMonth))
+```
+
+# PC CRH & PC Community Referrals Over Time  
+```{r}
+pc_crh_pccc_refs_df <- sta5as_to_include %>%
+  select(sta5a) %>%
+  full_join(., total_pc_encounters %>% select(visitMonth) %>% distinct(), by = character()) %>%
+  filter(visitMonth > ymd("2018-09-01") & visitMonth < ymd("2022-06-01")) %>%
+  left_join(., crh_encounters_month, by = c("sta5a", "visitMonth" = "crh_month")) %>%
+  left_join(., pccc_refs_sta5a_month, by = c("sta5a", "visitMonth" = "pccc_ref_month")) %>%
+  left_join(., total_pc_encounters %>% select(sta5a = Sta6a, visitMonth, scrssn_count, pc_encounter_total), 
+            by = c("sta5a", "visitMonth")) %>%
+  left_join(., vast %>% select(sta5a, parent_station_sta5a, parent_visn))
+  
+```
+
+## National    
+
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  pivot_longer(-visitMonth) %>%
+  mutate(name_lab = case_when(str_detect(name, "pc_ref") == T ~ "PC CC Referrals",
+                              str_detect(name, "crh_enc") == T ~"PC CRH Encounters",
+                              TRUE ~ "CRH Uniques")) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_aaas() +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format(accuracy = 1)) +
+      geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+                 lty = 2) +
+  theme(axis.title = element_blank())
+
+```
+
+  
+## By VISN  
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, parent_visn) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  pivot_longer(-c(visitMonth, parent_visn)) %>%
+  mutate(name_lab = case_when(str_detect(name, "pc_ref") == T ~ "PC CC Referrals",
+                              str_detect(name, "crh_enc") == T ~"PC CRH Encounters",
+                              TRUE ~ "CRH Uniques")) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_nejm() +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format(accuracy = 1)) +
+      geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+                 lty = 2) +
+  facet_wrap(~parent_visn) +
+      theme(legend.position = "bottom",
+            axis.text.x = element_text(angle = 270, vjust = 0.4),
+            axis.title = element_blank())
+
+```
+
+## By Parent Station I  
+
+```{r}
+parent_station_and_visn <- vast %>% select(parent_station_sta5a, parent_visn)
+#
+parent_visns <- parent_station_and_visn %>% select(parent_visn) %>% distinct %>% arrange(parent_visn) %>% pull
+#--
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, parent_visn, parent_station_sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  pivot_longer(-c(visitMonth, parent_visn, parent_station_sta5a)) %>%
+  left_join(., vast %>% select(parent_station_sta5a = sta5a, short_name)) %>%
+  mutate(name_lab = case_when(str_detect(name, "pc_ref") == T ~ "PC CC Referrals",
+                              str_detect(name, "crh_enc") == T ~"PC CRH Encounters",
+                              TRUE ~ "CRH Uniques")) %>%
+  filter(parent_visn %in% parent_visns[1:3]) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_nejm() +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format(accuracy = 1)) +
+      geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+                 lty = 2) +
+  facet_wrap(~short_name) +
+      theme(axis.text.x = element_text(angle = 270, vjust = 0.4),
+            axis.title = element_blank(),
+            legend.position = "bottom") +
+  labs(title = "VISNs 1, 2, & 4")
+
+```
+
+
+## By Parent Station II  
+
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, parent_visn, parent_station_sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  pivot_longer(-c(visitMonth, parent_visn, parent_station_sta5a)) %>%
+  left_join(., vast %>% select(parent_station_sta5a = sta5a, short_name)) %>%
+  mutate(name_lab = case_when(str_detect(name, "pc_ref") == T ~ "PC CC Referrals",
+                              str_detect(name, "crh_enc") == T ~"PC CRH Encounters",
+                              TRUE ~ "CRH Uniques")) %>%
+  filter(parent_visn %in% parent_visns[4:6]) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_nejm() +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format(accuracy = 1)) +
+      geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+                 lty = 2) +
+  facet_wrap(~short_name) +
+      theme(axis.text.x = element_text(angle = 270, vjust = 0.4),
+            axis.title = element_blank(),
+            legend.position = "bottom") +
+  labs(title = "VISNs 5, 6, & 7")
+
+```
+
+## By Parent Station III  
+
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, parent_visn, parent_station_sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  pivot_longer(-c(visitMonth, parent_visn, parent_station_sta5a)) %>%
+  left_join(., vast %>% select(parent_station_sta5a = sta5a, short_name)) %>%
+  mutate(name_lab = case_when(str_detect(name, "pc_ref") == T ~ "PC CC Referrals",
+                              str_detect(name, "crh_enc") == T ~"PC CRH Encounters",
+                              TRUE ~ "CRH Uniques")) %>%
+  filter(parent_visn %in% parent_visns[7:9]) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_nejm() +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format(accuracy = 1)) +
+      geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+                 lty = 2) +
+  facet_wrap(~short_name) +
+      theme(axis.text.x = element_text(angle = 270, vjust = 0.4),
+            axis.title = element_blank(),
+            legend.position = "bottom") +
+  labs(title = "VISNs 8, 9 & 10")
+
+```
+
+## By Parent Station IV  
+
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, parent_visn, parent_station_sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  pivot_longer(-c(visitMonth, parent_visn, parent_station_sta5a)) %>%
+  left_join(., vast %>% select(parent_station_sta5a = sta5a, short_name)) %>%
+  mutate(name_lab = case_when(str_detect(name, "pc_ref") == T ~ "PC CC Referrals",
+                              str_detect(name, "crh_enc") == T ~"PC CRH Encounters",
+                              TRUE ~ "CRH Uniques")) %>%
+  filter(parent_visn %in% parent_visns[10:12]) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_nejm() +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format(accuracy = 1)) +
+      geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+                 lty = 2) +
+  facet_wrap(~short_name) +
+      theme(axis.text.x = element_text(angle = 270, vjust = 0.4),
+            axis.title = element_blank(),
+            legend.position = "bottom") +
+  labs(title = "VISNs 12, 15, & 16")
+
+```
+
+
+
+## By Parent Station V  
+
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, parent_visn, parent_station_sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  pivot_longer(-c(visitMonth, parent_visn, parent_station_sta5a)) %>%
+  left_join(., vast %>% select(parent_station_sta5a = sta5a, short_name)) %>%
+  mutate(name_lab = case_when(str_detect(name, "pc_ref") == T ~ "PC CC Referrals",
+                              str_detect(name, "crh_enc") == T ~"PC CRH Encounters",
+                              TRUE ~ "CRH Uniques")) %>%
+  filter(parent_visn %in% parent_visns[13:15]) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_nejm() +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format(accuracy = 1)) +
+      geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+                 lty = 2) +
+  facet_wrap(~short_name) +
+      theme(axis.text.x = element_text(angle = 270, vjust = 0.4),
+            axis.title = element_blank(),
+            legend.position = "bottom") +
+  labs(title = "VISNs 17, 19, 20")
+
+```
+
+## By Parent Station VI  
+
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, parent_visn, parent_station_sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  pivot_longer(-c(visitMonth, parent_visn, parent_station_sta5a)) %>%
+  left_join(., vast %>% select(parent_station_sta5a = sta5a, short_name)) %>%
+  mutate(name_lab = case_when(str_detect(name, "pc_ref") == T ~ "PC CC Referrals",
+                              str_detect(name, "crh_enc") == T ~"PC CRH Encounters",
+                              TRUE ~ "CRH Uniques")) %>%
+  filter(parent_visn %in% parent_visns[16:18]) %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  ggsci::scale_color_nejm() +
+  scale_y_continuous(limits = c(0, NA), labels = comma_format(accuracy = 1)) +
+      geom_vline(xintercept = as.numeric(ymd("2020-03-15")),
+                 lty = 2) +
+  facet_wrap(~short_name) +
+      theme(axis.text.x = element_text(angle = 270, vjust = 0.4),
+            axis.title = element_blank(),
+            legend.position = "bottom") +
+  labs(title = "VISNs 21, 22, & 23")
+
+```
+
+
+## By Sta5a, As a Scatter Plot  
+
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  mutate(all_3_zero = if_else(crh_encounter_count == 0 & crh_scrssn_count == 0 & pc_referral_count == 0, TRUE, FALSE)) %>%
+  filter(all_3_zero == F) %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, y = pc_referral_count)) +
+  geom_point(alpha = 0.4) +
+  geom_smooth(method = "lm", se = F) +
+  labs(x = "PC CRH Encounters per Month",
+       y = "PC CC Referrals per Month") +
+  scale_y_continuous(labels = comma_format(accuracy = 1))
+
+```
+
+```{r}
+pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  mutate(all_3_zero = if_else(crh_encounter_count == 0 & crh_scrssn_count == 0 & pc_referral_count == 0, TRUE, FALSE)) %>%
+  filter(all_3_zero == F) %>%
+  lm(pc_referral_count ~ crh_encounter_count, data = .) %>%
+  summary()
+```

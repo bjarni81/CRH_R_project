@@ -1,0 +1,515 @@
+---
+title: "CRH Encounters & PC CC Referrals Plotted Together"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(lme4)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+pactcc_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#
+every_nth = function(n) {
+  return(function(x) {x[c(TRUE, rep(FALSE, n - 1))]})
+}
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#Uniques in PCMM, categorized
+scrssn_count <- dbGetQuery(pactcc_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2019
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy19, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy19 < 450 ~ "< 450",
+    scrssn_count_avg_fy19 >= 450 & scrssn_count_avg_fy19 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy19 >= 2400 & scrssn_count_avg_fy19 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy19 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#####
+sta5as_to_include <- scrssn_count %>% 
+  filter(scrssn_count_cat != "< 450") %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  filter(is.na(parent_visn) == F)
+```
+
+```{r crh_penRate}
+# CRH penetration rate and monthly encounters by sta5a
+crh_encounters_month <- dbGetQuery(oabi_con,
+                          "with CTE as(
+                            	select *
+                            		, DATEFROMPARTS(year(visitdate), month(visitdate), '01') as crh_month
+                            	from [PACT_CC].[CRH].C_crh_utilization_final
+                            	where care_type = 'Primary Care'
+                            	)
+                            select count(*) as crh_encounter_count, count(distinct scrssn) as crh_scrssn_count
+                            	, spoke_sta5a_combined_cdw as sta5a
+                            	, crh_month
+                            from CTE
+                            group by spoke_sta5a_combined_cdw
+                            	, crh_month;") %>%
+  mutate(crh_month = ymd(crh_month))
+```
+
+```{r cdw_cc_refs}
+cc_refs_cdw <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].G_pc_communityCare_referrals
+                          where non_va = 1") %>%
+  mutate(ActivityDateTime = ymd_hms(ActivityDateTime),
+         month_n = month(ActivityDateTime),
+         qtr = case_when(month_n %in% c(10, 11, 12) ~ 1,
+                         month_n %in% c(1, 2, 3) ~ 2,
+                         month_n %in% c(4, 5, 6) ~ 3,
+                         month_n %in% c(7, 8, 9) ~ 4),
+         fy = if_else(qtr == 1, year(ActivityDateTime) + 1, year(ActivityDateTime)),
+         fy_qtr = str_c(fy, qtr, sep = "_"),
+         pccc_ref_month = ymd(str_c(year(ActivityDateTime), month(ActivityDateTime), "01", sep = "-"))) %>%
+  rename(sta5a = Sta6a) %>% 
+  filter(fy_qtr != "2022_4") %>%
+  inner_join(., sta5as_to_include)
+#
+pccc_refs_sta5a_month <- cc_refs_cdw %>%
+  group_by(pccc_ref_month, sta5a) %>%
+  summarise(pc_referral_count = n()) %>%
+  inner_join(., sta5as_to_include %>% select(sta5a))
+```
+
+```{r total_pc_encounters}
+total_pc_encounters <- dbGetQuery(oabi_con,
+                                  "select *
+                                  from [OABI_MyVAAccess].[crh_eval].[A1_pc_enc_scrssn_count]") %>%
+  mutate(visitMonth = ymd(visitMonth))
+```
+
+
+```{r assembling_pccc_and_crh_df}
+pc_crh_pccc_refs_df <- sta5as_to_include %>%
+  select(sta5a) %>%
+  full_join(., total_pc_encounters %>% select(visitMonth) %>% distinct(), by = character()) %>%
+  filter(visitMonth > ymd("2018-09-01") & visitMonth < ymd("2022-06-01")) %>%
+  left_join(., crh_encounters_month, by = c("sta5a", "visitMonth" = "crh_month")) %>%
+  left_join(., pccc_refs_sta5a_month, by = c("sta5a", "visitMonth" = "pccc_ref_month")) %>%
+  left_join(., total_pc_encounters %>% select(sta5a = Sta6a, visitMonth, scrssn_count, pc_encounter_total), 
+            by = c("sta5a", "visitMonth")) %>%
+  left_join(., vast %>% select(sta5a, parent_station_sta5a, parent_visn))
+  
+```
+
+```{r access_metrics}
+file_paths <- list.files(path = "H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/CRH_r_project/Input/Analytic df/E2_vssc_cube_access_metrics", pattern = "visn",
+                         full.names = TRUE)
+#
+est_pt_wt_visn_month <- read_csv(file_paths[1]) %>%
+  rename_all(tolower) %>%
+  mutate(month_n = match(str_to_title(str_sub(`fiscal date`, end = 3)), month.abb),
+         fy = as.numeric(str_sub(`fiscal date`, start = -2)),
+         cy2 = if_else(month_n > 9, fy - 1, fy),
+         cy = as.numeric(str_c("20", cy2)),
+         vssc_month = ymd(str_c(cy, month_n, "01", sep = "-")),
+         visn = str_sub(visn, start = 2)) %>%
+  select(visn, vssc_month, value = 3)
+#
+new_pt_wt_visn_month <- read_csv(file_paths[2]) %>%
+  rename_all(tolower) %>%
+  mutate(month_n = match(str_to_title(str_sub(`fiscal date`, end = 3)), month.abb),
+         fy = as.numeric(str_sub(`fiscal date`, start = -2)),
+         cy2 = if_else(month_n > 9, fy - 1, fy),
+         cy = as.numeric(str_c("20", cy2)),
+         vssc_month = ymd(str_c(cy, month_n, "01", sep = "-")),
+         visn = str_sub(visn, start = 2)) %>%
+  select(visn, vssc_month, value = 3)
+#
+tna_visn_month <- read_csv(file_paths[3]) %>%
+  rename_all(tolower) %>%
+  mutate(month_n = match(str_to_title(str_sub(`fiscal date`, end = 3)), month.abb),
+         fy = as.numeric(str_sub(`fiscal date`, start = -2)),
+         cy2 = if_else(month_n > 9, fy - 1, fy),
+         cy = as.numeric(str_c("20", cy2)),
+         vssc_month = ymd(str_c(cy, month_n, "01", sep = "-")),
+         visn = str_sub(visn, start = 2)) %>%
+  select(visn, vssc_month, value = 3)
+```
+
+```{r avg_pcmm_uniques_visn}
+#--
+avg_pcmm_uniques_fy20_by_VISN <- dbGetQuery(oabi_con,
+                                            "with CTE as(
+                                            select count(distinct scrssn_char) as scrssn_count, b.parent_visn, fy, qtr
+                                            from [pact_cc].[econ].patientPCP as a
+                                            inner join [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06 as b
+                                            on a.sta5a = b.sta5a
+                                            where fy = 2020
+                                            group by parent_visn, fy, qtr
+                                            )
+                                            select avg(scrssn_count) as scrssn_count_avg_fy20, parent_visn, fy
+                                            from CTE 
+                                            group by parent_visn, fy")
+```
+
+```{r analytic_df_assembly}
+total_enc_visn <- total_pc_encounters %>%
+  left_join(., vast %>% select(Sta6a = sta5a, parent_visn)) %>%
+  group_by(parent_visn, visitMonth) %>%
+  summarise(pc_encounter_total  = sum(pc_encounter_total, na.rm = T))
+#==--
+time_df <- pc_crh_pccc_refs_df %>%
+  select(visitMonth) %>%
+  distinct %>%
+  arrange(visitMonth) %>%
+  rownames_to_column(., var = "time") %>%
+  mutate(time = as.numeric(time))
+#
+analytic_df <- pc_crh_pccc_refs_df %>%
+  group_by(visitMonth, parent_visn) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = TRUE),
+            crh_scrssn_count = sum(crh_scrssn_count, na.rm = T),
+            pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  left_join(., total_enc_visn) %>%
+  left_join(., avg_pcmm_uniques_fy20_by_VISN) %>%
+  left_join(., est_pt_wt_visn_month %>% rename(est_pt_wt = value), 
+            by = c("parent_visn" = "visn", "visitMonth" = "vssc_month")) %>%
+  left_join(., new_pt_wt_visn_month %>% rename(new_pt_wt = value), 
+            by = c("parent_visn" = "visn", "visitMonth" = "vssc_month")) %>%
+  left_join(., tna_visn_month %>% rename(third_next_avail = value), 
+            by = c("parent_visn" = "visn", "visitMonth" = "vssc_month")) %>%
+  mutate(crh_per_1k_pc_enc = crh_encounter_count / pc_encounter_total * 1000,
+         pccc_per_1k_pc_enc = pc_referral_count / pc_encounter_total * 1000,
+         crh_per_1k_uniques = crh_encounter_count / scrssn_count_avg_fy20 * 1000,
+         pccc_per_1k_uniques = pc_referral_count / scrssn_count_avg_fy20 * 1000) %>%
+  left_join(., time_df)
+```
+
+# PC CC Referrals per Month, by VISN  
+```{r}
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = visitMonth, y = pc_referral_count, group = parent_visn, color = parent_visn)) +
+  geom_line() +
+  facet_wrap(~parent_visn) +
+  labs(x = "Month",
+       y = "PCCC Referrals per Month") +
+  scale_y_continuous(labels = comma_format()) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.position = "none")
+```
+
+```{r}
+analytic_df %>%
+  ggplot(data = .,
+         aes(y = pc_referral_count, x = parent_visn, fill = parent_visn)) +
+  geom_boxplot() +
+  theme(legend.position = "none") +
+  labs(x = "VISN",
+       y = "PCCC Referrals per Month") +
+  scale_y_continuous(labels = comma_format())
+```
+
+## Looks like 3 buckets  
+```{r}
+analytic_df %>%
+  group_by(parent_visn) %>%
+  summarise(pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  mutate(parent_visn = fct_reorder(parent_visn, desc(pc_referral_count))) %>%
+  arrange(parent_visn) %>%
+  rownames_to_column(., var = "rank")   %>%
+  ggplot(data = .) +
+  geom_col(aes(x = reorder(parent_visn, rank), y = pc_referral_count)) +
+  annotate(geom = "rect", ymin = 0, ymax = Inf,
+           xmin = 0.5, xmax = 1.49, fill = "red", alpha = 0.3) +
+  annotate(geom = "rect", ymin = 0, ymax = Inf,
+           xmin = 1.51, xmax = 11.49, fill = "blue", alpha = 0.3) +
+  annotate(geom = "rect", ymin = 0, ymax = Inf,
+           xmin = 11.51, xmax = 18.5, fill = "green", alpha = 0.3) +
+  geom_col(aes(x = reorder(parent_visn, rank), y = pc_referral_count)) +
+  scale_y_continuous(labels = comma_format(accuracy = 1),
+                     breaks = c(4000, 10000, 20000, 30000),
+                     limits = c(0, NA)) +
+  labs(y = "PC CC Referrals, total",
+        x = "VISN")
+```
+
+```{r analytic_df2}
+groups_of_pccc_sums <- analytic_df %>%
+  group_by(parent_visn) %>%
+  summarise(pc_referral_count = sum(pc_referral_count, na.rm = T)) %>%
+  mutate(pccc_total_cat = factor(case_when(pc_referral_count < 4000 ~ "< 4,000 total PCCCs",
+                                    pc_referral_count >= 4000 & pc_referral_count < 20000 ~ "4,000 - 19,999 PCCCs",
+                                    pc_referral_count >= 20000 ~ "> 19,999 PCCCs"),
+                                 ordered = TRUE,
+                                 levels = c("< 4,000 total PCCCs", "4,000 - 19,999 PCCCs", "> 19,999 PCCCs"))) %>%
+  select(parent_visn, pccc_total_cat)
+#-----
+analytic_df2 <- analytic_df %>%
+  left_join(., groups_of_pccc_sums)
+```
+
+# Correlation between PC CRH Encounters and PC CC Referrals  
+```{r}
+analytic_df2 %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, y = pc_referral_count)) +
+  geom_smooth(method = "lm", se = F) +
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(x = "CRH Encounters per Month",
+       y = "PC CC Referrals per Month")
+```
+
+* These two variables have a Pearson correlation of `r round(cor(analytic_df$crh_encounter_count, analytic_df$pc_referral_count), 2)`
+
+```{r}
+analytic_df2 %>%
+  lm(pc_referral_count ~ crh_encounter_count,
+     data = .) %>%
+  summary()
+```
+
+# Correlation between PC CRH Encounters and PC CC Referrals, By Category of PC CC Referrals      
+```{r}
+analytic_df2 %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, y = pc_referral_count)) +
+  geom_smooth(method = "lm", se = F) +
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(x = "CRH Encounters per Month",
+       y = "PC CC Referrals per Month") +
+  facet_wrap(~pccc_total_cat)
+```
+
+## < 4,000 total PCCCs   
+```{r}
+analytic_df2 %>%
+  filter(pccc_total_cat == "< 4,000 total PCCCs") %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, y = pc_referral_count)) +
+  geom_smooth(method = "lm", se = F) +
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(x = "CRH Encounters per Month",
+       y = "PC CC Referrals per Month")
+```
+
+### By VISN  
+```{r}
+analytic_df2 %>%
+  filter(pccc_total_cat == "< 4,000 total PCCCs") %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, y = pc_referral_count)) +
+  geom_smooth(method = "lm", se = F) +
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(x = "CRH Encounters per Month",
+       y = "PC CC Referrals per Month") +
+  facet_wrap(~parent_visn)
+```
+
+```{r}
+lt_4k_df <- analytic_df2 %>%
+  filter(pccc_total_cat == "< 4,000 total PCCCs")
+```
+
+* The Pearson correlation is `r round(cor(lt_4k_df$crh_encounter_count, lt_4k_df$pc_referral_count), 2)`
+
+```{r}
+lt_4k_df %>%
+  lm(pc_referral_count ~ crh_encounter_count,
+     data = .) %>%
+  summary()
+```
+
+## 4,000 - 19,999 PCCCs     
+```{r}
+analytic_df2 %>%
+  filter(pccc_total_cat == "4,000 - 19,999 PCCCs") %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, y = pc_referral_count)) +
+  geom_smooth(method = "lm", se = F) +
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(x = "CRH Encounters per Month",
+       y = "PC CC Referrals per Month")
+```
+
+### By VISN  
+```{r}
+analytic_df2 %>%
+  filter(pccc_total_cat == "4,000 - 19,999 PCCCs") %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, y = pc_referral_count)) +
+  geom_smooth(method = "lm", se = F) +
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(x = "CRH Encounters per Month",
+       y = "PC CC Referrals per Month") +
+  facet_wrap(~parent_visn)
+```
+
+```{r}
+gt4k_lt20k_df <- analytic_df2 %>%
+  filter(pccc_total_cat == "4,000 - 19,999 PCCCs")
+```
+
+* The Pearson correlation is `r round(cor(gt4k_lt20k_df$crh_encounter_count, gt4k_lt20k_df$pc_referral_count), 2)`
+
+```{r}
+gt4k_lt20k_df %>%
+  lm(pc_referral_count ~ crh_encounter_count,
+     data = .) %>%
+  summary()
+```
+
+## > 19,999 PCCCs (i.e., VISN 20)     
+```{r}
+analytic_df2 %>%
+  filter(pccc_total_cat == "> 19,999 PCCCs") %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, y = pc_referral_count)) +
+  geom_smooth(method = "lm", se = F) +
+  geom_point(alpha = 0.4) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(x = "CRH Encounters per Month",
+       y = "PC CC Referrals per Month")
+```
+
+
+
+```{r}
+visn20_df <- analytic_df2 %>%
+  filter(pccc_total_cat == "> 19,999 PCCCs")
+```
+
+* The Pearson correlation is `r round(cor(visn20_df$crh_encounter_count, visn20_df$pc_referral_count), 2)`
+
+```{r}
+visn20_df %>%
+  lm(pc_referral_count ~ crh_encounter_count,
+     data = .) %>%
+  summary()
+```
+
+# How about a little analysis?  
+
+## Model 1  
+* Model 1 includes all VISNs   
+    + Outcome is _Established Patient Wait Time_
+    + In the RHS we have 
+        + CRH Encounters per 1,000 Uniques 
+        + PC CC Referrals per 1,000 Uniques
+        + Time (months since October, 2018)
+        + Interactions between the 3 terms above
+        + A random intercept for VISN  
+        
+```{r}
+
+lmer.1 <- analytic_df2 %>%
+  lmer(est_pt_wt ~ crh_per_1k_uniques*pccc_per_1k_uniques*time + (1|parent_visn),
+       data = .)
+#
+summary(lmer.1)
+#anova(lmer.1)
+```
+
+## Model 2  
+* Model 2 includes only VISNs with 4,000 - 19,999 PCCCs      
+    + Outcome is _Established Patient Wait Time_
+    + In the RHS we have 
+        + CRH Encounters per 1,000 Uniques 
+        + PC CC Referrals per 1,000 Uniques
+        + Time (months since October, 2018)
+        + Interactions between the 3 terms above
+        + A random intercept for VISN  
+        
+```{r}
+
+lmer.2 <- analytic_df2 %>%
+  filter(pccc_total_cat == "4,000 - 19,999 PCCCs") %>%
+  lmer(est_pt_wt ~ crh_per_1k_uniques*pccc_per_1k_uniques*time + (1|parent_visn),
+       data = .)
+#
+summary(lmer.2)
+#anova(lmer.2)
+```
+
+## Model 3  
+* Model 3 includes only VISN 20        
+    + Outcome is _Established Patient Wait Time_
+    + In the RHS we have 
+        + CRH Encounters per 1,000 Uniques 
+        + PC CC Referrals per 1,000 Uniques
+        + Time (months since October, 2018)
+        + Interactions between the 3 terms above  
+        
+```{r}
+
+lmer.3 <- analytic_df2 %>%
+  filter(parent_visn == "20") %>%
+  lm(est_pt_wt ~ crh_per_1k_uniques*pccc_per_1k_uniques*time,
+       data = .)
+#
+summary(lmer.3)
+#anova(lmer.2)
+```

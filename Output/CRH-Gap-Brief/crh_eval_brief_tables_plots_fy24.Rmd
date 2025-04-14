@@ -1,0 +1,424 @@
+---
+title: "CRH Evaluation Brief FYTD2024"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+            # legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2023-10-01"), ymd("2024-06-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness)
+#--
+sta5as_to_start <- vast %>%
+  left_join(., scrssn_count %>%
+              select(sta5a, scrssn_count_cat)) %>%
+  filter(s_abbr %in% c("PCCBOC", "MSCBOC", "HCC", "OOS", "VAMC")
+         & scrssn_count_cat != "< 450") %>%
+  select(sta5a)
+#
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [PACT_CC].[CRH].[vw_gapMetric]") %>%
+  mutate(vssc_month = ymd(str_c(cy, mth_num, "01", sep = "-")),
+         gap_metric = expectedPanelSize_total / as.numeric(observedPanelSize_AllTeamTypes),
+         gap_capped = if_else(gap_metric > 3, 3, gap_metric),
+         gap_cat = factor(case_when(gap_metric < 1.0 ~ "< 1.0",
+                                    gap_metric >= 1.0 & gap_metric <= 1.2 ~ "1.0 - 1.2",
+                                    gap_metric > 1.2 ~ "> 1.2",
+                                     TRUE ~ "Missing"),
+                          ordered = TRUE,
+                          levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing"))) %>%
+  rename(sta5a = sta6a) %>%
+  inner_join(., sta5as_to_start %>%
+               cross_join(., dates %>%
+                            select(vssc_month)),
+             by = c("sta5a", "vssc_month"))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+pc_enc <- dbGetQuery(oabi_con,
+                     "select *
+                      from [OABI_MyVAAccess].[crh_eval].A1_pc_enc_scrssn_count") %>%
+  rename(sta5a = Sta6a,
+         vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month))
+#---
+visn_lower_48 <- sf::st_read("//v23.med.va.gov/v23/IOW/Research/HSRD/HSRD_General/General/Bjarni/VA Maps/VISN maps/FY2017_Q4_VISN/visn.48")
+```
+
+```{r}
+#==
+analytic_df <- sta5as_to_start %>%
+  cross_join (., dates %>%
+                select(vssc_month)) %>%
+  left_join(., gap_metric %>%
+              select(sta5a, vssc_month, gap_metric)) %>%
+  left_join(., pen_rate %>%
+              select(sta5a, vssc_month, crh_encounter_count)) %>%
+  left_join(., ps_matched %>%
+              select(sta5a, treated, treated_num)) %>%
+  left_join(., access_metrics %>%
+              select(sta5a, vssc_month, panel_fullness)) %>%
+  inner_join(., vast %>%
+              select(sta5a, parent_visn)) %>%
+  mutate(crh_encounter_count0 = replace_na(crh_encounter_count, 0),
+         treated_num = replace_na(treated_num, 0),
+         treated = replace_na(treated, "Control"),
+         gap_cat = factor(case_when(gap_metric < 1.0 ~ "< 1.0",
+                             gap_metric >= 1.0 & gap_metric <= 1.2 ~ "1.0 - 1.2",
+                             gap_metric > 1.2 ~ "> 1.2",
+                             TRUE ~ "Missing"),
+                          ordered = TRUE,
+                          levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing")),
+         pf_cat = case_when(panel_fullness > 1.05 ~ "> 105%",
+                            panel_fullness >= 0.8 & panel_fullness <= 1.05 ~ "80% - 105%",
+                            panel_fullness < 0.8 ~ "< 80%"))
+```
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This document supplies table(s) and plots/maps for the CRH evaluation brief
+* The data included here come from the first 9 months of FY24 (i.e., October 2023 - June 2024)
+
+
+```{r table_assembly}
+table_1 <- analytic_df %>%
+  group_by(parent_visn) %>%
+  summarise(n_sta5a = n_distinct(sta5a),
+            n_months = n_sta5a * 9) %>%
+  left_join(., analytic_df %>%
+              mutate(flag_ = if_else(treated_num == 0
+                                     & gap_metric < 1.0
+                                     & crh_encounter_count0 == 0, 1, 0)) %>%
+              arrange(sta5a, vssc_month) %>%
+              group_by(sta5a, parent_visn) %>%
+              mutate(months_meet_crit_3 = if_else(flag_ == 1 
+                                                  & lead(flag_, 1) == 1
+                                                  & lead(flag_, 2) == 1, 1, 0)) %>%
+              summarise(keep_me = if_else(sum(months_meet_crit_3) > 0, 1, 0),
+                        month_count = sum(months_meet_crit_3)) %>%
+              filter(keep_me == 1) %>%
+              group_by(parent_visn) %>%
+              summarise(ctrl_gap_noCrh = sum(month_count))) %>%
+  mutate(ctrl_gap_noCrh = replace_na(ctrl_gap_noCrh, 0)) %>%
+  left_join(., analytic_df %>%
+              filter(treated_num == 1) %>%
+              mutate(flag_ = if_else(gap_metric < 1.0, 1, 0)) %>%
+              group_by(parent_visn) %>%
+              summarise(month_count = sum(flag_, na.rm = T))) %>%
+  mutate(total = ctrl_gap_noCrh + month_count) %>%
+  select(parent_visn, n_sta5a, n_months, ctrl_gap_noCrh, month_count, total) %>%
+  mutate(prop_mos = month_count / total,
+         pct = percent(prop_mos, accuracy = 0.1))
+```
+
+# Penetration Rate Table  
+
+```{r}
+pen_rate_df <- sta5as_to_start %>%
+  cross_join (., dates %>%
+                select(vssc_month)) %>%
+  left_join(., pen_rate %>%
+              select(sta5a, vssc_month, crh_encounter_count)) %>%
+  left_join(., pc_enc %>%
+              select(sta5a, vssc_month, pc_encounter_total)) %>%
+  left_join(., vast %>%
+              select(sta5a, parent_visn, census_division))
+#------
+pen_rate_df %>%
+  summarise(crh_tot = sum(crh_encounter_count, na.rm = T),
+            pc_tot = sum(pc_encounter_total, na.rm = T),
+            pen_rate = crh_tot / pc_tot * 1000) %>%
+  mutate(crh_tot = comma(crh_tot, accuracy = 1),
+         pc_tot = comma(pc_tot, na.rm = T),
+         pen_rate = comma(pen_rate, accuracy = 0.01),
+         rowname = "National") %>%
+  bind_rows(., pen_rate_df %>%
+              group_by(census_division) %>%
+              summarise(crh_tot = sum(crh_encounter_count, na.rm = T),
+                        pc_tot = sum(pc_encounter_total, na.rm = T),
+                        pen_rate = crh_tot / pc_tot * 1000) %>%
+              mutate(crh_tot = comma(crh_tot, accuracy = 1),
+                     pc_tot = comma(pc_tot, na.rm = T),
+                     pen_rate = comma(pen_rate, accuracy = 0.01)) %>%
+              rename(rowname = census_division)) %>%
+  bind_rows(., pen_rate_df %>%
+              group_by(parent_visn) %>%
+              summarise(crh_tot = sum(crh_encounter_count, na.rm = T),
+                        pc_tot = sum(pc_encounter_total, na.rm = T),
+                        pen_rate = crh_tot / pc_tot * 1000) %>%
+              mutate(crh_tot = comma(crh_tot, accuracy = 1),
+                     pc_tot = comma(pc_tot, na.rm = T),
+                     pen_rate = comma(pen_rate, accuracy = 0.01)) %>%
+              rename(rowname = parent_visn)) %>%
+  select(rowname, crh_tot, pc_tot, pen_rate) %>%
+  kbl(col.names = c("", "PC CRH Encounters", "PC Encounters", "PC CRH per 1,000 Total PC"),
+      align = c("l", rep("r", 3)),
+      escape = F) %>%
+  kable_classic("striped") %>%
+  pack_rows("Census Division",
+            2, 10) %>%
+  pack_rows("VISN",
+            11, 28) %>%
+  row_spec(0,
+           bold = TRUE,
+           font_size = 16)
+```
+
+
+
+
+
+
+# Table 1 - Gap Metric       
+
+```{r}
+
+visn_map <- left_join(visn_lower_48, table_1 %>% 
+                             select(parent_visn, prop_mos),
+                           by = c("visn" = "parent_visn"))
+#------
+ggplot(data = visn_map) +
+  geom_sf(aes(fill = prop_mos)) +
+  scale_fill_distiller(palette = "RdYlGn",
+                       labels = percent_format(),
+                       direction = 1,
+                       limits = c(0, 1)) +
+  theme(legend.position = "right",
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "skyblue"),
+        legend.title = element_blank())
+```
+
+```{r}
+table_1 %>%
+  select(-prop_mos) %>%
+  adorn_totals() %>%
+  mutate(across(where(is.numeric), ~comma(.x))) %>%
+  kbl(col.names = c("VISN", "Clinics in VISN", "Total Clinic Months", "No Meaningful CRH Use", "Meaningful CRH Use", "Total", 
+                    "Percent of Understaffed Months Covered by CRH"),
+      align = c("c", "c", rep("r", 5))) %>%
+  kable_classic("striped") %>%
+  row_spec(c(0, 19), bold = T) %>%
+  add_header_above(c(" " = 3, "Understaffed Clinic Months" = 3, " "),
+                   bold = TRUE,
+                   font_size = 22) %>%
+  column_spec(c(3, 6), border_right = TRUE)
+```
+
+## Table 1b  
+
+```{r table2_assembly}
+table_2 <- analytic_df %>%
+  group_by(parent_visn) %>%
+  summarise(n_sta5a = n_distinct(sta5a),
+            n_months = n_sta5a * 9) %>%
+  left_join(., analytic_df %>%
+              mutate(flag_ = if_else(treated_num == 0
+                                     & gap_metric >= 1.0 & gap_metric <= 1.2
+                                     & crh_encounter_count0 == 0, 1, 0)) %>%
+              arrange(sta5a, vssc_month) %>%
+              group_by(sta5a, parent_visn) %>%
+              mutate(months_meet_crit_3 = if_else(flag_ == 1 
+                                                  & lead(flag_, 1) == 1
+                                                  & lead(flag_, 2) == 1, 1, 0)) %>%
+              summarise(keep_me = if_else(sum(months_meet_crit_3) > 0, 1, 0),
+                        month_count = sum(months_meet_crit_3)) %>%
+              filter(keep_me == 1) %>%
+              group_by(parent_visn) %>%
+              summarise(ctrl_gap_noCrh = sum(month_count))) %>%
+  mutate(ctrl_gap_noCrh = replace_na(ctrl_gap_noCrh, 0)) %>%
+  left_join(., analytic_df %>%
+              filter(treated_num == 1) %>%
+              mutate(flag_ = if_else(gap_metric >= 1.0 & gap_metric <= 1.2, 1, 0)) %>%
+              group_by(parent_visn) %>%
+              summarise(month_count = sum(flag_, na.rm = T))) %>%
+  mutate(total = ctrl_gap_noCrh + month_count) %>%
+  select(parent_visn, n_sta5a, n_months, ctrl_gap_noCrh, month_count, total) %>%
+  mutate(prop_mos = month_count / total,
+         pct = percent(prop_mos, accuracy = 0.1))
+#
+table_2  %>%
+  select(-prop_mos) %>%
+  adorn_totals() %>%
+  mutate(across(where(is.numeric), ~comma(.x))) %>%
+  kbl(col.names = c("VISN", "Clinics in VISN", "Total Clinic Months", "No Meaningful CRH Use", "Meaningful CRH Use", "Total", 
+                    "Percent of Gap 1.0-1.2 Months Covered by CRH"),
+      align = c("c", "c", rep("r", 5))) %>%
+  kable_classic("striped") %>%
+  row_spec(c(0, 19), bold = T) %>%
+  add_header_above(c(" " = 3, "Gap 1.0-1.2 Clinic Months" = 3, " "),
+                   bold = TRUE,
+                   font_size = 22) %>%
+  column_spec(c(3, 6), border_right = TRUE)
+```
+
+## Table 1c  
+
+```{r table3_assembly}
+table_3 <- analytic_df %>%
+  group_by(parent_visn) %>%
+  summarise(n_sta5a = n_distinct(sta5a),
+            n_months = n_sta5a * 9) %>%
+  left_join(., analytic_df %>%
+              mutate(flag_ = if_else(treated_num == 0
+                                     & gap_metric > 1.2
+                                     & crh_encounter_count0 == 0, 1, 0)) %>%
+              arrange(sta5a, vssc_month) %>%
+              group_by(sta5a, parent_visn) %>%
+              mutate(months_meet_crit_3 = if_else(flag_ == 1 
+                                                  & lead(flag_, 1) == 1
+                                                  & lead(flag_, 2) == 1, 1, 0)) %>%
+              summarise(keep_me = if_else(sum(months_meet_crit_3) > 0, 1, 0),
+                        month_count = sum(months_meet_crit_3)) %>%
+              filter(keep_me == 1) %>%
+              group_by(parent_visn) %>%
+              summarise(ctrl_gap_noCrh = sum(month_count))) %>%
+  mutate(ctrl_gap_noCrh = replace_na(ctrl_gap_noCrh, 0)) %>%
+  left_join(., analytic_df %>%
+              filter(treated_num == 1) %>%
+              mutate(flag_ = if_else(gap_metric > 1.2, 1, 0)) %>%
+              group_by(parent_visn) %>%
+              summarise(month_count = sum(flag_, na.rm = T))) %>%
+  mutate(total = ctrl_gap_noCrh + month_count) %>%
+  select(parent_visn, n_sta5a, n_months, ctrl_gap_noCrh, month_count, total) %>%
+  mutate(prop_mos = month_count / total,
+         pct = percent(prop_mos, accuracy = 0.1))
+#
+table_3  %>%
+  select(-prop_mos) %>%
+  adorn_totals() %>%
+  mutate(across(where(is.numeric), ~comma(.x))) %>%
+  kbl(col.names = c("VISN", "Clinics in VISN", "Total Clinic Months", "No Meaningful CRH Use", "Meaningful CRH Use", "Total", 
+                    "Percent of Gap > 1.2 Months Covered by CRH"),
+      align = c("c", "c", rep("r", 5))) %>%
+  kable_classic("striped") %>%
+  row_spec(c(0, 19), bold = T) %>%
+  add_header_above(c(" " = 3, "Gap > 1.2 Clinic Months" = 3, " "),
+                   bold = TRUE,
+                   font_size = 22) %>%
+  column_spec(c(3, 6), border_right = TRUE)
+```
+
+

@@ -1,0 +1,722 @@
+---
+title: "VISN 23 - CRH Encounters Over Time"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = TRUE,
+                      fig.width = 12, fig.height = 12)
+
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(ggthemes)
+library(kableExtra)
+library(lubridate)
+library(scales)
+library(grid)
+library(DT)
+library(RODBC)
+library(DBI)
+library(janitor)
+library(here)
+#
+source(here("Input", "Functions", "customFacetWrap.R"))
+#
+options(scipen = 999)
+###
+`%ni%` <- negate(`%in%`)
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Truested_Connection = "true")
+#=============
+theme_update(
+  strip.text = element_text(size = 20),
+  axis.text = element_text(size = 15),
+  axis.title.y = element_text(size = 18),
+  axis.title.x = element_blank(),
+  axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+  legend.text = element_text(size = 14),
+  plot.title = element_text(size = 20),
+  legend.title = element_blank()
+)
+```
+
+```{r reading-in}
+access_metrics_sta5a <- read_csv(here("Input", "Data", "pc_access_metrics.csv")) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_parent <- read_csv(here("Input", "Data", "pc_access_metrics_parent.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_visn <- read_csv(here("Input", "Data", "pc_access_metrics_visn.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_nat <- read_csv(here("Input", "Data", "pc_access_metrics_nat.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+vast <- read_csv(here("Input","Data","VAST_from_A06_11jan21.csv"))
+#
+crh_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].crh_encounters_deDup") %>%
+  mutate(crh_month = ymd(crh_month)) %>%
+  filter(crh_month > ymd("2019-09-01"))
+#
+stopCodes <- crh_encounters %>% 
+  select(stopCode = location_primary_sc, stopCodeName = primarystopcodelocationname) %>% 
+  distinct %>%
+  bind_rows(., crh_encounters %>% 
+              select(stopCode = location_secondary_sc, stopCodeName = secondarystopcodelocationname) %>% distinct) %>%
+  distinct
+```
+
+# Access Metrics  
+## National  
+```{r}
+access_metrics_nat %>%
+  pivot_longer(-vssc_month) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(2,3))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+
+---
+
+## VISN 23     
+```{r}
+access_metrics_visn %>% filter(visn == "23") %>%
+  pivot_longer(-c(vssc_month, visn)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(2,3))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (618) Minneapolis, MN           
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "618") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(2,4))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (568) Fort Meade, SD         
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "568") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(2,4))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (438) Sioux Falls, SD         
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "438") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(1.5, 3))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (636) Omaha, NE         
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "636") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(1.5, 3))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (636A6) Des Moines, IA          
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "636A6") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(1.5, 3))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (636A8) Iowa City, IA          
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "636A8") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0, 65))),
+                      scale_override(2, scale_y_continuous(limits = c(0, 65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(3, 3.5), breaks = c(3, 3.25, 3.5))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0, 1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (656) St. Cloud, MN            
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "656") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(2,3.5))),
+                      scale_override(5, scale_y_continuous(limits = c(0.25, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (437) Fargo, ND            
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "437") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1.1))),
+                      scale_override(4, scale_y_continuous(limits = c(2, 3.5))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+
+# CRH Encounters  
+## National  
+```{r}
+crh_encounters_nat <- crh_encounters %>%
+  filter(care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n())
+#
+crh_encounters %>%
+  filter(care_type %ni% c("Missing crh")) %>%
+  mutate(fy_qtr = str_c(fy, qtr, sep = "-")) %>%
+  group_by(fy_qtr) %>%
+  summarise(count = n()) %>%
+  adorn_totals() %>%
+  kbl(col.names = c("FY-Qtr", "CRH Encounters")) %>%
+  kable_classic()
+#--
+ggplot(data = crh_encounters_nat,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#--==
+crh_encounters_type_nat <- crh_encounters %>%
+  filter(care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  mutate(care_type = str_remove(care_type, " crh"))
+#
+crh_encounters %>%
+  filter(care_type %ni% c("Missing crh")) %>%
+  mutate(fy_qtr = str_c(fy, qtr, sep = "-")) %>%
+  group_by(fy_qtr, care_type) %>%
+  summarise(count = n()) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  pivot_wider(names_from = care_type, values_from = count) %>%
+  adorn_totals() %>%
+  kbl(col.names = c("FY-Qtr", "Mental Health", "PCMHI", "Pharmacy", "Primary Care", "Specialty")) %>%
+  kable_classic()
+#
+ggplot(data = crh_encounters_type_nat,
+       aes(x = crh_month, y = count, group = care_type, color = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  facet_wrap(~care_type) +
+  theme(legend.position = "none")
+  
+```
+
+## VISN 23  
+```{r}
+crh_v23_tot <- crh_encounters %>%
+  filter(parent_visn == 23 & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n())
+#
+ggplot(data = crh_v23_tot,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#--
+crh_v23_type <- crh_encounters %>%
+  filter(parent_visn == 23 & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  mutate(care_type = str_remove(care_type, " crh"))
+#
+crh_encounters %>%
+  filter(parent_visn == 23 & care_type == "Specialty crh") %>%
+  group_by(psc_joined) %>%
+  summarise(count = n()) %>%
+  left_join(., stopCodes, by = c("psc_joined" = "stopCode")) %>%
+  select(psc_joined, stopCodeName, count) %>%
+  arrange(desc(count)) %>%
+  slice_head(n = 7) %>%
+  kbl(col.names = c("Primary Stop Code", "Stop Code Name", "Count")) %>%
+  kable_classic()
+#
+ggplot(data = crh_v23_type,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  facet_wrap(~care_type) +
+  theme(legend.position = "none")
+```
+
+## VISN 23 - Parent Station (618) Minneapolis, MN  
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "618" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#---
+crh_encounters %>%
+  filter(parent_station_sta5a == "618" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month, care_type) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  theme(legend.position = "none") +
+  facet_wrap(~care_type)
+
+```
+
+## VISN 23 - Parent Station (568) Fort Meade, SD    
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "568" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#---
+crh_encounters %>%
+  filter(parent_station_sta5a == "568" & care_type %ni% c("Missing crh")) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  theme(legend.position = "none") +
+  facet_wrap(~care_type)
+
+```
+
+## VISN 23 - Parent Station (438) Sioux Falls, SD     
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "438" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#---
+crh_encounters %>%
+  filter(parent_station_sta5a == "438" & care_type %ni% c("Missing crh")) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  theme(legend.position = "none") +
+  facet_wrap(~care_type)
+
+```
+
+## VISN 23 - Parent Station (636) Omaha, NE      
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "636" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#---
+crh_encounters %>%
+  filter(parent_station_sta5a == "636" & care_type %ni% c("Missing crh")) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  theme(legend.position = "none") +
+  facet_wrap(~care_type)
+
+```
+
+## VISN 23 - Parent Station (636A6) Des Moines, IA      
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "636A6" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#---
+crh_encounters %>%
+  filter(parent_station_sta5a == "636A6" & care_type %ni% c("Missing crh")) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  theme(legend.position = "none") +
+  facet_wrap(~care_type)
+
+```
+
+## VISN 23 - Parent Station (636A8) Iowa City, IA      
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "636A8" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#---
+crh_encounters %>%
+  filter(parent_station_sta5a == "636A8" & care_type %ni% c("Missing crh")) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  theme(legend.position = "none") +
+  facet_wrap(~care_type)
+
+```
+
+## VISN 23 - Parent Station (656) St. Cloud, MN      
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "656" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#---
+crh_encounters %>%
+  filter(parent_station_sta5a == "656" & care_type %ni% c("Missing crh")) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  theme(legend.position = "none") +
+  facet_wrap(~care_type)
+
+```
+
+## VISN 23 - Parent Station (437) Fargo, ND      
+```{r}
+crh_encounters %>%
+  filter(parent_station_sta5a == "437" & care_type %ni% c("Missing crh")) %>%
+  group_by(crh_month) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count)) +
+  geom_line(size = 1, color = "red") +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month")
+#---
+crh_encounters %>%
+  filter(parent_station_sta5a == "437" & care_type %ni% c("Missing crh")) %>%
+  mutate(care_type = str_remove(care_type, " crh")) %>%
+  group_by(crh_month, care_type) %>%
+  summarise(count = n()) %>%
+  ggplot(data = .,
+       aes(x = crh_month, y = count, color = care_type, group = care_type)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA), 
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "CRH Encounters per Month") +
+  theme(legend.position = "none") +
+  facet_wrap(~care_type)
+
+```

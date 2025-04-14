@@ -1,0 +1,414 @@
+---
+title: "CRH-Corrected Panel Fullness & Gap Metric"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+sta5as_to_start <- vast %>%
+  left_join(., scrssn_count %>%
+              select(sta5a, scrssn_count_cat)) %>%
+  filter(s_abbr %in% c("PCCBOC", "MSCBOC", "HCC", "OOS", "VAMC")
+         & scrssn_count_cat != "< 450") %>%
+  select(sta5a)
+#-------
+gap_metric_2 <- dbGetQuery(oabi_con,
+                           "select distinct *
+                           from [PACT_CC].[CRH].[vw_gapMetric]
+                           where fy > 2020") %>%
+  mutate(gap_month = ymd(str_c(cy, mth_num, "01", sep = "-"))) %>%
+  mutate(across(contains("PanelSize"), ~as.numeric(.x)),
+         expectedPanelSize_CRH_0 = replace_na(expectedPanelSize_CRH, 0),
+         observedPanelSize_CRH_0 = replace_na(observedPanelSize_CRH, 0),
+         expectedPanelSize_total = expectedPanelSize_AllTeamTypes - expectedPanelSize_CRH_0,
+         observedPanelSize_total = observedPanelSize_AllTeamTypes - observedPanelSize_CRH_0,
+         panel_fullness = observedPanelSize_AllTeamTypes / (expectedPanelSize_total),#unadjusted numerator / crh-adjusted denominator
+         pf_pct = panel_fullness * 100) %>%
+  right_join(., sta5as_to_start %>%
+               rename(sta6a = sta5a) %>%
+               cross_join(., dates %>%
+                            select(gap_month = vssc_month)))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This document looks at the gap metric as executed by Jorge, as well as the relationship between the gap metric and panel fullness
+
+
+    
+
+```{r}
+
+#--
+analytic_df <- sta5as_to_start %>%
+  cross_join(., dates %>%
+               select(vssc_month)) %>%
+  left_join(., gap_metric %>%
+              mutate(pf_1_calc = observed_panel_size / expected_ps_tot,#unadjusted numerator / crh-adjusted denominator
+                     pf_1_pct = pf_1_calc * 100) %>%
+              select(sta5a, vssc_month, gap_metric_1 = gap_metric, pf_1_calc, pf_1_pct)) %>%
+  left_join(., gap_metric_2 %>%
+              mutate(gap_metric_2 = expectedPanelSize_total / observedPanelSize_total) %>%
+              select(sta5a = sta6a, vssc_month = gap_month,
+                     pf_2_calc = panel_fullness, pf_2_pct = pf_pct,
+                     gap_metric_2)) %>%
+  left_join (., access_metrics %>%
+               select(sta5a, vssc_month, panel_fullness_vssc = panel_fullness)) %>%
+  mutate(match_flag = if_else(round(gap_metric_1, 3) == gap_metric_2, 1, 0),
+         match_diff = gap_metric_1 - gap_metric_2) %>%
+  distinct()
+```
+
+# Gap Metric  
+
+$$
+\text{Gap Metric}_{\text{CRH-Corrected}}=\frac{(\text{Expected PS}_{total}-\text{Expected PS}_{CRH})}{(\text{Observed PS}_{total}-\text{Observed PS}_{CRH})}
+$$
+
+
+* The plots below have `r analytic_df %>% filter(gap_metric_1 > 3 | gap_metric_2 > 3) %>% nrow()` (`r ((analytic_df %>% filter(gap_metric_1 > 3 | gap_metric_2 > 3) %>% nrow()) / nrow(analytic_df)) %>% percent(., accuracy = 0.01)`) observations with a gap metric > 3 removed
+
+```{r}
+library(magrittr)
+#analytic_df %$% cor(gap_metric_1, gap_metric_2,use = "complete.obs")
+analytic_df %>%
+  filter(gap_metric_1 < 3
+         & gap_metric_2 < 3) %>%
+  ggplot(data = .,
+         aes(x = gap_metric_1, y = gap_metric_2)) +
+  geom_point(alpha = 0.45) +
+  ggpubr::stat_cor(label.y = 4, label.x = 0.5,
+                   p.accuracy = 0.001,
+                   color = "red") +
+  labs(x = "Gap Metric - Bjarni",
+       y = "Gap Metric - Jorge")
+#--
+bp_gap <- analytic_df %>%
+  filter(gap_metric_1 < 3
+         & gap_metric_2 < 3) %>%
+  select(sta5a, gap_metric_1, gap_metric_2) %>%
+  pivot_longer(-sta5a) %>%
+  mutate(name_lab = if_else(name == "gap_metric_1", "Bjarni", "Jorge")) %>%
+  ggplot(data = .,
+         aes(x = name_lab, y = value, fill = name_lab)) +
+  geom_boxplot() +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  geom_hline(yintercept = 1.2, lty = 3) +
+  labs(y = "Gap Metric")
+#
+de_gap <- 
+  analytic_df %>%
+  filter(gap_metric_1 < 3
+         & gap_metric_2 < 3) %>%
+  select(sta5a, gap_metric_1, gap_metric_2) %>%
+  pivot_longer(-sta5a) %>%
+  mutate(name_lab = if_else(name == "gap_metric_1", "Bjarni", "Jorge")) %>%
+  ggplot(data = .,
+         aes(x = value, fill = name_lab)) +
+  geom_histogram(position = "dodge2",
+                 bins = 50) +
+  scale_y_continuous(labels = comma_format()) +
+  geom_vline(xintercept = 1.2, lty = 3) +
+  labs(y = "Observations",
+       x = "Gap Metric")
+#--
+cowplot::plot_grid(bp_gap, de_gap, ncol = 2)
+```
+
+# Panel Fullness   
+
+$$
+\text{Panel Fullness}_{\text{CRH-Corrected}}=\frac{\text{Observed PS}_{total}}{(\text{Expected PS}_{total}-\text{Expected PS}_{CRH})}\times 100
+$$
+
+
+* The plots below have `r analytic_df %>% filter(pf_1_calc > 2 | pf_2_calc > 2) %>% nrow()` (`r ((analytic_df %>% filter(pf_1_calc > 2 | pf_2_calc > 2) %>% nrow()) / nrow(analytic_df)) %>% percent(., accuracy = 0.01)`) observations with a panel fullness > 200% removed
+
+
+```{r}
+analytic_df %>%
+  filter(pf_1_calc < 2
+         & pf_2_calc < 2) %>%
+  ggplot(data = .,
+         aes(x = pf_2_calc, y = pf_1_calc)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point(alpha = 0.45) +
+  ggpubr::stat_cor(label.y = 1.75, label.x = 0.125,
+                   p.accuracy = 0.001,
+                   color = "red") +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_continuous(labels = percent_format())+
+  labs(x = "Panel Fullness - Jorge",
+       y = "Panel Fullness - Bjarni")
+#----
+
+#--
+bp_pf <- analytic_df %>%
+  filter(pf_1_calc < 2
+         & pf_2_calc < 2) %>%
+  select(sta5a, pf_1_calc, pf_2_calc) %>%
+  pivot_longer(-sta5a) %>%
+  mutate(name_lab = if_else(name == "pf_1_calc", "Bjarni", "Jorge")) %>%
+  ggplot(data = .,
+         aes(x = name_lab, y = value, fill = name_lab)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = percent_format()) +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "Panel Fullness")
+#
+de_pf <- 
+  analytic_df %>%
+  filter(pf_1_calc < 2
+         & pf_2_calc < 2) %>%
+  select(sta5a, pf_1_calc, pf_2_calc) %>%
+  pivot_longer(-sta5a) %>%
+  mutate(name_lab = if_else(name == "pf_1_calc", "Bjarni", "Jorge")) %>%
+  ggplot(data = .,
+         aes(x = value, fill = name_lab)) +
+  geom_histogram(position = "dodge2",
+                 bins = 50) +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = percent_format()) +
+  labs(y = "Observations",
+       x = "Panel Fullness")
+#--
+cowplot::plot_grid(bp_pf, de_pf, ncol = 2)
+```
+
+
+# Where are the differences?  
+
+
+```{r}
+obs_comp_df <- sta5as_to_start %>%
+  cross_join(., dates %>%
+               select(vssc_month)) %>%
+  left_join(., gap_metric %>%
+              select(sta5a, vssc_month, obs_ps_1 = observed_panel_size, observedPanelSize_CRH_1 = observed_panel_size_crh)) %>%
+  left_join(., gap_metric_2 %>%
+              select(sta5a = sta6a, vssc_month = gap_month, obs_ps_2 = observedPanelSize_AllTeamTypes,
+                     observedPanelSize_CRH_2 = observedPanelSize_CRH)) %>%
+  mutate(observedPanelSize_CRH_diff = (observedPanelSize_CRH_1 - observedPanelSize_CRH_2),
+         observedPanelSize_CRH_diff_0 = replace_na(observedPanelSize_CRH_diff, 0),
+         mismatch = if_else(observedPanelSize_CRH_1 != observedPanelSize_CRH_2, 1, 0),
+         max_val = case_when(observedPanelSize_CRH_diff_0 == 0 ~ NA,
+                             observedPanelSize_CRH_1 > observedPanelSize_CRH_2 ~ observedPanelSize_CRH_1,
+                             observedPanelSize_CRH_1 < observedPanelSize_CRH_2 ~ observedPanelSize_CRH_2),
+         diff_prop_max = observedPanelSize_CRH_diff / max_val)
+```
+
+* There are `r obs_comp_df %>% filter(mismatch == 1) %>% nrow()` (`r (((obs_comp_df %>% filter(mismatch == 1) %>% nrow())) / nrow(analytic_df)) %>% percent(., accuracy = 0.1)`) observations where these two sources of __observed CRH panel size__ do not agree
+
+```{r}
+# obs_comp_df %>%
+#   ggplot(data = .,
+#          aes(x = obs_ps_1, y = obs_ps_2)) +
+#   geom_point() +
+#   ggpubr::stat_cor(p.accuracy = 0.001,
+#                    color = "red") +
+#   scale_y_continuous(labels = comma_format()) +
+#   scale_x_continuous(labels = comma_format()) +
+#   labs(y = "Observed Panel Size - Bjarni",
+#        x = "Observed Panel Size - Jorge")
+#===
+obs_comp_df %>%
+  ggplot(data = .,
+         aes(x = observedPanelSize_CRH_1, y = observedPanelSize_CRH_2)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point() +
+  ggpubr::stat_cor(p.accuracy = 0.001,
+                   color = "red") +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(y = "Observed CRH Panel Size - Bjarni",
+       x = "Observed CRH Panel Size - Jorge")
+#
+obs_visn_lm <- obs_comp_df %>%
+  left_join(., vast %>%
+              select(sta5a, parent_visn)) %>%
+  mutate(parent_visn = relevel(factor(parent_visn, ordered = F), ref = "09")) %>%
+  lm(data = .,
+     observedPanelSize_CRH_diff ~ parent_visn)
+#--
+#tab_model(obs_visn_lm)
+#lm(observedPanelSize_CRH_1 ~ observedPanelSize_CRH_2, data = obs_comp_df) %>% tab_model()
+```
+
+```{r}
+exp_comp_df <- sta5as_to_start %>%
+  cross_join(., dates %>%
+               select(vssc_month)) %>%
+  left_join(., gap_metric %>%
+              select(sta5a, vssc_month, exp_ps_1 = expected_panel_size, expectedPanelSize_CRH_1 = expected_panel_size_crh)) %>%
+  left_join(., gap_metric_2 %>%
+              select(sta5a = sta6a, vssc_month = gap_month, exp_ps_2 = expectedPanelSize_AllTeamTypes,
+                     expectedPanelSize_CRH_2 = expectedPanelSize_CRH))%>%
+  mutate(expectedPanelSize_CRH_diff = (expectedPanelSize_CRH_1 - expectedPanelSize_CRH_2),
+         expectedPanelSize_CRH_diff_0 = replace_na(expectedPanelSize_CRH_diff, 0),
+         mismatch = if_else(expectedPanelSize_CRH_1 != expectedPanelSize_CRH_2, 1, 0),
+         max_val = case_when(expectedPanelSize_CRH_diff_0 == 0 ~ NA,
+                             expectedPanelSize_CRH_1 > expectedPanelSize_CRH_2 ~ expectedPanelSize_CRH_1,
+                             expectedPanelSize_CRH_1 < expectedPanelSize_CRH_2 ~ expectedPanelSize_CRH_2),
+         diff_prop_max = expectedPanelSize_CRH_diff / max_val)
+```
+
+
+* There are `r exp_comp_df %>% filter(mismatch == 1) %>% nrow()` (`r (((exp_comp_df %>% filter(mismatch == 1) %>% nrow())) / nrow(analytic_df)) %>% percent(., accuracy = 0.1)`) observations where these two sources of __expected CRH panel size__ do not agree
+
+```{r}
+# exp_comp_df %>%
+#   ggplot(data = .,
+#          aes(x = exp_ps_1, y = exp_ps_2)) +
+#   geom_point() +
+#   ggpubr::stat_cor(p.accuracy = 0.001,
+#                    color = "red") +
+#   scale_y_continuous(labels = comma_format()) +
+#   scale_x_continuous(labels = comma_format()) +
+#   labs(y = "Expected Panel Size - Bjarni",
+#        x = "Expected Panel Size - Jorge")
+#===
+exp_comp_df %>%
+  ggplot(data = .,
+         aes(x = expectedPanelSize_CRH_1, y = expectedPanelSize_CRH_2)) +
+  geom_point() +
+  ggpubr::stat_cor(p.accuracy = 0.001,
+                   color = "red") +
+  scale_y_continuous(labels = comma_format()) +
+  scale_x_continuous(labels = comma_format()) +
+  labs(y = "Expected CRH Panel Size - Bjarni",
+       x = "Expected CRH Panel Size - Jorge")
+```

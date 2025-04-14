@@ -1,0 +1,1062 @@
+---
+title: "Graphical Display of PC Gap and CRH Utilization Over Time"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0),
+         s_abbr2 = case_when(s_abbr %in% c("PCCBOC", "MSCBOC") ~ "CBOC",
+                             s_abbr %in% c("VAMC", "HCC") ~ "VAMC/HCC",
+                             s_abbr == "OOS" ~ "OOS")) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv")) %>%
+  rename(treated_ever = treated_num)
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care) %>%
+  inner_join(., dates) %>%
+  mutate(panel_fullness_pct = panel_fullness * 100,
+         panel_fullness_cat = factor(case_when(panel_fullness_pct < 80 ~ "<80%",
+                                        panel_fullness_pct > 105 ~ ">105%",
+                                        panel_fullness_pct >= 80 & panel_fullness_pct <= 105 ~ "80-105%"),
+                                     ordered = TRUE,
+                                     levels = c("<80%", "80-105%", ">105%")))
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>% 
+  rename(sta5a = Sta6a, vssc_month = visitMonth)  %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness) %>%
+  inner_join(., dates) %>%
+  mutate(panel_fullness_pct = panel_fullness * 100,
+         panel_fullness_cat = factor(case_when(panel_fullness_pct < 80 ~ "<80%",
+                                        panel_fullness_pct > 105 ~ ">105%",
+                                        panel_fullness_pct >= 80 & panel_fullness_pct <= 105 ~ "80-105%")))
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month),
+         gap_metric_cat = factor(case_when(gap_metric >= 1.2 ~ "> 1.2",
+                                    gap_metric < 1 ~ "< 1.0",
+                                    gap_metric < 1.2 & gap_metric >= 1.0 ~ "1.0-1.2"),
+                                 ordered = T,
+                                 levels = c("< 1.0", "1.0-1.2", "> 1.2"))) %>%
+  inner_join(., dates)
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month),
+         treated_month = if_else(crh_encounter_count > 9, 1, 0)) %>%
+  inner_join(., dates)
+```
+
+
+```{r time_varying_treated}
+treated_sta5a <- ps_matched %>%
+  filter(treated_ever == 1) %>%
+  select(sta5a)
+#
+months_meeting_inclusion_criteria <- pen_rate %>%
+  arrange(sta5a, vssc_month) %>%#ordering by station and month
+  group_by(sta5a) %>%#grouping by station
+  mutate(this_mo_mt9_pc_crh = if_else(crh_encounter_count > 9, 1, 0),#flag for this month meeting criteria 
+         last_mo_mt9_pc_crh = if_else(lag(crh_encounter_count) > 9, 1, 0),#flag for last month
+         next_mo_mt9_pc_crh = if_else(lead(crh_encounter_count) > 9, 1, 0),#flag for next month
+         meets_inc_crit = if_else(this_mo_mt9_pc_crh == 1 & # IF this month meets criteria
+                                    ((last_mo_mt9_pc_crh == 1 | is.na(last_mo_mt9_pc_crh)) 
+                                     | (next_mo_mt9_pc_crh == 1 | is.na(next_mo_mt9_pc_crh))),#AND either this or last month
+                                  1, 0),#THEN 1, ELSE 0
+         meets_inc_crit_both = meets_inc_crit,
+         meets_inc_crit_fwd = if_else(this_mo_mt9_pc_crh == TRUE & (next_mo_mt9_pc_crh == 1 | is.na(next_mo_mt9_pc_crh)), 1, 0)
+         ) %>%
+  filter(sta5a %in% treated_sta5a$sta5a) %>%
+  right_join(., dates %>%
+               select(vssc_month) %>%
+               cross_join(., treated_sta5a)) %>%
+  mutate(meets_inc_crit_both = replace_na(meets_inc_crit_both, 0),
+         meets_inc_crit_fwd = replace_na(meets_inc_crit_fwd, 0),
+         crh_enc_count_na = crh_encounter_count,
+         crh_encounter_count = replace_na(crh_encounter_count, 0))
+```
+
+
+```{r}
+sta5as_to_include <- vast %>%
+  left_join(., scrssn_count) %>%
+  filter(s_abbr %in% c("PCCBOC", "MSCBOC", "OOS", "VAMC", "HCC")
+         & scrssn_count_cat != "< 450") %>%
+  select(sta5a) %>%
+  left_join(., ps_matched) %>%
+  mutate(treated_ever = replace_na(treated_ever, 0))
+```
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This report is to address GANTT section 1.5  
+
+
+# Gap Metric  
+
+## National  
+```{r}
+gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  group_by(vssc_month) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = ., 
+         aes(x = vssc_month, y = gap_metric)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0.75, NA)) +
+  labs(x = "Month",
+       y = "Gap Metric") +
+  geom_hline(yintercept = 1.0, lty = 2) +
+  geom_hline(yintercept = 1.2, lty = 3)
+#--
+p1 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  group_by(vssc_month) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = .,
+         aes(x = gap_metric)) +
+  geom_histogram(color = "black",
+                 fill = "aquamarine",
+                 bins = 20) +
+  scale_y_continuous(breaks = seq(0, 10, 2)) +
+  labs(x = "Gap Metric",
+       y = "Observations/Months")
+#
+p2 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  group_by(vssc_month) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = .,
+         aes(x = "a", y = gap_metric)) +
+  geom_boxplot(color = "black",
+               fill = "dodgerblue") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "Gap Metric")
+#
+multiplot(p1, p2, cols = 2)
+```
+
+## VISN    
+```{r}
+gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = ., 
+         aes(x = vssc_month, y = gap_metric, color = parent_visn)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0.75, NA)) +
+  labs(x = "Month",
+       y = "Gap Metric") +
+  geom_hline(yintercept = 1.0, lty = 2) +
+  geom_hline(yintercept = 1.2, lty = 3) +
+  facet_wrap(~parent_visn) +
+  theme(legend.position = "none")
+#--
+p1 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = .,
+         aes(x = gap_metric, fill = parent_visn)) +
+  geom_histogram(color = "black",
+                 bins = 20) +
+  scale_y_continuous(breaks = seq(0, 10, 2)) +
+  labs(x = "Gap Metric",
+       y = "Observations/Months") +
+  facet_wrap(~parent_visn) +
+  theme(legend.position = "none")
+#
+p2 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = .,
+         aes(x = "a", y = gap_metric, fill = parent_visn)) +
+  geom_boxplot(color = "black") +
+  theme(axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "Gap Metric") +
+  facet_wrap(~parent_visn)
+#
+multiplot(p1, p2, cols = 2)
+#----
+gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  group_by(parent_visn) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T),
+            sd_gap = sd(gap_metric, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(y = mean_gap,
+             ymin = mean_gap - sd_gap,
+             ymax = mean_gap + sd_gap,
+             x = reorder(parent_visn, mean_gap))) +
+  geom_point() +
+  geom_errorbar(width = 0.75) +
+  scale_y_continuous(limits = c(0.85, NA)) +
+  geom_hline(yintercept = 1.0, lty = 2) +
+  geom_hline(yintercept = 1.2, lty = 3) +
+  labs(y = "Mean Gap +/- SD(Gap)",
+       x = "VISN")
+```
+
+## Site Type  
+
+```{r}
+p1 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  group_by(vssc_month, s_abbr) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = gap_metric, color = s_abbr)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0.85, NA)) +
+  geom_hline(yintercept = 1.0, lty = 2) +
+  geom_hline(yintercept = 1.2, lty = 3) +
+  labs(x = "Month",
+       y = "Gap Metric")
+
+p2 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, s_abbr2)) %>%
+  group_by(vssc_month, s_abbr2) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = gap_metric, color = s_abbr2)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0.85, NA)) +
+  geom_hline(yintercept = 1.0, lty = 2) +
+  geom_hline(yintercept = 1.2, lty = 3) +
+  labs(x = "Month",
+       y = "Gap Metric")
+#--
+multiplot(p1, p2)
+```
+
+```{r}
+p1 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, s_abbr2)) %>%
+  group_by(vssc_month, s_abbr2) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = .,
+         aes(x = gap_metric, fill = s_abbr2)) +
+  geom_histogram(color = "black") +
+  facet_wrap(~s_abbr2) +
+  theme(legend.position = "none") +
+  labs(x = "Gap Metric",
+       y = "Observations/Months")
+#
+p2 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, s_abbr2)) %>%
+  group_by(vssc_month, s_abbr2) %>%
+  summarise(observed_ps_tot = sum(observed_ps_tot, na.rm = T),
+            expected_ps_tot = sum(expected_ps_tot, na.rm = T)) %>%
+  mutate(gap_metric = expected_ps_tot / observed_ps_tot) %>%
+  ggplot(data = .,
+         aes(y = gap_metric, fill = s_abbr2)) +
+  geom_boxplot(color = "black") +
+  facet_wrap(~s_abbr2) +
+  theme(legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "Gap Metric")
+#
+multiplot(p1, p2, cols = 2)
+```
+
+## Sta5a  
+
+```{r}
+gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  summarise(obs = n(),
+            obs_na = sum(is.na(gap_metric)),
+            mean_gap = mean(gap_metric, na.rm = T),
+            sd_gap = sd(gap_metric, na.rm = T),
+            qtl_5 = quantile(gap_metric, 0.05, na.rm = T),
+            qtl_95 = quantile(gap_metric, 0.95, na.rm = T),
+            qtl_1 = quantile(gap_metric, 0.01, na.rm = T),
+            qtl_99 = quantile(gap_metric, 0.99, na.rm = T)) %>%
+  mutate(foo = "foo", 
+         across(c(3:8), ~comma(.x, accuracy = 0.01)),
+         across(c(1:2), ~comma(.x, accuracy = 1)),
+         mean_sd = paste0(mean_gap, " (", sd_gap, ")"),
+         qtls_05_95 = paste0("[", qtl_5, ", ", qtl_95, "]"),
+         qtls_01_99 = paste0("[", qtl_1, ", ", qtl_99, "]")) %>%
+  select(obs, obs_na, mean_sd, qtls_05_95, qtls_01_99) %>%
+  kbl(col.names = c("Observations", "Missing", "Mean (SD)", "[5th %ile, 95th %ile]", "[1st %ile, 99th %ile]"),
+      align = rep("r", 5)) %>%
+  kable_classic(full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(gap_metric < 3) %>%
+  ggplot(data = .,
+         aes(y = gap_metric, x = vssc_month, group = sta5a)) +
+  geom_hline(yintercept = 1.0, lty = 2, color = "red") +
+  geom_hline(yintercept = 1.2, lty = 3, color = "red") +
+  geom_line(alpha = 0.1) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "Gap Metric",
+       caption = "*Removed obs. > 3")
+#--
+gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(gap_metric < 3) %>%
+  ggplot(data = .,
+         aes(x = gap_metric)) +
+  geom_histogram(color = "black",
+                 fill = "darkorchid") +
+  labs(x = "Gap Metric",
+       y = "Observations/Months",
+       caption = "*Removed obs. > 3") +
+  scale_y_continuous(labels = scales::comma_format())
+```
+
+```{r}
+gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(gap_metric < 3) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  ggplot(data = .,
+         aes(y = gap_metric, x = vssc_month, group = sta5a)) +
+  geom_hline(yintercept = 1.0, lty = 2, color = "red") +
+  geom_hline(yintercept = 1.2, lty = 3, color = "red") +
+  geom_line(alpha = 0.2) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "Gap Metric",
+       caption = "*Removed obs. > 3") +
+  facet_wrap(~parent_visn)
+#--
+p1 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(gap_metric < 3) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  ggplot(data = .,
+         aes(x = gap_metric, fill = parent_visn)) +
+  geom_histogram(color = "black") +
+  facet_wrap(~parent_visn) +
+  theme(legend.position = "none") +
+  labs(y = "Observations/Months",
+       x = "Gap Metric")
+#
+p2 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(gap_metric < 3) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  ggplot(data = .,
+         aes(y = gap_metric, fill = parent_visn)) +
+  geom_boxplot(color = "black") +
+  theme(legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  facet_wrap(~parent_visn) +
+  labs(y = "Gap Metric")
+#
+multiplot(p1, p2, cols = 2)
+```
+
+```{r}
+qtl_05 <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  summarise(qtl_95 = quantile(gap_metric, 0.05, na.rm = T)) %>%
+  pull
+#
+outlier_sta5as <- gap_metric %>%
+  inner_join(., sta5as_to_include) %>%
+  mutate(lt_5th_pctle = if_else(gap_metric < qtl_05, 1, 0)) %>%
+  arrange(sta5a, vssc_month) %>%
+  group_by(sta5a) %>%
+  mutate(outlier = if_else(lt_5th_pctle == 1
+                           & lead(lt_5th_pctle, n = 1) == 1
+                           & lead(lt_5th_pctle, n = 2) == 1
+                           & lead(lt_5th_pctle, n = 3) == 1, 1, 0)) %>%
+  filter(outlier == 1) %>%
+  select(sta5a) %>%
+  distinct
+#--
+gap_metric %>%
+  filter(sta5a %in% outlier_sta5as$sta5a) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = gap_metric, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "Gap Metric")
+#
+gap_stats <- gap_metric %>%
+  filter(sta5a %in% outlier_sta5as$sta5a) %>%
+  summarise(nobs = n(),
+            months_below_qtl_05 = sum(if_else(gap_metric < qtl_05, 1, 0), na.rm = T))
+```
+
+* There are `r nrow(outlier_sta5as)` sta5as that have at least 4 consecutive months with a gap metric < `r comma(qtl_05, accuracy = 0.01)`, the 5th percentile of gap metric
+* These `r nrow(outlier_sta5as)` sta5as all contribute 36 months of observation, giving us a total of $\text{127}\times\text{36}=\text{4,572}$ observations
+* Out of these $\text{4,572}$ observations, $\text{1,524}$ (`r percent(gap_stats$months_below_qtl_05 / gap_stats$nobs, accuracy = 0.1)`) have a gap metric less than the 5th percentile of all gap metric observations in our study period
+
+```{r}
+gap_chisq <- gap_metric %>%
+  filter(sta5a %in% outlier_sta5as$sta5a) %>%
+  left_join(., ps_matched %>% select(sta5a, treated)) %>%
+  mutate(treated = replace_na(treated, "Control")) %>%
+  filter(is.na(gap_metric_cat) == F) %>%
+  tabyl(gap_metric_cat, treated) %>%
+  chisq.test()
+#--
+gap_chisq$observed %>%
+  tibble %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 1))) %>%
+  kbl(col.names = c("Gap Metric Category", "Control", "Treated", "Total"),
+      align = c("l", rep("r", 3)),
+      caption = "<b>Observed</b>") %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(c(0, 4), bold = T)
+#--
+gap_chisq$expected %>%
+  tibble %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.1))) %>%
+  kbl(col.names = c("Gap Metric Category", "Control", "Treated", "Total"),
+      align = c("l", rep("r", 3)),
+      caption = "<b>Expected</b>") %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(c(0, 4), bold = T)
+#
+gap_chisq
+```
+
+# Panel Fullness  
+
+
+
+
+
+## Sta5a  
+
+```{r}
+access_metrics %>%
+  inner_join(., sta5as_to_include) %>%
+  summarise(obs = n(),
+            obs_na = sum(is.na(panel_fullness)),
+            mean_gap = mean(panel_fullness, na.rm = T),
+            sd_gap = sd(panel_fullness, na.rm = T),
+            qtl_5 = quantile(panel_fullness, 0.05, na.rm = T),
+            qtl_95 = quantile(panel_fullness, 0.95, na.rm = T),
+            qtl_1 = quantile(panel_fullness, 0.01, na.rm = T),
+            qtl_99 = quantile(panel_fullness, 0.99, na.rm = T)) %>%
+  mutate(foo = "foo", 
+         across(c(3:8), ~percent(.x, accuracy = 0.1)),
+         across(c(1:2), ~comma(.x, accuracy = 1)),
+         mean_sd = paste0(mean_gap, " (", sd_gap, ")"),
+         qtls_05_95 = paste0("[", qtl_5, ", ", qtl_95, "]"),
+         qtls_01_99 = paste0("[", qtl_1, ", ", qtl_99, "]")) %>%
+  select(obs, obs_na, mean_sd, qtls_05_95, qtls_01_99) %>%
+  kbl(col.names = c("Observations", "Missing", "Mean (SD)", "[5th %ile, 95th %ile]", "[1st %ile, 99th %ile]"),
+      align = rep("r", 5)) %>%
+  kable_classic(full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+access_metrics %>%
+  inner_join(., sta5as_to_include) %>%
+  ggplot(data = .,
+         aes(y = panel_fullness, x = vssc_month, group = sta5a)) +
+  geom_hline(yintercept = 0.88, lty = 3, color = "blue") +
+  geom_line(alpha = 0.1) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "Panel Fullness") +
+  scale_y_continuous(limits = c(0, 1.5),
+                     labels = scales::percent_format(accuracy = 1))
+#--
+access_metrics %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(panel_fullness < 1.5) %>%
+  ggplot(data = .,
+         aes(x = panel_fullness)) +
+  geom_histogram(color = "black",
+                 fill = "darkorchid") +
+  labs(x = "Panel Fullness",
+       y = "Observations/Months",
+       caption = "*Removed obs. > 150%") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  scale_x_continuous(labels = scales::percent_format())
+```
+
+```{r}
+access_metrics %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(panel_fullness < 1.5) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  ggplot(data = .,
+         aes(y = panel_fullness, x = vssc_month, group = sta5a)) +
+  geom_line(alpha = 0.2) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "Panel Fullness",
+       caption = "*Removed obs. > 150%") +
+  facet_wrap(~parent_visn) +
+  scale_y_continuous(labels = scales::percent_format())
+#--
+p1 <- access_metrics %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(panel_fullness < 1.5) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  ggplot(data = .,
+         aes(x = panel_fullness, fill = parent_visn)) +
+  geom_histogram(color = "black") +
+  facet_wrap(~parent_visn) +
+  theme(legend.position = "none") +
+  labs(y = "Observations/Months",
+       x = "Panel Fullness") +
+  scale_x_continuous(labels = scales::percent_format())
+#
+p2 <- access_metrics %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(panel_fullness < 1.5) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  ggplot(data = .,
+         aes(y = panel_fullness, fill = parent_visn)) +
+  geom_boxplot(color = "black") +
+  theme(legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  facet_wrap(~parent_visn) +
+  labs(y = "Panel Fullness") +
+  scale_y_continuous(labels = scales::percent_format())
+#
+multiplot(p1, p2, cols = 2)
+```
+
+```{r}
+qtl_95_pf <- access_metrics %>%
+  inner_join(., sta5as_to_include) %>%
+  summarise(qtl_95 = quantile(panel_fullness, 0.95, na.rm = T)) %>%
+  pull
+#
+outlier_sta5as_pf <- access_metrics %>%
+  select(sta5a, vssc_month, panel_fullness) %>%
+  inner_join(., sta5as_to_include) %>%
+  mutate(lt_5th_pctle = if_else(panel_fullness > qtl_95_pf, 1, 0)) %>%
+  arrange(sta5a, vssc_month) %>%
+  group_by(sta5a) %>%
+  mutate(outlier = if_else(lt_5th_pctle == 1
+                           & lead(lt_5th_pctle, n = 1) == 1
+                           & lead(lt_5th_pctle, n = 2) == 1
+                           & lead(lt_5th_pctle, n = 3) == 1, 1, 0)) %>%
+  filter(outlier == 1) %>%
+  select(sta5a) %>%
+  distinct
+#--
+access_metrics %>%
+  filter(sta5a %in% outlier_sta5as_pf$sta5a) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = panel_fullness, group = sta5a)) +
+  geom_line(alpha = 0.3) +
+  theme(legend.position = "none") +
+  labs(x = "Month",
+       y = "Panel Fullness") +
+  scale_y_continuous(labels = scales::percent_format())
+#
+pf_stats <- outlier_sta5as_pf %>%
+  cross_join(., dates %>%
+               select(vssc_month)) %>%
+  left_join(., access_metrics %>%
+              select(sta5a, vssc_month, panel_fullness)) %>%
+  ungroup %>%
+  summarise(nobs = n(),
+            months_above_qtl_95 = sum(if_else(panel_fullness > qtl_95_pf, 1, 0), na.rm = T))
+```
+
+* There are `r nrow(outlier_sta5as_pf)` sta5as that have at least 4 consecutive months with a panel fullness > `r percent(qtl_95_pf / 100, accuracy = 0.1)`, the 95th percentile of panel fullness
+* These `r nrow(outlier_sta5as_pf)` sta5as all contribute 36 months of observation, giving us a total of $\text{127}\times\text{36}=\text{4,572}$ observations
+* Out of these $\text{4,572}$ observations, $\text{1,488}$ (`r percent(pf_stats$months_above_qtl_95 / pf_stats$nobs, accuracy = 0.1)`) have panel fullness greater than the 5th percentile of all panel fullness observations in our study period
+
+```{r}
+pf_chisq <- access_metrics %>%
+  filter(sta5a %in% outlier_sta5as$sta5a) %>%
+  left_join(., ps_matched %>% select(sta5a, treated)) %>%
+  mutate(treated = replace_na(treated, "Control")) %>%
+  filter(is.na(panel_fullness_cat) == F) %>%
+  tabyl(panel_fullness_cat, treated) %>%
+  chisq.test()
+#--
+pf_chisq$observed %>%
+  tibble %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 1))) %>%
+  kbl(col.names = c("Panel Fullness Category", "Control", "Treated", "Total"),
+      align = c("l", rep("r", 3)),
+      caption = "<b>Observed</b>") %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(c(0, 4), bold = T)
+#--
+pf_chisq$expected %>%
+  tibble %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.1))) %>%
+  kbl(col.names = c("Panel Fullness Category", "Control", "Treated", "Total"),
+      align = c("l", rep("r", 3)),
+      caption = "<b>Expected</b>") %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(c(0, 4), bold = T)
+#
+gap_chisq
+```
+
+
+# CRH Utilization  
+
+
+```{r}
+pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  group_by(vssc_month) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = crh_encounter_count)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "Total PC CRH Encounters",
+       caption = "We have been assured the drop is normal")
+```
+
+
+```{r}
+pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = crh_encounter_count, color = parent_visn)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "Total PC CRH Encounters") +
+  facet_wrap(~parent_visn) +
+  theme(legend.position = "none")
+#--
+p1 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, fill = parent_visn)) +
+  geom_histogram(color = "black") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  facet_wrap(~parent_visn) +
+  labs(x = "PC CRH Encounters",
+       y = "Observations/Months") +
+  theme(legend.position = "none")
+#--
+p2 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(y = crh_encounter_count, fill = parent_visn)) +
+  geom_boxplot(color = "black") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  facet_wrap(~parent_visn) +
+  labs(y = "PC CRH Encounters per Month") +
+  theme(legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+#
+multiplot(p1, p2, cols = 2)
+```
+
+
+```{r}
+p1 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn, s_abbr)) %>%
+  group_by(vssc_month, s_abbr) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = crh_encounter_count, color = s_abbr)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  labs(y = "Total PC CRH Encounters") +
+  theme(axis.title.x = element_blank())
+#---
+p2 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn, s_abbr2)) %>%
+  group_by(vssc_month, s_abbr2) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = crh_encounter_count, color = s_abbr2)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  labs(y = "Total PC CRH Encounters") +
+  theme(axis.title.x = element_blank())
+#-
+multiplot(p1, p2, cols = 1)
+#--==--
+p1 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast) %>%
+  group_by(vssc_month, s_abbr) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, fill = s_abbr)) +
+  geom_histogram(color = "black") +
+  scale_x_continuous(labels = scales::comma_format()) +
+  facet_wrap(~s_abbr) +
+  labs(x = "PC CRH Encounters",
+       y = "Observations/Months") +
+  theme(legend.position = "none")
+#--
+p2 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast) %>%
+  group_by(vssc_month, s_abbr) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(y = crh_encounter_count, fill = s_abbr)) +
+  geom_boxplot(color = "black") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  facet_wrap(~s_abbr) +
+  labs(y = "PC CRH Encounters per Month") +
+  theme(legend.position = "none",
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank())
+#
+multiplot(p1, p2)
+```
+
+### Sta5a  
+```{r}
+p1 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count)) +
+  geom_histogram(color = "black") +
+  labs(x = "PC CRH Encounters",
+       y = "Observations/Sta5a-Months") +
+  scale_y_continuous(labels = scales::comma_format())
+#--
+p2 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  ggplot(data = .,
+         aes(y = crh_encounter_count)) +
+  geom_boxplot(color = "black",
+               fill = "chartreuse") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "PC CRH Encounters per Month")
+#
+multiplot(p1, p2, cols = 2) 
+#--
+pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(crh_encounter_count < 31)  %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count)) +
+  geom_histogram(color = "black") +
+  labs(x = "PC CRH Encounters",
+       y = "Observations/Sta5a-Months",
+       caption = "*Restricted to the first 30 integers") +
+  scale_y_continuous(labels = scales::comma_format())
+```
+
+```{r}
+p1 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, fill = parent_visn)) +
+  geom_histogram(color = "black") +
+  labs(x = "PC CRH Encounters",
+       y = "Observations/Sta5a-Months") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  facet_wrap(~parent_visn) +
+  theme(legend.position  = "none")
+#--
+p2 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  ggplot(data = .,
+         aes(y = crh_encounter_count, fill = parent_visn)) +
+  geom_boxplot(color = "black") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "PC CRH Encounters per Month") +
+  facet_wrap(~parent_visn) +
+  theme(legend.position  = "none")
+#
+multiplot(p1, p2, cols = 2) 
+```
+
+```{r}
+p1 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, s_abbr2)) %>%
+  ggplot(data = .,
+         aes(x = crh_encounter_count, fill = s_abbr2)) +
+  geom_histogram(color = "black") +
+  labs(x = "PC CRH Encounters",
+       y = "Observations/Sta5a-Months") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  facet_wrap(~s_abbr2) +
+  theme(legend.position  = "none")
+#--
+p2 <- pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, s_abbr2)) %>%
+  ggplot(data = .,
+         aes(y = crh_encounter_count, fill = s_abbr2)) +
+  geom_boxplot(color = "black") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "PC CRH Encounters per Month") +
+  facet_wrap(~s_abbr2) +
+  theme(legend.position  = "none")
+#
+multiplot(p1, p2, cols = 2) 
+```
+
+## Meaningful Use Definition  
+* The meaningful use definition of PC CRH engagement is two consecutive months with at least 10 PC CRH Encounters
+
+```{r}
+pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(treated_ever == 1) %>%
+  group_by(vssc_month) %>%
+  summarise(treated_month = sum(treated_month, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = treated_month)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "Sta5as meeting Meaningful Use")
+```
+
+```{r}
+pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  filter(treated_ever == 1) %>%
+  left_join(., vast) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(treated_month = sum(treated_month, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = treated_month, color = parent_visn)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format()) +
+  labs(x = "Month",
+       y = "Sta5as meeting Meaningful Use") +
+  facet_wrap(~parent_visn) +
+  theme(legend.position = "none")
+```
+
+
+
+
+## Continuous Pentration Rate  
+
+```{r}
+pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  group_by(vssc_month) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T),
+            pc_encounter_total = sum(pc_encounter_total, na.rm = T)) %>%
+  mutate(pc_crh_per_1k_total_pc = crh_encounter_count / pc_encounter_total * 1000) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = pc_crh_per_1k_total_pc)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Month",
+       y = "PC CRH per 1,000 total PC")
+```
+
+
+```{r}
+pen_rate %>%
+  inner_join(., sta5as_to_include) %>%
+  left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  group_by(vssc_month, parent_visn) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count, na.rm = T),
+            pc_encounter_total = sum(pc_encounter_total, na.rm = T)) %>%
+  mutate(pc_crh_per_1k_total_pc = crh_encounter_count / pc_encounter_total * 1000) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = pc_crh_per_1k_total_pc, color = parent_visn)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Month",
+       y = "PC CRH per 1,000 total PC") +
+  theme(legend.position = "none") +
+  facet_wrap(~parent_visn)
+```
+
+
+

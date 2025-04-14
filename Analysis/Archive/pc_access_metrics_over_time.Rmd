@@ -1,0 +1,288 @@
+---
+title: "Access Metrics Over Time"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+---
+
+```{r setup, warning=FALSE, message=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = TRUE,
+                      fig.width = 12, fig.height = 12)
+
+library(tidyverse)
+library(readxl)
+library(ggplot2)
+library(ggthemes)
+library(kableExtra)
+library(lubridate)
+library(scales)
+library(grid)
+library(DT)
+library(RODBC)
+library(DBI)
+library(janitor)
+library(here)
+#
+source(here("Input", "Functions", "customFacetWrap.R"))
+#
+options(scipen = 999)
+###
+`%ni%` <- negate(`%in%`)
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#=============
+theme_update(
+  strip.text = element_text(size = 20),
+  axis.text = element_text(size = 15),
+  axis.title.y = element_text(size = 18),
+  axis.title.x = element_blank(),
+  axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3),
+  legend.text = element_text(size = 14),
+  plot.title = element_text(size = 20),
+  legend.title = element_blank()
+)
+```
+
+```{r reading-in}
+access_metrics_sta5a <- read_csv(here("Input", "Data", "pc_access_metrics.csv")) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop) %>%
+  filter(sta5a %ni% c("612"))
+#
+access_metrics_parent <- read_csv(here("Input", "Data", "pc_access_metrics_parent.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_visn <- read_csv(here("Input", "Data", "pc_access_metrics_visn.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+access_metrics_nat <- read_csv(here("Input", "Data", "pc_access_metrics_nat.csv")) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop)
+#
+vast <- read_csv(here("Input","Data","VAST_from_A06_11jan21.csv"))
+#
+# crh_encounters <- dbGetQuery(oabi_con,
+#                              "select * from [OABI_MyVAAccess].[crh_eval].crh_encounters_deDup") %>%
+#   mutate(crh_month = ymd(crh_month)) %>%
+#   filter(crh_month > ymd("2019-09-01"))
+#
+# stopCodes <- crh_encounters %>% 
+#   select(stopCode = location_primary_sc, stopCodeName = primarystopcodelocationname) %>% 
+#   distinct %>%
+#   bind_rows(., crh_encounters %>% 
+#               select(stopCode = location_secondary_sc, stopCodeName = secondarystopcodelocationname) %>% distinct) %>%
+#   distinct
+```
+
+
+# Access Metrics  
+## National  
+```{r}
+access_metrics_nat %>%
+  pivot_longer(-vssc_month) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(1, 4))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+
+---
+
+## VISN 23     
+```{r}
+access_metrics_visn %>% filter(visn == "23") %>%
+  pivot_longer(-c(vssc_month, visn)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(1, 4))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+```
+
+## VISN 23 - Parent Station (618) Minneapolis, MN           
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "618") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,65))),
+                      scale_override(2, scale_y_continuous(limits = c(0,65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(1,4))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0,1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+#-------
+p618_sta5a <- vast %>%
+  filter(parent_station_sta5a == "618") %>%
+  select(sta5a) %>% distinct %>% pull
+#
+p618_df <- access_metrics_sta5a %>%
+  left_join(., vast %>% select(sta5a, parent_station_sta5a, short_name)) %>%
+  filter(parent_station_sta5a == "618") %>%
+  mutate(sta5a_lab = paste0("(", sta5a, ") ", short_name)) %>%
+  select(-c(parent_station_sta5a, short_name)) %>%
+  pivot_longer(-c(vssc_month, sta5a_lab, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %"))
+#--
+ggplot(data = subset(p618_df, sta5a %in% p618_sta5a[1:10]),
+         aes(x = vssc_month,, y = value, group = sta5a_lab, color = sta5a_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,NA))),
+                      scale_override(2, scale_y_continuous(limits = c(0,NA))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, NA))),
+                      scale_override(4, scale_y_continuous(limits = c(1, 4))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, NA), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0, NA)))
+                    )) +
+  theme(axis.title.y = element_blank())
+#--
+ggplot(data = subset(p618_df, sta5a %in% p618_sta5a[11:20]),
+       aes(x = vssc_month,, y = value, group = sta5a_lab, color = sta5a_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,NA))),
+                      scale_override(2, scale_y_continuous(limits = c(0,NA))),
+                      scale_override(3, scale_y_continuous(limits = c(0, NA))),
+                      scale_override(4, scale_y_continuous(limits = c(1, 7))),
+                      scale_override(5, scale_y_continuous(limits = c(0, NA), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0, NA)))
+                    )) +
+  theme(axis.title.y = element_blank())
+```
+
+---
+
+## VISN 23 - Parent Station (636A8) Iowa City, IA          
+```{r}
+#vast %>% filter(visn == 23) %>% select(parent_station_sta5a) %>% distinct()
+#
+access_metrics_parent %>% filter(sta5a == "636A8") %>%
+  pivot_longer(-c(vssc_month, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = value, group = name_lab, color = name_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0, 65))),
+                      scale_override(2, scale_y_continuous(limits = c(0, 65))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, 1))),
+                      scale_override(4, scale_y_continuous(limits = c(1, 4))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, 1), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0, 1)))
+                    )) +
+  theme(legend.position = "none", 
+        axis.title.y = element_blank())
+#-------
+p636a8_sta5a <- vast %>%
+  filter(parent_station_sta5a == "636A8") %>%
+  select(sta5a) %>% distinct %>% pull
+#
+p636a8_df <- access_metrics_sta5a %>%
+  left_join(., vast %>% select(sta5a, parent_station_sta5a, short_name)) %>%
+  filter(parent_station_sta5a == "636A8") %>%
+  mutate(sta5a_lab = paste0("(", sta5a, ") ", short_name)) %>%
+  select(-c(parent_station_sta5a, short_name)) %>%
+  pivot_longer(-c(vssc_month, sta5a_lab, sta5a)) %>%
+  mutate(name_lab = case_when(name == "established_pt_waitTime" ~ "Est. Patient Wait Time",
+                              name == "new_pt_waitTime" ~ "New Patient Wait Time",
+                              name == "obs_expected_panel_size_ratio" ~ "Obs:Exp Panel Ratio",
+                              name == "pc_staff_ratio" ~ "PC Staff Ratio",
+                              name == "same_day_appts_wPC_provider_ratio" ~ "Same-day Appts. w/PC",
+                              name == "tc_pc_success_prop" ~ "PC TimelyCare Success %")) %>%
+  filter(is.na(value) == F)
+#--
+ggplot(data = subset(p636a8_df, sta5a %in% p636a8_sta5a[1:10]),
+         aes(x = vssc_month,, y = value, group = sta5a_lab, color = sta5a_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,NA))),
+                      scale_override(2, scale_y_continuous(limits = c(0,NA))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, NA))),
+                      scale_override(4, scale_y_continuous(limits = c(1, 4))),
+                      scale_override(5, scale_y_continuous(limits = c(0, NA), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0, NA)))
+                    )) +
+  theme(axis.title.y = element_blank())
+#--
+ggplot(data = subset(p636a8_df, sta5a %in% p636a8_sta5a[11:20]),
+       aes(x = vssc_month,, y = value, group = sta5a_lab, color = sta5a_lab)) +
+  geom_line(size = 1) +
+  facet_wrap_custom(~name_lab, scales = "free",
+                    scale_overrides = list(
+                      scale_override(1, scale_y_continuous(limits = c(0,NA))),
+                      scale_override(2, scale_y_continuous(limits = c(0,NA))),
+                      scale_override(3, scale_y_continuous(limits = c(0.5, NA))),
+                      scale_override(4, scale_y_continuous(limits = c(1, 4))),
+                      scale_override(5, scale_y_continuous(limits = c(0.5, NA), labels = scales::percent_format())),
+                      scale_override(6, scale_y_continuous(limits = c(0, NA)))
+                    )) +
+  theme(axis.title.y = element_blank())
+```
+

@@ -1,0 +1,294 @@
+---
+title: "Gap Metric: Removing CRH Contribution in Denominator"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             plot.title = element_text(size = 24),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0),
+         s_abbr2 = case_when(str_detect(s_abbr, "CBOC") ~ "CBOC",
+                             str_detect(s_abbr, "VAMC|HCC") ~ "VAMC/HCC",
+                             s_abbr == "OOS" ~ "OOS")) %>%
+  filter(drop_flag == 0
+         & is.na(s_abbr2) == F) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well as 
+  #flags for treated/control
+  #PS matching weights
+  #flags for meeting inclusion criteria in 3 periods
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv")) %>%
+  rename(treated_ever = treated_num)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(tna_new_source = as.numeric(tna_new_source))
+#making a time/date dataset
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time") %>%
+  mutate(fy = if_else(month(vssc_month) > 9, year(vssc_month) + 1, year(vssc_month)),
+         qtr = case_when(month(vssc_month) %in% c(10, 11, 12) ~ 1,
+                         month(vssc_month) %in% c(1, 2, 3) ~ 2,
+                         month(vssc_month) %in% c(4, 5, 6) ~ 3,
+                         month(vssc_month) %in% c(7, 8, 9) ~ 4,
+                         TRUE ~ 99))
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+#average age on october 1st 2022
+age_sta5a_qtr <- dbGetQuery(oabi_con,
+                            "select * from [OABI_MyVAAccess].[crh_eval].D1_age_sta5a_qtr")
+#sta5a-fy-specific counts of gender, race, and urh, as well as total uniques
+race_gender_urh <- dbGetQuery(oabi_con,
+                              "select * from [OABI_MyVAAccess].[crh_eval].D2_race_gender_urh_count") %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100)
+#sta5a-fy_qtr-specific average ADI and quartile counts, as well as total
+adi_sta5a_fy <- dbGetQuery(oabi_con,
+                            "select * from [OABI_MyVAAccess].[crh_eval].D3_adi_sta5a_fy")
+#sta5a-month-specific average Nosos, Obs:Exp, and Team PCP/AP FTE
+nosos_obs_exp_team_fte <- dbGetQuery(oabi_con,
+                                     "select * from [OABI_MyVAAccess].[crh_eval].F1_2_vssc_covars") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#sta5a-fy-specific average drive distance and time to closest PC site
+drive_time <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].D4_avg_drive_time")
+#sta5a-month-specific timely care success rate
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#sta5a-month-specific PC CRH penetration rate and it's components
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month),
+         treated_month = if_else(crh_encounter_count > 9, 1, 0))#time-varying treated
+#--
+sta5as_to_start <- vast %>%
+  left_join(., scrssn_count %>%
+              select(sta5a, scrssn_count_cat)) %>%
+  filter(s_abbr %in% c("PCCBOC", "MSCBOC", "HCC", "OOS", "VAMC")
+         & scrssn_count_cat != "< 450") %>%
+  select(sta5a)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month),
+         gap_capped = if_else(gap_metric > 3, 3, gap_metric),
+         gap2_capped = if_else(gap_metric2 > 3, 3, gap_metric2),
+         gap_cat = factor(case_when(gap_metric < 1.0 ~ "< 1.0",
+                                    gap_metric >= 1.0 & gap_metric <= 1.2 ~ "1.0 - 1.2",
+                                    gap_metric > 1.2 ~ "> 1.2",
+                                     TRUE ~ "Missing"),
+                          ordered = TRUE,
+                          levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing")),
+         gap_cat2 = factor(case_when(gap_metric2 < 1.0 ~ "< 1.0",
+                                     gap_metric2 >= 1.0 & gap_metric2 <= 1.2 ~ "1.0 - 1.2",
+                                     gap_metric2 > 1.2 ~ "> 1.2",
+                                     TRUE ~ "Missing"),
+                           ordered = TRUE,
+                           levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing"))) %>%
+  inner_join(., sta5as_to_start %>%
+               cross_join(., dates %>%
+                            select(vssc_month)),
+             by = c("sta5a", "vssc_month"))
+#
+mean_gap <- gap_metric %>%
+  group_by(sta5a) %>%
+  summarise(mean_gap = mean(gap_metric, na.rm = T),
+            mean_gap2 = mean(gap_metric2, na.rm = T)) %>%
+  mutate(gap_cat = factor(case_when(mean_gap < 1.0 ~ "< 1.0",
+                                    mean_gap >= 1.0 & mean_gap <= 1.2 ~ "1.0 - 1.2",
+                                    mean_gap > 1.2 ~ "> 1.2",
+                                     TRUE ~ "Missing"),
+                          ordered = TRUE,
+                          levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing")),
+         gap_cat2 = factor(case_when(mean_gap2 < 1.0 ~ "< 1.0",
+                                    mean_gap2 >= 1.0 & mean_gap2 <= 1.2 ~ "1.0 - 1.2",
+                                    mean_gap2 > 1.2 ~ "> 1.2",
+                                     TRUE ~ "Missing"),
+                          ordered = TRUE,
+                          levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing")))
+```
+
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a comparison of 2 versions of the gap metric:
+
+$$
+\text{Gap Metric}_1 = \frac{(\text{Expected PS}_{total}-\text{Expected PS}_{CRH})}{\text{Observed PS}_{Total}- \text{Observed PS}_{CRH}}
+$$
+
+$$
+\text{Gap Metric}_2 = \frac{(\text{Expected PS}_{total}-\text{Expected PS}_{CRH})}{\text{Observed PS}_{Total}}
+$$
+
+## Decision Points  
+
+* Per our discussion on June 6th I am examining a version of the gap metric that doesn't correct for CRH panel size in the denominator
+
+# Sta5a-Month  
+
+* There are `r gap_metric %>% filter(gap_metric != gap_metric2) %>% nrow() %>% comma(., accuracy = 1)` (`r ((gap_metric %>% filter(gap_metric != gap_metric2) %>% nrow()) / nrow(gap_metric)) %>% percent(., accuracy = 0.1)`) observations where these 2 versions of the gap metric do not agree
+
+```{r}
+gap_metric %>%
+  ggplot(data = .,
+         aes(x = gap_capped, y = gap2_capped)) +
+  geom_point() +
+  ggpubr::stat_cor(p.accuracy = 0.001,
+                   color = "red") +
+  labs(x = "Gap Metric 1",
+       y = "Gap Metric 2")
+#
+gap_tot_chisq <- gap_metric %>%
+  tabyl(gap_cat, gap_cat2) %>%
+  chisq.test()
+#
+gap_tot_chisq$observed %>%
+  rownames_to_column() %>%
+  select(-rowname) %>%
+  as.data.frame() %>%
+  janitor::adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~ comma(.x, accuracy = 1))) %>%
+  kbl(col.names = c("Gap Metric 1", "< 1.0", "1.0 - 1.2", "> 1.2", "Missing", "Total"),
+      align = c("c", rep("r", 5))) %>%
+  kable_classic("striped") %>%
+  add_header_above(c("", "Gap Metric 2" = 4, " "))
+```
+
+
+```{r}
+diff_hist <- gap_metric %>%
+  filter(gap_metric != gap_metric2) %>%
+  mutate(difference = gap_metric - gap_metric2,
+         diff_cap = if_else(difference > 2, 2, difference)) %>%
+  ggplot(data = .,
+         aes(x = diff_cap)) +
+  scale_y_continuous(labels = scales::comma_format()) +
+  geom_histogram(color = "black",
+                 fill = "skyblue") +
+  labs(x = "Gap Metric 1 - Gap Metric 2",
+       y = "Observations")
+#
+diff_bp <-  gap_metric %>%
+  filter(gap_metric != gap_metric2) %>%
+  mutate(difference = gap_metric - gap_metric2,
+         diff_cap = if_else(difference > 2, 2, difference)) %>%
+  ggplot(data = .,
+         aes(y = diff_cap)) +
+  geom_boxplot(color = "black",
+               fill = "seagreen") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  labs(y = "Gap Metric 1 - Gap Metric 2")
+#
+cowplot::plot_grid(diff_hist, diff_bp, ncol = 2)
+```
+
+
+# Average Gap  
+
+* There are `r mean_gap %>% filter(gap_cat != gap_cat2) %>% nrow()` (`r ((mean_gap %>% filter(gap_cat != gap_cat2) %>% nrow()) / nrow(sta5as_to_start)) %>% percent(., accuracy = 0.1)`) sta5as that do not fall into the same mean gap category using this new version of the gap metric 
+
+```{r}
+gap_chisq <- mean_gap %>%
+  tabyl(gap_cat, gap_cat2) %>%
+  chisq.test()
+#
+gap_chisq$observed %>%
+  rownames_to_column() %>%
+  select(-rowname) %>%
+  as.data.frame() %>%
+  janitor::adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~ comma(.x, accuracy = 1))) %>%
+  kbl(col.names = c("Gap Metric 1", "< 1.0", "1.0 - 1.2", "> 1.2", "Missing", "Total"),
+      align = c("c", rep("r", 5))) %>%
+  kable_classic("striped") %>%
+  add_header_above(c("", "Gap Metric 2" = 5))
+```
+
+    

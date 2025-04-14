@@ -1,0 +1,312 @@
+---
+title: "PC FTE Needed: July 2023"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v6_post_COVID.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-02-01"), ymd("2022-12-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+```{r}
+analytic_df <- gap_metric %>%
+  inner_join(., vast) %>%
+  left_join(., scrssn_count) %>%
+  filter(s_abbr %in% c("PCCBOC", "MSCBOC", "HCC", "VAMC", "OOS")
+         & scrssn_count_cat != "< 450"
+         & vssc_month == ymd("2021-03-01")
+         & is.na(gap_metric) == F) %>%
+  mutate(gap_level = case_when(
+    gap_metric >= 1 & gap_metric < 1.2 ~ "Marginally Staffed (1-1.2)",
+    gap_metric >= 1.2 ~ "Fully Staffed (>= 1.2)",
+    gap_metric < 1 ~ "Not Fully Staffed (< 1)"
+  ),
+  gap_diff = 1.2 - gap_metric,
+  dr_fte_diff = (gap_diff * observed_ps_tot) / 1200,
+  np_fte_diff = (gap_diff * observed_ps_tot) / 900,
+  #
+  dr_fte_diff_up = ceiling((gap_diff * observed_ps_tot) / 1200),
+  np_fte_diff_up = ceiling((gap_diff * observed_ps_tot) / 900),
+  #
+  excess_gap = if_else(gap_metric > 1.2, gap_metric - 1.2, NA_integer_),
+  #
+  excess_dr = (excess_gap * observed_ps_tot) / 1200,
+  excess_app = (excess_gap * observed_ps_tot) / 900,
+  #
+  patient_diff = (gap_diff * observed_ps_tot),
+  #
+  status = if_else(gap_metric >= 1.2, "No Gap", "Gap"),
+  #
+  np_need = case_when(np_fte_diff >= 0.5 ~ 1,
+                      is.na(np_fte_diff) & np_fte_diff < 0.5 ~ 0,
+                      TRUE ~ 99))
+#--
+analytic_df2 <- gap_metric %>%
+  inner_join(., vast) %>%
+  left_join(., scrssn_count) %>%
+  filter(s_abbr %in% c("PCCBOC", "MSCBOC", "HCC", "VAMC", "OOS")
+         & scrssn_count_cat != "< 450"
+         & vssc_month == ymd("2023-07-01")
+         & is.na(gap_metric) == F) %>%
+  mutate(gap_level = case_when(
+    gap_metric >= 1 & gap_metric < 1.2 ~ "Marginally Staffed (1-1.2)",
+    gap_metric >= 1.2 ~ "Fully Staffed (>= 1.2)",
+    gap_metric < 1 ~ "Not Fully Staffed (< 1)"
+  ),
+  gap_diff = 1.2 - gap_metric,
+  dr_fte_diff = (gap_diff * observed_ps_tot) / 1200,
+  np_fte_diff = (gap_diff * observed_ps_tot) / 900,
+  #
+  dr_fte_diff_up = ceiling((gap_diff * observed_ps_tot) / 1200),
+  np_fte_diff_up = ceiling((gap_diff * observed_ps_tot) / 900),
+  #
+  excess_gap = if_else(gap_metric > 1.2, gap_metric - 1.2, NA_integer_),
+  #
+  excess_dr = (excess_gap * observed_ps_tot) / 1200,
+  excess_app = (excess_gap * observed_ps_tot) / 900,
+  #
+  patient_diff = (gap_diff * observed_ps_tot),
+  #
+  status = if_else(gap_metric >= 1.2, "No Gap", "Gap"),
+  #
+  np_need = case_when(np_fte_diff >= 0.5 ~ 1,
+                      is.na(np_fte_diff) & np_fte_diff < 0.5 ~ 0,
+                      TRUE ~ 99))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a response to the rapid request for PCP FTE needed to be fully staffed
+
+
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+
+# March 2021    
+
+## FTE Needed  
+
+```{r}
+analytic_df %>%
+  filter(status == "Gap") %>%
+  summarise("MD FTE Needed" = sum(dr_fte_diff, na.rm = T),
+            "MD FTE Needed, Ceiling" = sum(dr_fte_diff_up, na.rm = T),
+            "APP FTE Needed" = sum(np_fte_diff, na.rm = T),
+            "APP FTE Needed, Ceiling" = sum(np_fte_diff_up, na.rm = T)) %>%
+  mutate(foo = "foo") %>%
+  pivot_longer(-foo) %>%
+  select(-foo) %>%
+  mutate(value = comma(value, accuracy = 0.1)) %>%
+  kbl(col.names = c("", "FTE")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+## Number of under-staffed, marginally staffed, and over-staffed sta5as  
+
+```{r}
+analytic_df %>%
+  tabyl(gap_level) %>%
+  adorn_totals("row") %>%
+  mutate(n = comma(n, accuracy = 1)) %>%
+  adorn_pct_formatting() %>%
+  kbl(col.names = c("Gap Category", "Count", "%")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+
+
+# July 2023  
+
+## FTE Needed  
+
+```{r}
+analytic_df2 %>%
+  filter(status == "Gap") %>%
+  summarise("MD FTE Needed" = sum(dr_fte_diff, na.rm = T),
+            "MD FTE Needed, Ceiling" = sum(dr_fte_diff_up, na.rm = T),
+            "APP FTE Needed" = sum(np_fte_diff, na.rm = T),
+            "APP FTE Needed, Ceiling" = sum(np_fte_diff_up, na.rm = T)) %>%
+  mutate(foo = "foo") %>%
+  pivot_longer(-foo) %>%
+  select(-foo) %>%
+  mutate(value = comma(value, accuracy = 0.1)) %>%
+  kbl(col.names = c("", "FTE")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+## Number of under-staffed, marginally staffed, and over-staffed sta5as  
+
+```{r}
+analytic_df2 %>%
+  tabyl(gap_level) %>%
+  adorn_totals("row") %>%
+  mutate(n = comma(n, accuracy = 1)) %>%
+  adorn_pct_formatting() %>%
+  kbl(col.names = c("Gap Category", "Count", "%")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+
+```{r}
+analytic_df %>%
+  rename(gap_level_march_21 = gap_level) %>%
+  select(sta5a, gap_level_march_21) %>%
+  left_join(., analytic_df2 %>%
+              select(sta5a, gap_level_july_23 = gap_level)) %>%
+  tabyl(gap_level_march_21, gap_level_july_23) %>%
+  select(-NA_) %>%
+  kbl(col.names = c("", "Fully Staffed (>= 1.2)", "Marginally Staffed (1-1.2)", "Not Fully Staffed (< 1)"),
+      full_width = F) %>%
+  kable_classic("striped") %>%
+  add_header_above(c("", "<b>July 2023</b>" = 3))
+```

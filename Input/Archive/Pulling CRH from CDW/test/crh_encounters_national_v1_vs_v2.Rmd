@@ -1,0 +1,730 @@
+---
+title: "CRH Encounters Over Time - Version 1 vs. Version 2"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = '-')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 24),
+             axis.text.y = element_text(size = 18),
+             axis.text.x = element_text(size = 18, angle = 270, vjust = 0.3, hjust = 0),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+hubs <- dbGetQuery(oabi_con,
+                     "select hub_sta3n from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select hub_sta3n from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+all_months <- seq.Date(ymd('2019-10-01'),ymd('2021-09-01'), by = 'month')
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#==
+all_encounters <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].all_encounters_E_counts") %>%
+  select(-contains("Vax")) %>%
+  mutate(vizMonth = ymd(vizMonth)) %>%
+  left_join(., vast, by = c("sta6a" = "sta5a")) %>%
+  mutate(sta5a_lab = paste0("(", sta6a, ") ", short_name),
+         spoke_flag = if_else(sta6a %in% spokes_v, TRUE, FALSE),
+         fy = if_else(month(vizMonth) > 9, year(vizMonth) + 1, year(vizMonth)),
+         qtr = case_when(month(vizMonth) %in% c(10, 11, 12) ~ 1,
+                         month(vizMonth) %in% c(1, 2, 3) ~ 2,
+                         month(vizMonth) %in% c(4, 5, 6) ~ 3,
+                         month(vizMonth) %in% c(7, 8, 9) ~ 4)) %>%
+  filter(is.na(parent_visn) == F & fy %in% c(2020, 2021)) %>%
+  rename("Primary Care" = pc_encounters,
+         "Mental Health" = mh_encounters,
+         "Pharmacy" = pharmacy_encounters,
+         "PCMHI" = pcmhi_encounters)
+#
+spoke_encounters <- all_encounters %>% filter(spoke_flag == T)
+#==
+crh_encounters_v1 <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].encounters_D_deDup") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(visitdate) > 9, year(visitdate) + 1, year(visitdate)),
+         sta5a_to_use = if_else(spoke_sta5a %in% hubs$hub_sta3n | is.na(spoke_sta5a) == T, sta5a_most_freq, spoke_sta5a),
+         version = "Version 1") %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  left_join(., vast, by = c("sta5a_to_use" = "sta5a")) %>%
+  filter(is.na(parent_visn) == FALSE)
+#--
+crh_encounters_v2 <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].encounters_D_deDup_v2") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(visitdate) > 9, year(visitdate) + 1, year(visitdate)),
+         sta5a_to_use = if_else(spoke_sta5a %in% hubs$hub_sta3n | is.na(spoke_sta5a) == T, sta5a_most_freq, spoke_sta5a),
+         version = "Version 2") %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  left_join(., vast, by = c("sta5a_to_use" = "sta5a")) %>%
+  filter(is.na(parent_visn) == FALSE)
+#
+crh_encounters <- crh_encounters_v1 %>%
+  bind_rows(., crh_encounters_v2)
+```
+
+# National  
+## Total    
+```{r}
+crh_nat_total <- crh_encounters %>%
+  group_by(crh_month, version) %>%
+  summarise(crh_encounters = n())
+#
+all_nat_total <- spoke_encounters %>%
+  select(2:6) %>%
+  pivot_longer(-vizMonth) %>%
+  group_by(vizMonth) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+total_df <- crh_nat_total %>%
+  left_join(., all_nat_total, by = c("crh_month" = "vizMonth")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000)
+#
+ggplot(data = total_df,
+         aes(x = crh_month, y = crh_encounters, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+\newpage
+
+## By Type      
+
+```{r}
+crh_nat_type <- crh_encounters %>%
+  group_by(crh_month, care_type, version) %>%
+  summarise(crh_encounters = n())
+#
+all_nat_type <- spoke_encounters %>%
+  select(2:6) %>%
+  pivot_longer(-vizMonth) %>%
+  group_by(vizMonth, name) %>%
+  summarise(total = sum(value, na.rm = T))
+#
+type_nat_df <- crh_nat_type %>%
+  left_join(., all_nat_type, by = c("crh_month" = "vizMonth", "care_type" = "name")) %>%
+  mutate(crh_per_1k_total = crh_encounters / total * 1000)
+#
+ggplot(data = type_nat_df,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, hjust = 0, vjust = 0.3)) +
+  labs(x = "Month",
+       y = "CRH Encounters per 1,000 Total Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  facet_wrap(~care_type) +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2) +
+  scale_x_date(date_labels = "%b-%y")
+```
+
+```{r creating_data_frames}
+#--TOTAL
+crh_visn_total <- crh_encounters %>%
+  group_by(crh_month, parent_visn, version) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup %>%
+  complete(crh_month = all_months, nesting(parent_visn, version))
+#==BY CARE TYPE
+crh_visn_type <- crh_encounters %>%
+  group_by(crh_month, parent_visn, care_type, version) %>%
+  summarise(crh_encounters = n()) %>%
+  ungroup %>%
+  complete(crh_month = all_months, nesting(parent_visn, care_type, version))
+```
+
+# VISN  
+## Total  
+```{r}
+crh_visn_total %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+
+```
+
+## Mental Health  
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Mental Health") %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Mental Health CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+```
+
+
+## Primary Care    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Primary Care") %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Primary Care CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+```
+
+## Pharmacy    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Pharmacy") %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Pharmacy CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2) +
+  facet_wrap(~parent_visn)
+```
+
+# VISN 6  
+## Total  
+```{r}
+crh_visn_total %>%
+  filter(parent_visn == 6) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+
+```
+
+## Mental Health  
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Mental Health" & parent_visn == 6) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Mental Health CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+## Primary Care    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Primary Care" & parent_visn == 6) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Primary Care CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+## Pharmacy    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Pharmacy" & parent_visn == 6) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Pharmacy CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+# VISN 16  
+## Total  
+```{r}
+crh_visn_total %>%
+  filter(parent_visn == 16) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+
+```
+
+## Mental Health  
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Mental Health" & parent_visn == 16) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Mental Health CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+## Primary Care    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Primary Care" & parent_visn == 16) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Primary Care CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+## Pharmacy    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Pharmacy" & parent_visn == 16) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Pharmacy CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+# VISN 19  
+## Total  
+```{r}
+crh_visn_total %>%
+  filter(parent_visn == 19) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+
+```
+
+## Mental Health  
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Mental Health" & parent_visn == 19) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Mental Health CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+## Primary Care    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Primary Care" & parent_visn == 19) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Primary Care CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+## Pharmacy    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Pharmacy" & parent_visn == 19) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Pharmacy CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+# VISN 20  
+## Total  
+```{r}
+crh_visn_total %>%
+  filter(parent_visn == 20) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+
+```
+
+## Mental Health  
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Mental Health" & parent_visn == 20) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Mental Health CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+## Primary Care    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Primary Care" & parent_visn == 20) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Primary Care CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+## Pharmacy    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Pharmacy" & parent_visn == 20) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Pharmacy CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+# VISN 21    
+## Total  
+```{r}
+crh_visn_total %>%
+  filter(parent_visn == 21) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+
+```
+
+## Mental Health  
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Mental Health" & parent_visn == 21) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Mental Health CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+## Primary Care    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Primary Care" & parent_visn == 21) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Primary Care CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+## Pharmacy    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Pharmacy" & parent_visn == 21) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Pharmacy CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+# VISN 23    
+## Total  
+```{r}
+crh_visn_total %>%
+  filter(parent_visn == 23) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+
+```
+
+## Mental Health  
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Mental Health" & parent_visn == 23) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Mental Health CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+
+## Primary Care    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Primary Care" & parent_visn == 23) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Primary Care CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```
+
+## Pharmacy    
+```{r}
+crh_visn_type %>%
+  filter(care_type == "Pharmacy" & parent_visn == 23) %>%
+  ggplot(data = .,
+         aes(x = crh_month, y = crh_encounters, group = version, color = version)) +
+  geom_line(size = 1) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Month",
+       y = "Pharmacy CRH Encounters",
+       caption = "*Vertical line at October 1st, 2020") +
+  geom_vline(xintercept = as.numeric(ymd("2020-10-01")), lty = 2)
+```

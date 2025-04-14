@@ -1,0 +1,623 @@
+---
+title: "A Quick Look at MH Access Metrics"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-02-01"), ymd("2023-10-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+# scrssn_count <- dbGetQuery(oabi_con,
+#                            "with CTE as(
+#                             	select count(distinct ScrSSN_num) as scrssn_count
+#                             		, sta5a, fy, qtr
+#                             	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+#                             	where fy = 2020
+#                             	group by Sta5a, fy, QTR
+#                             	)
+#                             select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+#                             from CTE
+#                             group by Sta5a") %>%
+#   mutate(scrssn_count_cat = factor(case_when(
+#     scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+#     scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+#     scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+#     scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+#   ), ordered = TRUE,
+#   levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+```{r}
+mh_metrics_filepath <- "R:\\HSRD\\HSRD_General\\Kaboli Access Team\\CRH Evaluation\\Bjarni\\MH Access Metrics"
+mh_access_dirs <- list.dirs(path = mh_metrics_filepath, full.names = TRUE)
+```
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a sanity check of the MH Access metrics I have downloaded
+
+
+
+# CONT3  
+```{r}
+cont3 <- read_csv(list.files(mh_access_dirs[2], full.names = TRUE, pattern = "_all"))
+#
+cont3_national <- cont3 %>%
+  filter(location == "National") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+cont3_visn <- cont3 %>%
+  filter(str_sub(location, start = 1, end = 1) == "V") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+cont3_parent <- cont3 %>%
+  filter(str_sub(location, start = 1, end = 1) == "(") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+```
+
+* This is available quarterly at the national level:
+```{r}
+ggplot(data = cont3_national,
+       aes(x = name, y = value, group = 1)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "CONT3")
+```
+
+* As well as the VISN level:
+```{r}
+ggplot(data = cont3_visn,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "right") +
+  labs(y = "CONT3")
+```
+
+* And the parent station level:
+```{r}
+ggplot(data = cont3_parent,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "CONT3")
+```
+
+# MH13  
+* This is available monthly at the sta5a level: 
+* The actual metric we want (i.e., proportion of appointments in 30 days or less) isn't directly reported, which means I had to do some math to get the answer  
+
+```{r}
+#------
+mh13 <- read_csv(list.files(mh_access_dirs[5], full.names = TRUE, pattern = "_all"))
+#==
+mh13 %>% left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+         aes(x = month, y = prop_le_30, group = sta5a, color = sta5a)) +
+  geom_line() +
+  scale_y_continuous(limits = c(NA, 1.0),
+                     labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "MH13") +
+  facet_wrap(~parent_visn)
+```
+
+# MH17  
+* This is available monthly at the sta5a level: 
+* The actual metric we want (i.e., proportion of appointments in 30 days or less) isn't directly reported, which means I had to do some math to get the answer  
+
+```{r}
+mh17 <- read_csv(list.files(mh_access_dirs[6], full.names = TRUE, pattern = "_all"))
+#==
+mh17 %>% left_join(., vast %>% select(sta5a, parent_visn)) %>%
+  filter(is.na(parent_visn) == F) %>%
+  ggplot(data = .,
+         aes(x = month, y = prop_le_30, group = sta5a, color = sta5a)) +
+  geom_line() +
+  scale_y_continuous(limits = c(NA, 1.0),
+                     labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "MH17") +
+  facet_wrap(~parent_visn)
+```
+
+# MHPA1  
+
+```{r}
+#------
+mhpa1 <- read_csv(list.files(mh_access_dirs[7], full.names = TRUE, pattern = "_all"))
+#
+mhpa1_national <- mhpa1 %>%
+  filter(location == "National") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+mhpa1_visn <- mhpa1 %>%
+  filter(str_sub(location, start = 1, end = 1) == "V") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+mhpa1_parent <- mhpa1 %>%
+  filter(str_sub(location, start = 1, end = 1) == "(") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+```
+
+* This is available quarterly at the national level:
+```{r}
+ggplot(data = mhpa1_national,
+       aes(x = name, y = value, group = 1)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "MHPA1")
+```
+
+* As well as the VISN level:
+```{r}
+ggplot(data = mhpa1_visn,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "right") +
+  labs(y = "MHPA1")
+```
+
+* And the parent station level:
+```{r}
+ggplot(data = mhpa1_parent,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "MHPA1")
+```
+
+# PCMHI7  
+
+```{r}
+#------
+pcmhi7 <- read_csv(list.files(mh_access_dirs[8], full.names = TRUE, pattern = "_all"))
+#
+pcmhi7_national <- pcmhi7 %>%
+  filter(location == "National") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"),
+         value = as.numeric(str_remove(value, "%")) / 100)
+#
+pcmhi7_visn <- pcmhi7 %>%
+  filter(str_sub(location, start = 1, end = 1) == "V") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"),
+         value = as.numeric(str_remove(value, "%")) / 100)
+#
+pcmhi7_parent <- pcmhi7 %>%
+  filter(str_sub(location, start = 1, end = 1) == "(") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"),
+         value = as.numeric(str_remove(value, "%")) / 100)
+```
+
+* This is available quarterly at the national level:
+```{r}
+ggplot(data = pcmhi7_national,
+       aes(x = name, y = value, group = 1)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 0.5),
+                     labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "PCMHI7")
+```
+
+* As well as the VISN level:
+```{r}
+ggplot(data = pcmhi7_visn,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0, 0.6),
+                     labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "right") +
+  labs(y = "PCMHI7")
+```
+
+* And the parent station level:
+```{r}
+ggplot(data = pcmhi7_parent,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous(limits = c(NA, 1.0),
+                     labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "PCMHI7")
+```
+
+# PCOV2  
+
+```{r}
+#------
+pcov2 <- read_csv(list.files(mh_access_dirs[9], full.names = TRUE, pattern = "_all"))
+#
+pcov2_national <- pcov2 %>%
+  filter(location == "National") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+pcov2_visn <- pcov2 %>%
+  filter(str_sub(location, start = 1, end = 1) == "V") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+pcov2_parent <- pcov2 %>%
+  filter(str_sub(location, start = 1, end = 1) == "(") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+```
+
+* This is available quarterly at the national level:
+```{r}
+ggplot(data = pcov2_national,
+       aes(x = name, y = value, group = 1)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "PCOV2")
+```
+
+* As well as the VISN level:
+```{r}
+ggplot(data = pcov2_visn,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "right") +
+  labs(y = "PCOV2")
+```
+
+* And the parent station level:
+```{r}
+ggplot(data = pcov2_parent,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "PCOV2")
+```
+
+# PDE1  
+
+```{r}
+#------
+pde1 <- read_csv(list.files(mh_access_dirs[10], full.names = TRUE, pattern = "_all"))
+#
+pde1_national <- pde1 %>%
+  filter(location == "National") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"),
+         value = as.numeric(str_remove(value, "%")) / 100)
+#
+pde1_visn <- pde1 %>%
+  filter(str_sub(location, start = 1, end = 1) == "V") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"),
+         value = as.numeric(str_remove(value, "%")) / 100)
+#
+pde1_parent <- pde1 %>%
+  filter(str_sub(location, start = 1, end = 1) == "(") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"),
+         value = as.numeric(str_remove(value, "%")) / 100)
+```
+
+* This is available quarterly at the national level:
+```{r}
+ggplot(data = pde1_national,
+       aes(x = name, y = value, group = 1)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0.5, 1),
+                     labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "PDE1")
+```
+
+* As well as the VISN level:
+```{r}
+ggplot(data = pde1_visn,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous(limits = c(0.5, 1),
+                     labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "right") +
+  labs(y = "PDE1")
+```
+
+* And the parent station level:
+```{r}
+ggplot(data = pde1_parent,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous(limits = c(NA, 1.0),
+                     labels = percent_format(accuracy = 1)) +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "PDE1")
+```
+
+# VSAA1  
+
+```{r}
+#------
+vsaa1 <- read_csv(list.files(mh_access_dirs[11], full.names = TRUE, pattern = "_all"))
+#
+vsaa1_national <- vsaa1 %>%
+  filter(location == "National") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+vsaa1_visn <- vsaa1 %>%
+  filter(str_sub(location, start = 1, end = 1) == "V") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+vsaa1_parent <- vsaa1 %>%
+  filter(str_sub(location, start = 1, end = 1) == "(") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+```
+
+* This is available quarterly at the national level:
+```{r}
+ggplot(data = vsaa1_national,
+       aes(x = name, y = value, group = 1)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "VSAA1")
+```
+
+* As well as the VISN level:
+```{r}
+ggplot(data = vsaa1_visn,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "right") +
+  labs(y = "VSAA1")
+```
+
+* And the parent station level:
+```{r}
+ggplot(data = vsaa1_parent,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "VSAA1")
+```
+
+# VSPC2  
+
+```{r}
+#------
+vspc2 <- read_csv(list.files(mh_access_dirs[12], full.names = TRUE, pattern = "_all"))
+#
+vspc2_national <- vspc2 %>%
+  filter(location == "National") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+vspc2_visn <- vspc2 %>%
+  filter(str_sub(location, start = 1, end = 1) == "V") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+#
+vspc2_parent <- vspc2 %>%
+  filter(str_sub(location, start = 1, end = 1) == "(") %>%
+  select(-contains("std")) %>%
+  pivot_longer(-location) %>%
+  mutate(name = str_remove(name, "score_"))
+```
+
+* This is available quarterly at the national level:
+```{r}
+ggplot(data = vspc2_national,
+       aes(x = name, y = value, group = 1)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank()) +
+  labs(y = "VSPC2")
+```
+
+* As well as the VISN level:
+```{r}
+ggplot(data = vspc2_visn,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "right") +
+  labs(y = "VSPC2")
+```
+
+* And the parent station level:
+```{r}
+ggplot(data = vspc2_parent,
+       aes(x = name, y = value, group = location, color = location)) +
+  geom_line() +
+  scale_y_continuous() +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "VSPC2")
+```
+

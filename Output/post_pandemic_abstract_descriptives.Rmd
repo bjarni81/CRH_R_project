@@ -1,0 +1,519 @@
+---
+title: "Post-Pandemic Abstract: Tables and Other Descriptives"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 8, fig.height = 8)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v6_post_COVID.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month),
+         tna_new_source = as.numeric(tna_new_source))
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-03-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+pc_community_care <- dbGetQuery(oabi_con,
+                                 "select *
+                                 from [OABI_MyVAAccess].[crh_eval].F5_avg_pc_cons_post_COVID")
+```
+
+```{r}
+# a vector of sta5as that:
+    #1. have at least 451 average unique scrssns in pcmm FY20
+    #2. are a CBOC, OOS, VAMC, or HCC
+sta5as_to_start_with <- vast %>%
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F
+         & scrssn_count_cat != "< 450"
+         & s_abbr %in% c("PCCBOC", "MSCBOC", "VAMC", "OOS", "HCC")) %>%
+  select(sta5a, s_abbr, scrssn_count_cat)
+#-----
+months_meeting_inclusion_criteria <- pen_rate %>%
+  arrange(sta5a, vssc_month) %>%#ordering by station and month
+  group_by(sta5a) %>%#grouping by station
+  mutate(this_mo_mt9_pc_crh = if_else(crh_encounter_count > 9, 1, 0),#flag for this month meeting criteria 
+         last_mo_mt9_pc_crh = if_else(lag(crh_encounter_count) > 9, 1, 0),#flag for last month
+         next_mo_mt9_pc_crh = if_else(lead(crh_encounter_count) > 9, 1, 0),#flag for next month
+         meets_inc_crit = if_else(this_mo_mt9_pc_crh == 1 & # IF this month meets criteria
+                                    (last_mo_mt9_pc_crh == 1 | next_mo_mt9_pc_crh == 1),#AND either this or last month
+                                  1, 0),#THEN 1, ELSE 0
+         meets_inc_crit = replace_na(meets_inc_crit, 0)) %>%#replacing NA with 0
+  mutate(
+    period_meeting_citeria = factor(case_when(
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month < ymd("2020-03-01") #AND month < march 2020
+      ~ "Before March 2020",#label
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month >= ymd("2020-03-01")#AND month between March 2020
+      & vssc_month <= ymd("2020-09-01") #AND September 2020
+      ~ "Between March and September 2020",#label
+      meets_inc_crit == 1 #IF meets criteria
+      & vssc_month > ymd("2020-09-01") #AND month > Setember 2020
+      ~ "After September 2020",#label
+      TRUE ~ "Not Enough PC CRH"),#ELSE
+      ordered = TRUE,
+      levels = c("Before March 2020", 
+                 "Between March and September 2020",
+                 "After September 2020",
+                 "Not Enough PC CRH")))
+#--
+sta5a_month_inc <- months_meeting_inclusion_criteria %>%
+  group_by(sta5a, period_meeting_citeria) %>%
+  summarise(count = n()) %>%
+  filter(period_meeting_citeria != "Not Enough PC CRH") %>%
+  group_by(sta5a) %>%
+  summarise(period1_inc = sum(if_else(period_meeting_citeria == "Before March 2020" & count > 1, 1, 0)),
+            period2_inc = sum(if_else(period_meeting_citeria == "Between March and September 2020" & count > 1, 1, 0)),
+            period3_inc = sum(if_else(period_meeting_citeria == "After September 2020" & count > 1, 1, 0)))
+#--
+cases_controls <- sta5as_to_start_with %>%
+  left_join(., sta5a_month_inc) %>%
+  mutate(across(contains("period"), ~replace_na(.x, 0)),
+         not_enough_crh = if_else(period1_inc == 0 & period2_inc == 0 & period3_inc == 0 & sta5a %in% pen_rate$sta5a, 
+                                  1, 0),
+         potential_control = if_else(period1_inc == 0 & period2_inc == 0 & period3_inc == 0 & not_enough_crh == 0, 1, 0),
+         ever_met_criteria = if_else(period1_inc == 1 | period2_inc == 1 | period3_inc == 1, 1, 0),
+         treated = factor(case_when(period3_inc == 1 ~ "Treated",
+                             potential_control == 1 ~ "Control",
+                             TRUE ~ "Drop me!"),
+                          ordered = T, 
+                          levels = c("Treated", "Control", "Drop me!"))) %>%
+  filter(treated != "Drop me!")
+#$$$$$$
+gap_flag <- cases_controls %>%
+  select(sta5a) %>%
+  cross_join(., dates) %>%
+  left_join(gap_metric %>%
+              select(sta5a, vssc_month, gap_metric)) %>%
+  group_by(sta5a) %>%
+  summarise(gap_avg = mean(gap_metric, na.rm = T)) %>%
+  mutate(gap_flag = case_when(
+    gap_avg < 1 ~ "< 1.0",
+    gap_avg > 1.2 ~ "> 1.2",
+    TRUE ~ "1.0-1.2"
+  ))
+#========
+outcomes_avg <- cases_controls %>%
+  select(sta5a) %>%
+  cross_join(., dates %>%
+               select(-time)) %>%
+  left_join(., access_metrics %>%
+              select(sta5a, vssc_month, 
+                     est_pc_pt_wt_pid,
+                     new_pc_pt_wt_create,
+                     tna_new_source,
+                     new_0_20_days_create)) %>%
+  left_join(., timely_care %>%
+              select(sta5a, vssc_month, tc_pc_success_prop)) %>%
+  group_by(sta5a) %>%
+  summarise(across(where(is.numeric), ~mean(.x, na.rm = T)))
+  
+#--------
+analytic_df <- cases_controls %>%
+  select(sta5a, treated, scrssn_count_cat) %>%
+  left_join(., gap_flag) %>%
+  left_join(., vast %>%
+              select(sta5a, urh_vast, s_abbr)) %>%
+  mutate(treated = factor(treated,
+                          levels = c("Treated", "Control"),
+                          ordered = TRUE),
+         urh_vast2 = if_else(urh_vast == "U", "Urban", "Rural"),
+         gap_flag = factor(gap_flag,
+                           ordered = TRUE,
+                           levels = c("< 1.0", "1.0-1.2", "> 1.2"))) %>%
+  left_join(., outcomes_avg)
+```
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a collection of tables and statistics for the post-pandemic abstract 
+
+## Decision Points  
+
+* Per our discussion on November 28th and 30th I am putting-together a series of tables and data descriptions to fill-in numbers in the post-pandemic abstract
+    
+## Analytic details  
+
+
+* Description of the data:
+    + The data analyzed here include the 30 months from October 2020 through March 2023
+      + This is also the period in which the __gap_flag__ covariate is being created
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + There are `r analytic_df %>% select(sta5a) %>% n_distinct()` unique sta5as
+      + `r sum(analytic_df$treated == "Treated")` of these met our criteria for PC CRH at least once after September 2020  
+      + `r sum(str_detect(analytic_df$s_abbr, "CBOC") == T)` of these are CBOCs
+      + `r sum(str_detect(analytic_df$s_abbr, "HCC|VAMC") == T)` of these are HCCs or VAMCs
+      + `r sum(str_detect(analytic_df$s_abbr, "OOS") == T)` of these are OOS    
+    + Treated sta5as are the `r sum(analytic_df$treated == "Treated")` sta5as that __met our inclusion criteria after September 2020__ 
+    + Control sta5as are the `r sum(analytic_df$treated != "Treated")` sta5as that have __never had a PC CRH encounter__
+
+
+# Gap Metric X PC CRH  
+
+```{r}
+analytic_df %>%
+  tabyl(gap_flag, treated) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  add_header_above(c("", "Observed" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df <- analytic_df %>%
+  tabyl(gap_flag, treated) %>%
+  chisq.test()
+#
+chisq_df$expected %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.1))) %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  remove_column(1) %>%
+  add_header_above(c("", "Expected" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df
+```
+
+## By Uniques  
+### 450 - 2,399   
+```{r}
+analytic_df %>%
+  filter(scrssn_count_cat == "450 - 2,399") %>%
+  tabyl(gap_flag, treated) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  add_header_above(c("", "Observed" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df <- analytic_df %>%
+  filter(scrssn_count_cat == "450 - 2,399") %>%
+  tabyl(gap_flag, treated) %>%
+  chisq.test()
+#
+chisq_df$expected %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.1))) %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  remove_column(1) %>%
+  add_header_above(c("", "Expected" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df
+```
+
+  
+### 2,400 - 9,999   
+```{r}
+analytic_df %>%
+  filter(scrssn_count_cat == "2,400 - 9,999") %>%
+  tabyl(gap_flag, treated) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  add_header_above(c("", "Observed" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df <- analytic_df %>%
+  filter(scrssn_count_cat == "2,400 - 9,999") %>%
+  tabyl(gap_flag, treated) %>%
+  chisq.test()
+#
+chisq_df$expected %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.1))) %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  remove_column(1) %>%
+  add_header_above(c("", "Expected" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df
+```
+
+
+### 10,000+   
+```{r}
+analytic_df %>%
+  filter(scrssn_count_cat == "10,000+") %>%
+  tabyl(gap_flag, treated) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  add_header_above(c("", "Observed" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df <- analytic_df %>%
+  filter(scrssn_count_cat == "10,000+") %>%
+  tabyl(gap_flag, treated) %>%
+  chisq.test()
+#
+chisq_df$expected %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.1))) %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  remove_column(1) %>%
+  add_header_above(c("", "Expected" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df
+```
+
+## By Rurality  
+### Urban     
+```{r}
+analytic_df %>%
+  filter(urh_vast2 == "Urban") %>%
+  tabyl(gap_flag, treated) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  add_header_above(c("", "Observed" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df <- analytic_df %>%
+  filter(urh_vast2 == "Urban") %>%
+  tabyl(gap_flag, treated) %>%
+  chisq.test()
+#
+chisq_df$expected %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.1))) %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  remove_column(1) %>%
+  add_header_above(c("", "Expected" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df
+```
+
+
+### Rural     
+```{r}
+analytic_df %>%
+  filter(urh_vast2 == "Rural") %>%
+  tabyl(gap_flag, treated) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  add_header_above(c("", "Observed" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df <- analytic_df %>%
+  filter(urh_vast2 == "Rural") %>%
+  tabyl(gap_flag, treated) %>%
+  chisq.test()
+#
+chisq_df$expected %>%
+  adorn_totals("both") %>%
+  mutate(across(where(is.numeric), ~comma(.x, accuracy = 0.1))) %>%
+  kbl(col.names = c("", "Treated", "Control", "Total")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T) %>%
+  row_spec(4, bold = T) %>%
+  remove_column(1) %>%
+  add_header_above(c("", "Expected" = 2, ""),
+                   bold = TRUE)
+#
+chisq_df
+```
+
+
+# Access Metrics Among Treated Sites, by Gap Status  
+
+```{r}
+lm_fxn <- function(formula, covar_name){
+  analytic_df %>%
+    mutate(gap_flag = relevel(factor(gap_flag, ordered = F), ref = '> 1.2')) %>%
+    filter(treated == "Treated") %>%
+    lm(formula, data = .) %>%
+    tab_model(.,
+              dv.labels = {{covar_name}})
+  
+}
+```
+
+## Established Patient Wait Time (PID)  
+```{r}
+lm_fxn(est_pc_pt_wt_pid ~ gap_flag, "Established Patient Wait Time (PID)")
+```
+
+## New Patient Wait Time (create)
+```{r}
+lm_fxn(new_pc_pt_wt_create ~ gap_flag, "New Patient Wait Time (create)")
+```
+
+## Third Next Available
+```{r}
+lm_fxn(tna_new_source ~ gap_flag, "Third Next Available")
+```
+
+## Timely Care  
+```{r}
+lm_fxn(tc_pc_success_prop ~ gap_flag, "Timely Care")
+```
+

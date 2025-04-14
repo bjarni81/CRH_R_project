@@ -1,0 +1,289 @@
+---
+title: "Consults for Primary Care: intra-VHA vs. community"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+```{r}
+t.test2 <- function(m1, m2, s1, s2, n1, n2, m0=0, equal.variances = FALSE){
+  if(equal.variances == FALSE)
+  {
+    se <- round(sqrt((s1 ^ 2 / n1) + (s2^2 / n2)), 8)
+    #welch-satterwaithe df
+    df <- ((s1^2 / n1 + s2 ^ 2 / n2) ^2 ) / ((s1 ^ 2 / n1) ^ 2 / (n1 - 1) + (s2 ^ 2 / n2) ^ 2 / (n2 - 1))
+  }
+  else
+  {
+    se <- sqrt((1 / n1 + 1/ n2) * ((n1 - 1) * s1^2 +(n2-1) * s2^2) / (n1 + n2 - 2))
+    df <- n1 + n2 - 2
+  }
+  t <- round((m1 - m2 - m0)/ se, 4)
+  se <- round(se, 4)
+  mean_diff <- round((m1 - m2), 4)
+  pval <- if_else(2*pt(-abs(t), df) < 0.00001, "<0.00001", as.character(2*pt(-abs(t), df)))
+  dat <- c(mean_diff, se, t, pval)
+  names(dat) <- c("difference_of_means", "std_Error", "t", "p_value")
+  return(dat)
+}
+```
+
+
+
+```{r cdw_cc_refs}
+cc_refs_cdw <- dbGetQuery(oabi_con,
+                          "--
+select count(*) as referral_count
+	, actyMonth, non_va, stopCode_group
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+group by actyMonth, non_va, stopCode_group") %>%
+  mutate(actyMonth = ymd(actyMonth),
+         fy = if_else(month(actyMonth) > 9, year(actyMonth) + 1, year(actyMonth))) %>%
+  filter(actyMonth < ymd("2021-10-01")
+         & actyMonth > ymd("2017-12-01"))
+#
+non_va_cc_refs <- cc_refs_cdw %>%
+  filter(non_va == 1) %>%
+  rename(non_va_referral_count = referral_count) %>%
+  select(-non_va)
+#
+yes_va_cc_refs <- cc_refs_cdw %>%
+  filter(non_va == 0) %>%
+  rename(yes_va_referral_count = referral_count) %>%
+  select(-non_va)
+#--
+analytic_df <- non_va_cc_refs %>%
+  left_join(., yes_va_cc_refs) %>%
+  mutate(total_referrals = yes_va_referral_count + non_va_referral_count,
+         non_va_as_prop_of_total = non_va_referral_count / total_referrals) %>%
+  filter(str_detect(stopCode_group, "Primary") == T)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This report is written in response for feedback on the "Referrals for Primary Care in the Veterans Health Administration (VHA)" abstract 
+    + It focuses on PC only (i.e., eliminates urology, heme/onc, and cardio)
+    + It changes the focus from rural to rural
+
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$actyMonth)`
+    + The last observation in the data occurs on `r max(analytic_df$actyMonth)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + Each row is a month
+
+* Description of analyses 
+    + Outcome
+    + Technique
+    + Link function, if applicable
+    
+    
+## Primary Care  
+```{r pc_total_referrals}
+total_refs_by_nonVA <- dbGetQuery(oabi_con,
+           "select count(*) as referral_count, stopCode_group, non_va
+           from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+           where fy < 2022
+           group by stopCode_group, non_va") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_total <- total_refs_by_nonVA %>%
+  filter(stopCode_group == "Primary care")
+#
+pc_total_refs_table <- tibble(
+  name = "Total Referrals",
+  yes_va = comma(pc_refs_total[[1]][1], accuracy = 1),
+  non_va = comma(pc_refs_total[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+uniques_by_nonVA <- dbGetQuery(oabi_con,
+           "select count(distinct scrssn) as referral_count, stopCode_group, non_va
+           from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+           where fy < 2022
+           group by stopCode_group, non_va") %>%
+  arrange(stopCode_group, non_va)
+#
+uniques_pc <- uniques_by_nonVA %>%
+  filter(stopCode_group == "Primary care")
+# 
+pc_uniques_table <- tibble(
+  name = "Uniques Receiving Referrals",
+  yes_va = comma(uniques_pc[[1]][1], accuracy = 1),
+  non_va = comma(uniques_pc[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+refs_by_urh <- dbGetQuery(oabi_con,
+           "with CTE as(
+	select *, rural_flag = case when urh <> 'U' AND urh IS NOT NULL then 1 else 0 end
+	from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+           where fy < 2022
+	)
+select AVG(cast(rural_flag as float)) as avg_rural
+	, STDEV(rural_flag) as sd_rural
+	, sum(rural_flag) as sum_rural
+	, non_va, stopCode_group
+from CTE
+group by non_va, stopCode_group
+") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_urh1 <- refs_by_urh %>%
+  filter(stopCode_group == "Primary care")
+#
+urh_pc_ttest <- t.test2(pc_refs_urh1[[1]][1], pc_refs_urh1[[1]][2],
+                        pc_refs_urh1[[2]][1], pc_refs_urh1[[2]][2],
+                        pc_refs_urh1[[3]][1], pc_refs_urh1[[3]][2])
+#
+pc_refs_urh <- pc_refs_urh1  %>%
+  mutate_at(c(1, 2), ~percent(., accuracy = 0.1))
+#
+pc_urh_table <- tibble(
+  name = "Rural Patients % (SD)",
+  yes_va = paste0(pc_refs_urh[[1]][1], " (", pc_refs_urh[[2]][1], ")"),
+  non_va = paste0(pc_refs_urh[[1]][2], " (", pc_refs_urh[[2]][2], ")"),
+  p_val = urh_pc_ttest[4]
+)
+#####
+refs_by_dta <- dbGetQuery(oabi_con,
+                          "
+  select AVG(cast(dta as float)) as avg_dta
+	, STDEV(dta) as sd_dta
+	, count(*) as sum_dta
+	, non_va, stopCode_group
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+where fy < 2022
+group by non_va, stopCode_group") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_dta <- refs_by_dta %>%
+  filter(stopCode_group == "Primary care")
+#
+dta_pc_ttest <- t.test2(pc_refs_dta[[1]][1], pc_refs_dta[[1]][2],
+                        pc_refs_dta[[2]][1], pc_refs_dta[[2]][2],
+                        pc_refs_dta[[3]][1], pc_refs_dta[[3]][2])
+#
+pc_dta_table <- tibble(
+  name = "Days to Approved (SD)",
+  yes_va = paste0(comma(pc_refs_dta[[1]][1], accuracy = 0.1), " (", comma(pc_refs_dta[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(pc_refs_dta[[1]][2], accuracy = 0.1), " (", comma(pc_refs_dta[[2]][2], accuracy = 0.1), ")"),
+  p_val = dta_pc_ttest[4]
+)
+#####
+refs_by_dts <- dbGetQuery(oabi_con,
+                          "
+  select AVG(cast(dts as float)) as avg_dts
+	, STDEV(dts) as sd_dts
+	, count(*) as sum_dts
+	, non_va, stopCode_group
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+where fy < 2022
+group by non_va, stopCode_group") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_dts <- refs_by_dts %>%
+  filter(stopCode_group == "Primary care")
+#
+dts_pc_ttest <- t.test2(pc_refs_dts[[1]][1], pc_refs_dts[[1]][2],
+                        pc_refs_dts[[2]][1], pc_refs_dts[[2]][2],
+                        pc_refs_dts[[3]][1], pc_refs_dts[[3]][2])
+#
+pc_dts_table <- tibble(
+  name = "Days to Scheduled (SD)",
+  yes_va = paste0(comma(pc_refs_dts[[1]][1], accuracy = 0.1), " (", comma(pc_refs_dts[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(pc_refs_dts[[1]][2], accuracy = 0.1), " (", comma(pc_refs_dts[[2]][2], accuracy = 0.1), ")"),
+  p_val = dts_pc_ttest[4]
+)
+
+#####
+refs_by_dtc <- dbGetQuery(oabi_con,
+                          "
+  select AVG(cast(dtc as float)) as avg_dtc
+	, STDEV(dtc) as sd_dtc
+	, count(*) as sum_dtc
+	, non_va, stopCode_group
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+where fy < 2022
+group by non_va, stopCode_group") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_dtc <- refs_by_dtc %>%
+  filter(stopCode_group == "Primary care")
+#
+dtc_pc_ttest <- t.test2(pc_refs_dtc[[1]][1], pc_refs_dtc[[1]][2],
+                        pc_refs_dtc[[2]][1], pc_refs_dtc[[2]][2],
+                        pc_refs_dtc[[3]][1], pc_refs_dtc[[3]][2])
+#
+pc_dtc_table <- tibble(
+  name = "Days to Completed (SD)",
+  yes_va = paste0(comma(pc_refs_dtc[[1]][1], accuracy = 0.1), " (", comma(pc_refs_dtc[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(pc_refs_dtc[[1]][2], accuracy = 0.1), " (", comma(pc_refs_dtc[[2]][2], accuracy = 0.1), ")"),
+  p_val = dtc_pc_ttest[4]
+)
+
+#####
+foo <- ls(pattern = "_table")
+do.call(bind_rows, mget(foo)) %>%
+  mutate(name = factor(name, 
+                       ordered = TRUE,
+                       levels = c("Total Referrals", "Uniques Receiving Referrals",
+                                  "Rural Patients % (SD)", "Days to Approved (SD)", 
+                                  "Days to Scheduled (SD)", "Days to Completed (SD)"))) %>%
+  arrange(name) %>%
+  kbl(col.names = c("", "Yes VA", "Non-VA", "p-value"),
+      align = c("l", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```

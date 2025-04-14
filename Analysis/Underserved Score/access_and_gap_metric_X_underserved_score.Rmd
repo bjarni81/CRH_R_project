@@ -1,0 +1,581 @@
+---
+title: "Access Metrics & Gap Metric vs. Underserved Score"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#counting number of urban sta5as per parent sta5a
+parent_urh <- vast %>%
+  group_by(parent_station_sta5a) %>%
+  summarise(prop_urban = (sum(if_else(urh_vast == "U", 1, 0), na.rm = T)) / n()) %>%
+  mutate(majority_urban = if_else(prop_urban > 0.5, 1, 0))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+
+gap_metric <- read_csv(here("Input", "Data", "Gap Metric", "fy_parent_gap_metric.csv"))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month),
+         fy = if_else(month(vssc_month) > 9, year(vssc_month) + 1, year(vssc_month)),
+         pc_encounter_total = pc_encounter_total + crh_encounter_count,
+         pc_encounter_total = na_if(pc_encounter_total, 0),
+         pc_crh_per_1k_total_pc2 = crh_encounter_count / pc_encounter_total * 1000)
+#-----------------------------------------
+underserved_score_fy22 <- read_xlsx(here("Input", "Underserved Score", "MISSION 401 - FY22 - Primary Care.xlsx"),
+                                    range = "A1:G141") %>%
+  rename(parent_station_sta5a = `Facility ID`,
+         underserved_score = 4) %>%
+  select(parent_station_sta5a, underserved_score) %>%
+  mutate(fy = 2022,
+         underserved_score = underserved_score * 10)
+#--
+underserved_score_fy23 <- read_xlsx(here("Input", "Underserved Score", "MISSION 401 - FY23 Primary Care .xlsx"),
+                                    range = "A1:G141") %>%
+  rename(parent_station_sta5a = `Facility ID`,
+         underserved_score = 3) %>%
+  select(parent_station_sta5a, underserved_score) %>%
+  mutate(fy = 2023)
+#--
+underserved_score <- underserved_score_fy22 %>%
+  bind_rows(., underserved_score_fy23)
+#--------------------
+fy_parent_access_metrics <- list.files(here("Input", "Data", "VSSC", "Appointments - Completed Summary"),
+                                       pattern = "fy_parent",
+                                       full.names = TRUE)
+#
+tna_fy_parent <- read_csv(fy_parent_access_metrics[1]) %>%
+  mutate(parent_station_sta5a = if_else(str_sub(`Facility District`, 11, 11) == ")",
+                                        str_sub(`Facility District`, 8, 10),
+                                        str_sub(`Facility District`, 8, 12))) %>%
+  rename(third_next_avail = 3,
+         fy = `Fiscal Year`) %>%
+  mutate(fy2 = str_remove(fy, "FY"),
+         fy4 = str_c("20", fy2, sep = ""),
+         fy = as.numeric(fy4)) %>%
+  select(parent_station_sta5a, fy, third_next_avail)
+#
+est_fy_parent <- read_csv(fy_parent_access_metrics[2]) %>%
+  mutate(parent_station_sta5a = if_else(str_sub(`Facility District`, 11, 11) == ")",
+                                        str_sub(`Facility District`, 8, 10),
+                                        str_sub(`Facility District`, 8, 12)))%>%
+  rename(est_pc_pt_wt_pid = 3,
+         fy = `Fiscal Year Name`) %>%
+  mutate(fy2 = str_remove(fy, "FY"),
+         fy4 = str_c("20", fy2, sep = ""),
+         fy = as.numeric(fy4)) %>%
+  select(parent_station_sta5a, fy, est_pc_pt_wt_pid)
+#
+new_0_20_fy_parent <- read_csv(fy_parent_access_metrics[3]) %>%
+  mutate(parent_station_sta5a = if_else(str_sub(`Facility District`, 11, 11) == ")",
+                                        str_sub(`Facility District`, 8, 10),
+                                        str_sub(`Facility District`, 8, 12))) %>%
+  rename(new_pc_pt_0_20 = 3,
+         fy = `Fiscal Year Name`) %>%
+  mutate(fy2 = str_remove(fy, "FY"),
+         fy4 = str_c("20", fy2, sep = ""),
+         fy = as.numeric(fy4)) %>%
+  select(parent_station_sta5a, fy, new_pc_pt_0_20)
+#
+new_fy_parent <- read_csv(fy_parent_access_metrics[4]) %>%
+  mutate(parent_station_sta5a = if_else(str_sub(`Facility District`, 11, 11) == ")",
+                                        str_sub(`Facility District`, 8, 10),
+                                        str_sub(`Facility District`, 8, 12))) %>%
+  rename(new_pc_pt_wt_create = 3,
+         fy = `Fiscal Year Name`) %>%
+  mutate(fy2 = str_remove(fy, "FY"),
+         fy4 = str_c("20", fy2, sep = ""),
+         fy = as.numeric(fy4)) %>%
+  select(parent_station_sta5a, fy, new_pc_pt_wt_create)
+#
+tc_fy_parent <- vast %>%
+  select(sta5a, parent_station_sta5a) %>%
+  left_join(., timely_care) %>%
+  group_by(parent_station_sta5a, viz_fy) %>%
+  summarise(tc_pc_success_sum = sum(tc_pc_success_sum, na.rm = T),
+            tc_requests_sum = sum(tc_requests_sum, na.rm = T),
+            tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum) %>%
+  rename(fy = viz_fy)%>%
+  select(parent_station_sta5a, fy, tc_pc_success_prop)
+#=================
+months_meeting_inclusion_criteria <- pen_rate %>%
+  arrange(sta5a, vssc_month) %>%
+  group_by(sta5a) %>%
+  mutate(this_mo_mt9_pcCRH = if_else(crh_encounter_count > 9, 1, 0),
+         next_mo_mt9_pcCRH = if_else(lead(crh_encounter_count, 1) > 9, 1, 0),
+         last_mo_mt9_pcCRH = if_else(lag(crh_encounter_count, 1) > 9, 1, 0),
+         meets_inclusion_criteria = case_when(this_mo_mt9_pcCRH == 1 & next_mo_mt9_pcCRH == 1 ~ 1,
+                                              this_mo_mt9_pcCRH == 1 & last_mo_mt9_pcCRH == 1 ~ 1,
+                                              TRUE ~ 0)) %>%
+  filter(meets_inclusion_criteria == 1) %>%
+  complete(vssc_month = seq(ymd("2018-09-01"), ymd("2023-09-01"), by = "month")) %>%
+  mutate(rowNum = row_number()) %>%
+  select(sta5a, vssc_month, crh_encounter_count, meets_inclusion_criteria, rowNum)
+#==================
+pen_rate_parent_tot <- vast %>%
+  select(parent_station_sta5a, sta5a) %>%
+  left_join(., pen_rate) %>%
+  mutate(fy = if_else(month(vssc_month) > 9, year(vssc_month) + 1, year(vssc_month))) %>%
+  filter(fy == 2023) %>%
+  inner_join(., months_meeting_inclusion_criteria %>%
+               select(sta5a, vssc_month, meets_inclusion_criteria)) %>%
+  filter(meets_inclusion_criteria == T) %>%
+  group_by(parent_station_sta5a) %>%
+  summarise(crh_encounter_count = sum(crh_encounter_count),
+            pc_encounter_total = sum(pc_encounter_total)) %>%
+  mutate(crh_per_1k_pc = crh_encounter_count / pc_encounter_total * 1000) %>%
+  select(parent_station_sta5a, crh_per_1k_pc)
+#==================
+pen_rate_parent_avg <- vast %>%
+  select(parent_station_sta5a, sta5a) %>%
+  left_join(., pen_rate) %>%
+  mutate(fy = if_else(month(vssc_month) > 9, year(vssc_month) + 1, year(vssc_month))) %>%
+  filter(fy == 2023) %>%
+  inner_join(., months_meeting_inclusion_criteria %>%
+               select(sta5a, vssc_month, meets_inclusion_criteria)) %>%
+  filter(meets_inclusion_criteria == T) %>%
+  group_by(parent_station_sta5a) %>%
+  summarise(pc_crh_per_1k_total_pc_avg = mean(pc_crh_per_1k_total_pc))
+#--------------------
+pen_rate_cat <- vast %>%
+  select(parent_station_sta5a, sta5a) %>%
+  left_join(., pen_rate) %>%
+  mutate(fy = if_else(month(vssc_month) > 9, year(vssc_month) + 1, year(vssc_month))) %>%
+  filter(fy == 2023) %>%
+  left_join(., months_meeting_inclusion_criteria %>%
+               select(sta5a, vssc_month, meets_inclusion_criteria)) %>%
+  mutate(meets_inclusion_criteria = replace_na(meets_inclusion_criteria, 0)) %>%
+  select(parent_station_sta5a, sta5a, meets_inclusion_criteria) %>%
+  distinct %>%
+  group_by(parent_station_sta5a) %>%
+  summarise(sta5as_met_criteria = sum(meets_inclusion_criteria),
+            sta5as_child_count = n_distinct(sta5a)) %>%
+  mutate(prop_child_sta5as_met_criteria = sta5as_met_criteria / sta5as_child_count,
+         prop_child_cat = if_else(prop_child_sta5as_met_criteria >= 0.5, ">= 50%", "< 50%"),
+         prop_child_cat2 = factor(case_when(prop_child_sta5as_met_criteria < quantile(prop_child_sta5as_met_criteria,
+                                                                                      0.33) ~ "< 14.3%",
+                                            prop_child_sta5as_met_criteria > quantile(prop_child_sta5as_met_criteria,
+                                                                                      0.66) ~ "> 33%",
+                                            TRUE ~ "14.4% - 33%"),
+                                  ordered = T,
+                                  levels = c("> 33%", "14.4% - 33%", "< 14.3%")))
+#=====================================================
+analytic_df <- underserved_score %>%
+  filter(fy == 2023) %>%
+  left_join(., tna_fy_parent) %>%
+  left_join(., est_fy_parent) %>%
+  left_join(., new_fy_parent) %>%
+  left_join(., new_0_20_fy_parent) %>%
+  left_join(., tc_fy_parent) %>%
+  left_join(., gap_metric) %>%
+  left_join(., pen_rate_parent_tot) %>%
+  left_join(., pen_rate_parent_avg) %>%
+  left_join(., parent_urh) %>%
+  left_join(., vast %>% filter(parent_station_sta5a == sta5a) %>% select(parent_station_sta5a, short_name))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This report will explore the relationship between the Underserved Score and:
+    + 5 Access Metrics
+    + Gap Metric
+    + PC CRH Penetration rate
+
+    
+## Analytic details  
+
+* All of these plots are using FY 2023 data  
+* All of the data included here is summarized to the parent station
+
+# Access Metrics X Underserved Score  
+## Third Next Available  
+
+
+```{r}
+analytic_df %>%
+  filter(third_next_avail >= 1) %>%
+  ggplot(data = .,
+         aes(x = underserved_score,
+             y = third_next_avail)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point() +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(y = "Third Next Available",
+       x = "Underserved Score",
+       caption = "*Values less than 1 removed")
+```
+
+## New Patient Wait Time  
+
+
+```{r}
+analytic_df %>%
+  filter(new_pc_pt_wt_create >= 1) %>%
+  ggplot(data = .,
+         aes(x = underserved_score,
+             y = new_pc_pt_wt_create)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point() +
+  scale_y_continuous(limits = c(0, NA)) +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(y = "New Patient WT (Create)",
+       x = "Underserved Score",
+       caption = "*Values less than 1 removed")
+```
+
+## Established Patient Wait Time  
+```{r}
+analytic_df %>%
+  filter(est_pc_pt_wt_pid != 0) %>%
+  ggplot(data = .,
+         aes(x = underserved_score,
+             y = est_pc_pt_wt_pid)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point() +
+  ggpubr::stat_cor(method = "pearson") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(y = "Established Patient Wait Time (PID)",
+       x = "Underserved Score",
+       caption = "*Values equal to zero removed")
+```
+
+## Timely Care  
+```{r}
+analytic_df %>%
+  filter(tc_pc_success_prop != 0) %>%
+  ggplot(data = .,
+         aes(x = underserved_score,
+             y = tc_pc_success_prop)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point() +
+  ggpubr::stat_cor(method = "pearson") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1)) +
+  labs(y = "Timely Care",
+       x = "Underserved Score",
+       caption = "*Values equal to zero removed")
+```
+
+## New Patients Seen in 0-20 Days  
+
+
+```{r}
+analytic_df %>%
+  filter(new_pc_pt_0_20 != 1) %>%
+  ggplot(data = .,
+         aes(x = underserved_score,
+             y = new_pc_pt_0_20)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point() +
+  ggpubr::stat_cor(method = "pearson") +
+  scale_y_continuous(labels = scales::percent_format(),
+                     limits = c(0, 1)) +
+  labs(y = "New Patients Seen in 0-20 Days",
+       x = "Underserved Score",
+       caption = "*Values at 100% removed")
+```
+
+
+## Gap Metric  
+```{r}
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = underserved_score,
+             y = gap_metric)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point() +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(y = "Gap Metric",
+       x = "Underserved Score")
+```
+
+### Gap Metric - Categorical  
+```{r}
+gap_cat <- gap_metric %>%
+  filter(fy == 2023) %>%
+  mutate(gap_level = case_when(
+    gap_metric >= 1 & gap_metric < 1.2 ~ "Marginally Staffed (1-1.2)",
+    gap_metric >= 1.2 ~ "Fully Staffed (>= 1.2)",
+    gap_metric < 1 ~ "Not Fully Staffed (< 1)"
+  ))
+#-
+underserved_cat <- underserved_score_fy23 %>%
+  mutate(underserved_cat = case_when(underserved_score < quantile(underserved_score, 0.33) ~ "Lowest 33%",
+                                     underserved_score > quantile(underserved_score, 0.66) ~ "Top 33%",
+                                     TRUE ~ "Middle 33%"))
+#
+foo <- gap_cat %>%
+  left_join(., underserved_cat) %>%
+  select(gap_level, underserved_cat)
+#
+foo %>%
+  tabyl(gap_level, underserved_cat) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("Gap Metric", "Lowest 33%", "Middle 33%", "Top 33%", "Total")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  add_header_above(c("", "Underserved Score" = 3, ""),
+                   bold = T) %>%
+  row_spec(0, bold = T)
+#--
+foo %>% tabyl(gap_level, underserved_cat) %>% chisq.test(., tabyl_results = T)
+```
+
+## Penetration Rate  
+
+* Out of the `r nrow(analytic_df)` parent stations in the FY 2023 underserved score, only `r nrow(pen_rate_parent_avg)` (`r (nrow(pen_rate_parent_avg) / nrow(analytic_df)) %>% percent(accuracy = 0.1)`) had at least one child sta5a that met our inclusion criteria in FY 2023 
+
+* The y-axis below is the average PC CRH per 1,000 PC rate in those months that any of that parent sta5a's child sta5a met our inclusion criteria
+
+```{r}
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = underserved_score,
+             y = pc_crh_per_1k_total_pc_avg)) +
+  geom_smooth(method = "lm",
+              se = F) +
+  geom_point() +
+  ggpubr::stat_cor(method = "pearson") +
+  labs(y = "Average PC CRH Per 1,000 PC",
+       x = "Underserved Score") +
+  scale_y_continuous(labels = comma_format(accuracy = 1))
+```
+
+### Penetration Rate - Categorical  
+
+* First a detour on the counts and proportion of child sta5as that met our inclusion criteria at least once in FY 2023  
+
+```{r}
+table_fxn <- function(name_input, var_input){
+  pen_rate_cat %>%
+  summarise(name = !!name_input,
+            mean_val = if_else(str_detect({{name_input}}, "Prop") == TRUE,
+                                          percent(mean({{var_input}}), accuracy = 0.1),
+                                          comma(mean({{var_input}}), accuracy = 0.1)),
+            sd_val =  if_else(str_detect({{name_input}}, "Prop") == TRUE,
+                                          percent(sd({{var_input}}), accuracy = 0.1),
+                                          comma(sd({{var_input}}), accuracy = 0.1)),
+            min_val =  if_else(str_detect({{name_input}}, "Prop") == TRUE,
+                                          percent(min({{var_input}}), accuracy = 0.1),
+                                          comma(min({{var_input}}), accuracy = 0.1)),
+            max_val =  if_else(str_detect({{name_input}}, "Prop") == TRUE,
+                                          percent(max({{var_input}}), accuracy = 0.1),
+                                          comma(max({{var_input}}), accuracy = 0.1)),
+            qtl_25 =  if_else(str_detect({{name_input}}, "Prop") == TRUE,
+                                          percent(quantile({{var_input}}, 0.25), accuracy = 0.1),
+                                          comma(quantile({{var_input}}, 0.25), accuracy = 0.1)),
+            qtl_75 =  if_else(str_detect({{name_input}}, "Prop") == TRUE,
+                                          percent(quantile({{var_input}}, 0.75), accuracy = 0.1),
+                                          comma(quantile({{var_input}}, 0.75), accuracy = 0.1))) %>%
+    mutate(mean_sd = paste0(mean_val, " (", sd_val, ")"),
+           min_max = paste0("[", min_val, ", ", max_val, "]"),
+           qtls = paste0("{", qtl_25, ", ", qtl_75, "}")) %>%
+    select(name, mean_sd, min_max, qtls)
+}
+#
+table_fxn("Number of child stations", sta5as_child_count) %>%
+  bind_rows(., table_fxn("Number of child stations meeting criteria", sta5as_met_criteria)) %>%
+  bind_rows(., table_fxn("Proportion of child stations meeting criteria", prop_child_sta5as_met_criteria)) %>%
+  kbl(col.names = c("", "Mean (SD)", "[Min, Max]", "{25%, 75%}"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T)
+```
+
+
+```{r}
+cbPalette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+#
+p1 <- pen_rate_cat %>%
+  ggplot(data = .,
+         aes(x = sta5as_child_count)) +
+  geom_histogram(bins = 21,
+                 color = "black",
+                 fill = cbPalette[2]) +
+  labs(x = "Number of child stations",
+       y = "")
+#===========
+p2 <- pen_rate_cat %>%
+  ggplot(data = .,
+         aes(x = sta5as_met_criteria)) +
+  geom_histogram(bins = 9,
+                 color = "black",
+                 fill = cbPalette[3]) +
+  scale_x_continuous(breaks = seq(0, 8, 1)) +
+  labs(x = "Number of child stations that met criteria",
+       y = "Number of parent stations")
+#-----------
+p3 <- pen_rate_cat %>%
+  ggplot(data = .,
+         aes(x = prop_child_sta5as_met_criteria)) +
+  geom_histogram(bins = 15,
+                 color = "black",
+                 fill = cbPalette[8]) +
+  scale_x_continuous(labels = scales::percent_format()) +
+  labs(x = "Proportion of child stations that met criteria",
+       y = "")
+#==--==
+multiplot(p1, p2, p3)
+```
+
+* Finally, a chi-square test of the relationship between tertiles of Underserved Score and the proportion of child sta5as meeting our inclusion criteria in FY 2023 being 50% or higher:
+
+```{r}
+pen_rate_chisq_df <- pen_rate_cat %>%
+  left_join(., underserved_cat)
+#--
+pen_rate_chisq_df %>%
+  tabyl(prop_child_cat, underserved_cat) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("Child Stations Met Criteria", "Lowest 33%", "Middle 33%", "Top 33%", "Total")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  add_header_above(c("", "Underserved Score" = 3, ""),
+                   bold = T) %>%
+  row_spec(0, bold = T)
+#--
+pen_rate_chisq_df %>% tabyl(prop_child_cat, underserved_cat) %>% chisq.test(., tabyl_results = T)
+```
+
+* Just for fun, a chi-square test of the relationship between tertiles of Underserved Score and tertiles of the proportion of child sta5as meeting our inclusion criteria in FY 2023:
+
+```{r}
+pen_rate_chisq_df %>%
+  tabyl(prop_child_cat2, underserved_cat) %>%
+  adorn_totals("both") %>%
+  kbl(col.names = c("Child Stations Met Criteria", "Lowest 33%", "Middle 33%", "Top 33%", "Total")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  add_header_above(c("", "Underserved Score" = 3, ""),
+                   bold = T) %>%
+  row_spec(0, bold = T)
+#--
+pen_rate_chisq_df %>% tabyl(prop_child_cat2, underserved_cat) %>% chisq.test(., tabyl_results = T)
+```
+
+## Details  
+### Whats up with sites that have > 50% coming from CRH?  
+
+```{r}
+outlier_parents <- analytic_df %>% 
+  filter(pc_crh_per_1k_total_pc_avg > 500) %>%
+  arrange(desc(pc_crh_per_1k_total_pc_avg)) %>%
+  select(parent_station_sta5a) %>%
+  pull
+```
+
+* The parent station with exactly 1,000 PC CRH per 1,000 PC is the Ralph H. Johnson VAMC in Charleston, SC
+    + Out of all `r vast %>% filter(parent_station_sta5a == "534") %>% nrow` child sta5as only 1 met our inclusion criteria in FY 2023: the Charleston, SC VAMC
+    + They had 2 months, April and May of 2023, where they had 13 and 16 total PC encounters attributed to them, and 100% of them were from CRH
+
+* The parent station with 649 PC CRH per 1,000 PC is the Big Spring, TX VAMC
+    + Out of all `r vast %>% filter(parent_station_sta5a == "519") %>% nrow` child sta5as only 1 met our inclusion criteria in FY 2023: Fort Stockton, TX OOS
+    + They met our inclusion criteria all 12 months in FY 2023
+
+
+* The parent station with 518 PC CRH per 1,000 PC is the Erie, PA VAMC
+    + Out of all `r vast %>% filter(parent_station_sta5a == "562") %>% nrow` child sta5as only 1 met our inclusion criteria in FY 2023: Ashtabula County, OH PC CBOC
+    + They met our inclusion criteria 8 out of 12 months months in FY 2023
+
+
+### Who are the parent stations with 100%?
+```{r}
+parent_tot_crh <- vast %>%
+  select(sta5a, parent_station_sta5a) %>%
+  left_join(., pen_rate %>% filter(fy == 2023)) %>%
+  group_by(parent_station_sta5a) %>%
+  summarise(crh_total = sum(crh_encounter_count, na.rm = T),
+            pc_total = sum(pc_encounter_total, na.rm = T) + crh_total)
+#--
+pen_rate_cat %>% filter(prop_child_sta5as_met_criteria == 1) %>%
+  left_join(., vast %>% select(sta5a, short_name, parent_visn), by = c("parent_station_sta5a" = "sta5a")) %>%
+  left_join(., parent_tot_crh) %>%
+  mutate(station_name = paste0("(", parent_station_sta5a, ") ", short_name),
+         across(where(is.numeric), ~comma(.x, accuracy = 1))) %>%
+  select(parent_visn, station_name, sta5as_child_count, sta5as_met_criteria, crh_total, pc_total) %>%
+  arrange(parent_visn) %>%
+  kbl(col.names = c("VISN", "Parent Station", "Child Stations", "Child Stations That Met Criteria",
+                    "Total PC CRH", "Total PC"),
+      align = c("l", "l", rep("r", 4))) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = T)
+```

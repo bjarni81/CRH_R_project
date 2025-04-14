@@ -1,0 +1,396 @@
+---
+title: "PS Matching version 5.1: 0 CRH Encounters Among Controls"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+#Input\Analytic df\F2_propensity_score_matching\propensity_score_matching_v3_1.R"
+
+source(here("Input", "Analytic df", "F2_propensity_score_matching","propensity_score_matching_v5_1_noCRH_among_controls.R"))
+#---
+pilot_sites <- dbGetQuery(oabi_con,
+                          "select distinct spoke_sta5a as sta5a
+                            from [PACT_CC].[CRH].[CRH_sites_FY20_working]
+                          where vimpact_pilot = 1") %>%
+  pull
+#--
+sta5a_demog_no_missing <- sta5a_demog_no_missing %>%
+  mutate(pilot_site = if_else(sta5a %in% pilot_sites, 1, 0))
+```
+
+
+
+
+# Dropped stations  
+* From a starting set of `r sta5a_demog %>% nrow() %>% comma()` candidate sta5as, we drop  `r sta5a_demog %>% nrow() - sta5a_demog_no_missing %>% nrow()` sta5as that:
+    + Have fewer than 450 uniques in PCMM (`r sta5a_demog %>% drop_na() %>% filter(pcmm_scrssn_count <= 450) %>% nrow()`)
+    + Had more than 0 PC CRH encounters before March 2020 but not enough to meet our inclusion criteria (`r sta5a_demog %>% drop_na() %>% filter(not_enough_crh_before_march_20 == 1) %>% nrow()`)
+
+# Propensity Score "Optimal" Matching
+
+
+## Final Model    
+
+-   Using [Optimal Matching](https://cran.r-project.org/web/packages/MatchIt/vignettes/matching-methods.html#optimal-pair-matching-method-optimal) we get `r nrow(opt_matches_pcmm_wVISN) / 2` pairs from a starting set of `r sum(sta5a_demog_no_missing$at_least_10_pc_crh_flag)` __Treated__ sta5as
+    - `r sum(sta5a_demog_no_missing$pilot_site == 1 & sta5a_demog_no_missing$at_least_10_pc_crh_flag == 1)` of these are pilot sites
+    - Controls are those sta5as that had 0 CRH encounters by March 2020
+
+-   Model: Treatment (i.e., at least two consecutive months with \>9 PC CRH encounters) =
+
+    -   ~~NOSOS (FY18 Q4 Avg)~~
+    -   Observed:Expected PC Panel Size (FY18 Q4 Avg)
+    -   Team PCP/AP FTE (FY18 Q4 Avg)
+    -   Uniques in PCMM (FY18 Q4)
+    -   ~~ADI (FY18 Q4)~~
+    -   Proportion rural (FY18 Q4)
+    -   (Non-VA PCCC Consults / Total PCCC Consults) X (uniques in PCMM) X 10,000 (FY18 Q4 Avg)
+    -   Third Next Available PC Appointment (FY19 Avg)
+    -   Established Patient Waittime (FY19 Avg)
+    -   New Patient Waittime (FY19 Avg)
+    -   VISN (Exact)
+    -   Site Type (i.e., CBOC, VAMC/HCC, or OOS) - (Exact)
+
+-   We estimate the propensity score with logistic regression (i.e., GLM and logit link)
+- [Absolute standardized mean difference:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) `r round(summary(opt_match_pcmm_wVISN)$sum.matched[1,3], 3)` 
+- [Variance ratio:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) `r round(summary(opt_match_pcmm_wVISN)$sum.matched[1,4], 3)`
+- [Empirical CDF:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) 
+    - Mean: `r round(summary(opt_match_pcmm_wVISN)$sum.matched[1,5], 2)`
+    - Max: `r round(summary(opt_match_pcmm_wVISN)$sum.matched[1,6], 2)`
+
+```{r}
+plot(opt_match_pcmm_wVISN, type = "jitter", interactive = FALSE)
+```
+
+
+```{r}
+ps_plot_df_pcmm <- tibble(
+  covariate = attributes(summary(opt_match_pcmm_wVISN)$sum.all)$dimnames[[1]], 
+  smd_matched = summary(opt_match_pcmm_wVISN)$sum.matched[,3], 
+  smd_preMatch = summary(opt_match_pcmm_wVISN)$sum.all[,3]) %>%
+  mutate(covariate = str_remove(covariate, "s_abbr2|census_division|pilot_visn_flag"),
+         covariate = str_replace(covariate, "parent_visn", "V"),
+         covar_lab = factor(case_when(
+           covariate == "distance" ~ "Distance",
+           #str_detect(covariate, "PCCBOC") == TRUE ~ "PCCBOC",
+           str_detect(covariate, "HCC") == TRUE ~ "VAMC/HCC",
+           #str_detect(covariate, "VAMC") == TRUE ~ "VAMC",
+           #str_detect(covariate, "MSCBOC") == TRUE ~ "MSCBOC",
+           str_detect(covariate, "CBOC") == TRUE ~ "CBOC",
+           str_detect(covariate, "OOS") == TRUE ~ "OOS",
+           str_detect(covariate, "nosos") == TRUE ~ "NOSOS",
+           str_detect(covariate, "obs_exp") == TRUE ~ "Obs:Exp",
+           str_detect(covariate, "team") == TRUE ~ "PCP/AP FTE",
+           str_detect(covariate, "pcmm_") == TRUE ~ "PCMM ScrSSN Count",
+           str_detect(covariate, "est_") == TRUE ~ "Established Patient WT",
+           str_detect(covariate, "new_") == TRUE ~ "New Patient WT",
+           str_detect(covariate, "third_") == TRUE ~ "Third-Next Available",
+           str_detect(covariate, "adi") == TRUE ~ "ADI, Avg",
+           str_detect(covariate, "age") == TRUE ~ "Age, Avg",
+           str_detect(covariate, "male") == TRUE ~ "Male %",
+           str_detect(covariate, "white") == TRUE ~ "White %",
+           str_detect(covariate, "rural") == TRUE ~ "Rural %",
+           str_detect(covariate, "gap") == TRUE ~ "Gap Metric",
+           str_detect(covariate, "non_va") == TRUE ~ "Non-VA Consults per 10,000 in PCMM",
+           TRUE ~ covariate
+         ), ordered = TRUE, levels = rev(c("Distance","Not a Pilot VISN",
+                                       "Pilot VISN","NOSOS","Obs:Exp","PCP/AP FTE",
+                                       "PCMM ScrSSN Count", "Rural %", "ADI, Avg",
+                                       "Non-VA Consults per 10,000 in PCMM",
+                                       "Third-Next Available", "New Patient WT", 
+                                       "Established Patient WT", "VAMC/HCC", "CBOC",
+                                       "HCC", "VAMC", "OOS",
+                                       "MSCBOC", "PCCBOC", "V01", "V02", "V04", "V05",
+                                       "V06", "V07", "V08", "V09", "V10", "V12", "V15",
+                                       "V16", "V17", "V19", "V20", "V21", "V22", "V23")))) %>%
+  select(-covariate) %>%
+  pivot_longer(-covar_lab) %>%
+  mutate(abs_smd = abs(value),
+         name_lab = if_else(name == "smd_matched", "Matched", "Un-Matched"))
+#
+ggplot(data = ps_plot_df_pcmm,
+       aes(x = abs_smd, y = covar_lab, group = name_lab, fill = name_lab)) +
+  geom_point(shape = 21,
+             size = 2.25) +
+  scale_fill_manual(values = c(
+    "Matched" = "black",
+    "Un-Matched" = "white"
+  )) +
+  labs(x = "Absolute Standardized Mean Difference") +
+  theme(axis.title.y = element_blank()) +
+  geom_vline(xintercept = 0, lty = 1) +
+  geom_vline(xintercept = 0.05, lty = 2) +
+  geom_vline(xintercept = 0.1, lty = 1)
+```
+
+
+# Comparing ADI and NOSOS  
+
+```{r}
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month),
+         pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric) %>%
+  inner_join(., opt_matches_pcmm_wVISN) %>%
+  filter(vssc_month >= ymd("2018-10-01")
+         & vssc_month <= ymd("2020-02-01")) %>%
+  mutate(crh_flag = if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "Control"))
+```
+
+
+```{r contrast_fxn}
+contrast_fxn <- function(covariate, covariate_char){
+  accuracy_val = if(covariate_char == "adi_natRnk_avg"){
+    0.1
+  }
+    else{0.01}
+#--
+covariates %>% 
+  group_by(crh_flag) %>%
+  summarise(mean_val = mean({{covariate}}, na.rm = T),
+            sd_val = sd({{covariate}}, na.rm = T),
+            qtl_25 = quantile({{covariate}}, 0.25, na.rm = T),
+            qtl_75 = quantile({{covariate}}, 0.75, na.rm = T)) %>%
+    mutate(mean_sd = paste0(comma(mean_val, accuracy = accuracy_val), " (",
+                            comma(sd_val, accuracy = accuracy_val),
+                            ")"),
+           qtls = paste0("[",
+                         comma(qtl_25, accuracy = accuracy_val),
+                         ", ",
+                         comma(qtl_75, accuracy = accuracy_val),
+                         "]")) %>%
+    select(crh_flag, mean_sd, qtls) %>%
+    kbl(col.names = c("", "Mean (SD)", "[25th %-ile, 75th %ile]"),
+        align = c("l", "c", "c")) %>%
+    kable_classic("striped") %>%
+    row_spec(0, bold = T)
+}
+```
+
+## ADI  
+```{r}
+contrast_fxn(adi_natRnk_avg, "adi_natRnk_avg") 
+```
+
+
+```{r}
+covariates %>%
+  ggplot(data = .,
+         aes(x = crh_flag,
+             y = adi_natRnk_avg,
+             fill = crh_flag)) +
+  geom_boxplot() +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "ADI")
+```
+
+```{r}
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2018-10-01"),
+                  ymd("2020-02-01"),
+                  "1 month")) %>%
+  rownames_to_column(var = "time") %>%
+  mutate(time = str_pad(time,
+                        side = "left",
+                        pad = "0",
+                        width = 2))
+#
+covariates %>%
+  select(vssc_month, adi_natRnk_avg, crh_flag) %>% 
+  left_join(dates) %>%
+  ggplot(data = .,
+         aes(x = time, y = adi_natRnk_avg, fill = crh_flag)) +
+  geom_boxplot(position = position_dodge()) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(y = "ADI",
+       x = "Month")
+```
+
+## NOSOS  
+```{r}
+contrast_fxn(nosos_risk_score, "nosos_risk_score") 
+```
+
+
+```{r}
+covariates %>%
+  ggplot(data = .,
+         aes(x = crh_flag,
+             y = nosos_risk_score,
+             fill = crh_flag)) +
+  geom_boxplot() +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "NOSOS")
+```
+
+```{r}
+covariates %>%
+  select(vssc_month, nosos_risk_score, crh_flag) %>% 
+  left_join(dates) %>%
+  ggplot(data = .,
+         aes(x = time, y = nosos_risk_score, fill = crh_flag)) +
+  geom_boxplot(position = position_dodge()) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(y = "NOSOS",
+       x = "Month")
+```
+
+# Let's look at outcomes  
+
+```{r}
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  filter(vssc_month >= ymd("2018-10-01")
+         & vssc_month <= ymd("2020-02-01")) %>%
+  inner_join(., opt_matches_pcmm_wVISN) %>%
+  mutate(crh_flag = if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "Control"))
+```
+
+## New Patient Wait Time  
+```{r}
+access_metrics %>%
+  group_by(crh_flag, vssc_month) %>%
+  summarise(mean_val = mean(new_pc_pt_wt, na.rm = T),
+            sd_val = sd(new_pc_pt_wt, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, group = crh_flag, color = crh_flag,
+             y = mean_val,
+             ymin = mean_val - sd_val,
+             ymax = mean_val + sd_val)) +
+  geom_point(position = position_dodge(width = 1)) +
+  geom_line() +
+  geom_errorbar(position = position_dodge(width = 1)) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Mean +/- SD")
+```
+
+```{r}
+access_metrics %>%
+  select(vssc_month, new_pc_pt_wt, crh_flag) %>% 
+  left_join(dates) %>%
+  ggplot(data = .,
+         aes(x = time, y = new_pc_pt_wt, fill = crh_flag)) +
+  geom_boxplot(position = position_dodge()) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(y = "New Patient Wait Time (days)",
+       x = "Month",
+       caption = "*Removed 3 observations with values > 100")
+```
+
+## Established Patient Wait Time  
+```{r}
+access_metrics %>%
+  group_by(crh_flag, vssc_month) %>%
+  summarise(mean_val = mean(est_pc_pt_wt, na.rm = T),
+            sd_val = sd(est_pc_pt_wt, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, group = crh_flag, color = crh_flag,
+             y = mean_val,
+             ymin = mean_val - sd_val,
+             ymax = mean_val + sd_val)) +
+  geom_point(position = position_dodge(width = 1)) +
+  geom_line() +
+  geom_errorbar(position = position_dodge(width = 1)) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Mean +/- SD")
+```
+
+```{r}
+access_metrics %>%
+  select(vssc_month, est_pc_pt_wt, crh_flag) %>% 
+  left_join(dates) %>%
+  ggplot(data = .,
+         aes(x = time, y = est_pc_pt_wt, fill = crh_flag)) +
+  geom_boxplot(position = position_dodge()) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(y = "Established Patient Wait Time (days)",
+       x = "Month")
+```
+
+
+## Third Next Available    
+```{r}
+access_metrics %>%
+  group_by(crh_flag, vssc_month) %>%
+  summarise(mean_val = mean(third_next_avail, na.rm = T),
+            sd_val = sd(third_next_avail, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, group = crh_flag, color = crh_flag,
+             y = mean_val,
+             ymin = mean_val - sd_val,
+             ymax = mean_val + sd_val)) +
+  geom_point(position = position_dodge(width = 1)) +
+  geom_line() +
+  geom_errorbar(position = position_dodge(width = 1)) +
+  theme(axis.title.x = element_blank()) +
+  labs(y = "Mean +/- SD")
+```
+
+```{r}
+access_metrics %>%
+  select(vssc_month, third_next_avail, crh_flag) %>% 
+  left_join(dates) %>%
+  ggplot(data = .,
+         aes(x = time, y = third_next_avail, fill = crh_flag)) +
+  geom_boxplot(position = position_dodge()) +
+  scale_y_continuous(limits = c(0, 100)) +
+  labs(y = "Third Next Available (days)",
+       x = "Month",
+       caption = "*Removed 9 observations with values > 100")
+```

@@ -1,0 +1,469 @@
+---
+title: "Primary Care CRH: Sta5as meeting inclusion criteria in all first 6 months of FY20"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.width = 12, fig.height = 12)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+##---------- Connection to PACT_CC
+pactcc_con <- dbConnect(odbc::odbc(),
+                        Driver = "SQL Server",
+                        Server = "vhacdwsql13.vha.med.va.gov",
+                        Database = "PACT_CC",
+                        Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+```
+
+```{r reading-in}
+#=========================
+# VAST
+vast <- read_csv(here("Input", "Data", "vast_from_a06.csv"))
+#
+vast_to_keep <- vast%>%
+  select(sta5a)
+#----
+# crh flags
+crh_flags <- dbGetQuery(oabi_con,
+                        "select * from [crh_eval].yoon_flag")
+#----- PCMM count
+scrssn_count <- vast %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count < 450 ~ "< 450",
+    scrssn_count >= 450 & scrssn_count < 2500 ~ "450 - 2,499",
+    scrssn_count >= 2500 & scrssn_count < 10000 ~ "2,500 - 9,999",
+    scrssn_count >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,499", "2,500 - 9,999", "10,000+")))
+#=============================
+# access metrics
+access_metrics_sta5a <- read_csv(here("Input", "Data", "pc_access_metrics.csv")) %>%
+  inner_join(., vast_to_keep) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum) %>%
+  select(-ends_with("avg"), -ends_with("sum"), -tc_success_prop) %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_10_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_10_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH")),
+         analytic_period = factor(case_when(
+           vssc_month >= ymd("2019-04-01") & vssc_month <= ymd("2019-09-01") ~ "6 Months Before",
+           vssc_month >= ymd("2019-10-01") & vssc_month <= ymd("2020-03-01") ~ "First 6 Months of CRH",
+           vssc_month >= ymd("2020-04-01") & vssc_month <= ymd("2020-09-01") ~ "6 Months After",
+           vssc_month >= ymd("2020-10-01") ~ "Final Period",
+           TRUE ~ NA_character_),
+           ordered = TRUE,
+           levels = c("6 Months Before", "First 6 Months of CRH", "6 Months After", "Final Period")))
+#=====
+sta5as_w_6mos <- access_metrics_sta5a %>%
+  filter(first_6_mos_w_10_flag == 1) %>%
+  select(sta5a) %>% distinct %>%
+  left_join(., vast)
+```
+
+# Sta5as with PC CRH in the first 6 months of FY 2020  
+* There are `r sum(crh_flags$first_6_mos_w_10_flag)` sta5as that had at least 10 PC CRH encounters during all of the first 6 months of FY 2020
+
+```{r}
+sta5as_w_6mos %>% group_by(parent_visn) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / nrow(sta5as_w_6mos)) %>%
+  add_row(parent_visn = c("01", "05", "09", "10", "23"),
+          count = rep(0, 5),
+          prop = rep(0, 5)) %>%
+  arrange(parent_visn) %>%
+  adorn_totals() %>%
+  mutate(prop = percent(prop, accuracy = 1)) %>%
+  kbl(col.names = c("VISN", "Number of Sta5a", "%"),
+      align = c("c", "r", "r")) %>%
+  kable_classic("striped",
+      full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+```{r}
+sta5as_w_6mos %>%
+  group_by(s_abbr) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / nrow(sta5as_w_6mos)) %>%
+  adorn_totals() %>%
+  mutate(prop = percent(prop, accuracy = 1)) %>%
+  kbl(col.names = c("Site Type", "Sta5a", "%"),
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+---
+
+```{r}
+sta5as_w_6mos %>%
+  left_join(., scrssn_count %>% select(sta5a, scrssn_count_cat)) %>%
+  group_by(scrssn_count_cat) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / nrow(sta5as_w_6mos)) %>%
+  adorn_totals() %>%
+  mutate(prop = percent(prop, accuracy = 1)) %>%
+  kbl(col.names = c("Uniques in PCMM", "Sta5a", "%"),
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = FALSE) %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+# New Patient Wait Time    
+
+* There are `r sum(crh_flags$first_6_mos_w_10_flag)` sta5as that had at least 10 PC CRH encounters during all of the first 6 months of FY 2020
+* The boxplots below are comparing average new patient wait times, between those `r sum(crh_flags$first_6_mos_w_10_flag)` sta5as and the `r access_metrics_sta5a%>% filter(table_1_columns == "No CRH") %>% select(sta5a) %>% n_distinct` sta5as that have never had a PC CRH encounter
+
+
+```{r}
+access_6mos_df <- access_metrics_sta5a %>%
+  filter(is.na(analytic_period) == F) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH")) %>%
+  select(sta5a, vssc_month, new_pt_waitTime, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(sta5a, analytic_period, first_6_lab) %>%
+  summarize(avg_new_pt_waitTime = mean(new_pt_waitTime, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = analytic_period, y = avg_new_pt_waitTime, fill = first_6_lab)) +
+  geom_boxplot() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Analytic Period",
+       y = "Average New Patient Wait Time") +
+  ggsci::scale_fill_aaas()
+
+```
+
+```{r}
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH")) %>%
+  select(sta5a, vssc_month, new_pt_waitTime, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(vssc_month, first_6_lab) %>%
+  summarise(avg_new_pt_waitTime = mean(new_pt_waitTime, na.rm = T),
+            sd_new_pt_waitTime = sd(new_pt_waitTime, na.rm = T)) %>%
+  mutate(val_plus_sd = avg_new_pt_waitTime + sd_new_pt_waitTime,
+         val_min_sd = avg_new_pt_waitTime - sd_new_pt_waitTime) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = avg_new_pt_waitTime, group = first_6_lab, color = first_6_lab)) +
+  geom_rect(aes(xmin = as.Date("2019-04-01"), xmax = as.Date("2019-10-01"),
+                ymin = 0, ymax = 25),
+            alpha = 0.002,
+            fill = "blue",
+            inherit.aes = FALSE) +
+  geom_rect(aes(xmin = as.Date("2020-04-01"), xmax = as.Date("2020-10-01"),
+                ymin = 0, ymax = 25),
+            alpha = 0.002,
+            fill = "red",
+            inherit.aes = FALSE) +
+  geom_line(size = 1) +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank()) +
+  labs(y = "Average New Patient Wait Time")
+```
+
+## Among CBOCs Only  
+* The boxplots below are comparing average new patient wait times, between the `r access_6mos_df%>% filter(first_6_mos_w_10_flag == 1 & s_abbr %in% c("PCCBOC", "MSCBOC")) %>% select(sta5a) %>% n_distinct` sta5as classified as __CBOCs__ and the `r access_6mos_df%>% filter(table_1_columns == "No CRH" & s_abbr %in% c("PCCBOC", "MSCBOC")) %>% select(sta5a) %>% n_distinct` sta5as classified as __PCCBOCs__ that have never had a PC CRH encounter  
+
+```{r}
+access_6mos_df %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH") & s_abbr %in% c("PCCBOC", "MSCBOC")) %>%
+  select(sta5a, vssc_month, new_pt_waitTime, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(sta5a, analytic_period, first_6_lab) %>%
+  summarize(avg_new_pt_waitTime = mean(new_pt_waitTime, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = analytic_period, y = avg_new_pt_waitTime, fill = first_6_lab)) +
+  geom_boxplot() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Analytic Period",
+       y = "Average New Patient Wait Time",
+       caption = "*CBOCs Only") +
+  ggsci::scale_fill_futurama()
+
+```
+
+```{r}
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH") & s_abbr %in% c("PCCBOC", "MSCBOC")) %>%
+  select(sta5a, vssc_month, new_pt_waitTime, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(vssc_month, first_6_lab) %>%
+  summarise(avg_new_pt_waitTime = mean(new_pt_waitTime, na.rm = T),
+            sd_new_pt_waitTime = sd(new_pt_waitTime, na.rm = T)) %>%
+  mutate(val_plus_sd = avg_new_pt_waitTime + sd_new_pt_waitTime,
+         val_min_sd = avg_new_pt_waitTime - sd_new_pt_waitTime) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = avg_new_pt_waitTime, group = first_6_lab, color = first_6_lab)) +
+  geom_rect(aes(xmin = as.Date("2019-04-01"), xmax = as.Date("2019-10-01"),
+                ymin = 0, ymax = 25),
+            alpha = 0.002,
+            fill = "blue",
+            inherit.aes = FALSE) +
+  geom_rect(aes(xmin = as.Date("2020-04-01"), xmax = as.Date("2020-10-01"),
+                ymin = 0, ymax = 25),
+            alpha = 0.002,
+            fill = "red",
+            inherit.aes = FALSE) +
+  geom_line(size = 1) +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank()) +
+  labs(y = "Average New Patient Wait Time",
+       caption = "*CBOCs Only")
+```
+
+# Established Patient Wait Time    
+
+* The boxplots below are comparing average established patient wait times, between those `r sum(crh_flags$first_6_mos_w_10_flag)` sta5as and the `r access_metrics_sta5a%>% filter(table_1_columns == "No CRH") %>% select(sta5a) %>% n_distinct` sta5as that have never had a PC CRH encounter
+
+```{r}
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH")) %>%
+  select(sta5a, vssc_month, established_pt_waitTime, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(sta5a, analytic_period, first_6_lab) %>%
+  summarize(avg_established_pt_waitTime = mean(established_pt_waitTime, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = analytic_period, y = avg_established_pt_waitTime, fill = first_6_lab)) +
+  geom_boxplot() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Analytic Period",
+       y = "Average Established Patient Wait Time") +
+  ggsci::scale_fill_igv()
+
+```
+
+
+```{r}
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH")) %>%
+  select(sta5a, vssc_month, established_pt_waitTime, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(vssc_month, first_6_lab) %>%
+  summarise(avg_established_pt_waitTime = mean(established_pt_waitTime, na.rm = T),
+            sd_established_pt_waitTime = sd(established_pt_waitTime, na.rm = T)) %>%
+  mutate(val_plus_sd = avg_established_pt_waitTime + sd_established_pt_waitTime,
+         val_min_sd = avg_established_pt_waitTime - sd_established_pt_waitTime) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = avg_established_pt_waitTime, group = first_6_lab, color = first_6_lab)) +
+  geom_rect(aes(xmin = as.Date("2019-04-01"), xmax = as.Date("2019-10-01"),
+                ymin = 0, ymax = 60),
+            alpha = 0.002,
+            fill = "blue",
+            inherit.aes = FALSE) +
+  geom_rect(aes(xmin = as.Date("2020-04-01"), xmax = as.Date("2020-10-01"),
+                ymin = 0, ymax = 60),
+            alpha = 0.002,
+            fill = "red",
+            inherit.aes = FALSE) +
+  geom_line(size = 1) +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank()) +
+  labs(y = "Average Established Patient Wait Time")
+```
+
+## Among CBOCs Only  
+* The boxplots below are comparing average established patient wait times, between the `r access_6mos_df%>% filter(first_6_mos_w_10_flag == 1 & s_abbr %in% c("PCCBOC", "MSCBOC")) %>% select(sta5a) %>% n_distinct` sta5as classified as __CBOCs__ and the `r access_6mos_df%>% filter(table_1_columns == "No CRH" & s_abbr %in% c("PCCBOC", "MSCBOC")) %>% select(sta5a) %>% n_distinct` sta5as classified as __CBOCs__ that have never had a PC CRH encounter  
+
+```{r}
+access_6mos_df %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH") & s_abbr %in% c("PCCBOC", "MSCBOC")) %>%
+  select(sta5a, vssc_month, established_pt_waitTime, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(sta5a, analytic_period, first_6_lab) %>%
+  summarize(avg_established_pt_waitTime = mean(established_pt_waitTime, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = analytic_period, y = avg_established_pt_waitTime, fill = first_6_lab)) +
+  geom_boxplot() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Analytic Period",
+       y = "Average Established Patient Wait Time",
+       caption = "*CBOCs Only") +
+  ggsci::scale_fill_jama()
+
+```
+
+
+```{r}
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH") & s_abbr %in% c("PCCBOC", "MSCBOC")) %>%
+  select(sta5a, vssc_month, established_pt_waitTime, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(vssc_month, first_6_lab) %>%
+  summarise(avg_established_pt_waitTime = mean(established_pt_waitTime, na.rm = T),
+            sd_established_pt_waitTime = sd(established_pt_waitTime, na.rm = T)) %>%
+  mutate(val_plus_sd = avg_established_pt_waitTime + sd_established_pt_waitTime,
+         val_min_sd = avg_established_pt_waitTime - sd_established_pt_waitTime) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = avg_established_pt_waitTime, group = first_6_lab, color = first_6_lab)) +
+  geom_rect(aes(xmin = as.Date("2019-04-01"), xmax = as.Date("2019-10-01"),
+                ymin = 0, ymax = 65),
+            alpha = 0.002,
+            fill = "blue",
+            inherit.aes = FALSE) +
+  geom_rect(aes(xmin = as.Date("2020-04-01"), xmax = as.Date("2020-10-01"),
+                ymin = 0, ymax = 65),
+            alpha = 0.002,
+            fill = "red",
+            inherit.aes = FALSE) +
+  geom_line(size = 1) +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank()) +
+  labs(y = "Average Established Patient Wait Time",
+       caption = "*CBOCs Only")
+```
+
+# Timely Care      
+
+* The boxplots below are comparing average timely care success rate, between those `r sum(crh_flags$first_6_mos_w_10_flag)` sta5as and the `r access_metrics_sta5a%>% filter(table_1_columns == "No CRH") %>% select(sta5a) %>% n_distinct` sta5as that have never had a PC CRH encounter
+
+```{r}
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH")) %>%
+  select(sta5a, vssc_month, tc_pc_success_prop, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(sta5a, analytic_period, first_6_lab) %>%
+  summarize(avg_tc_pc_success_prop = mean(tc_pc_success_prop, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = analytic_period, y = avg_tc_pc_success_prop, fill = first_6_lab)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  theme(legend.title = element_blank()) +
+  labs(x = "Analytic Period",
+       y = "Average Timely Care") +
+  ggsci::scale_fill_jco()
+
+```
+
+
+```{r}
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH")) %>%
+  select(sta5a, vssc_month, tc_pc_success_prop, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(vssc_month, first_6_lab) %>%
+  summarise(avg_tc_pc_success_prop = mean(tc_pc_success_prop, na.rm = T),
+            sd_tc_pc_success_prop = sd(tc_pc_success_prop, na.rm = T)) %>%
+  mutate(val_plus_sd = avg_tc_pc_success_prop + sd_tc_pc_success_prop,
+         val_min_sd = avg_tc_pc_success_prop - sd_tc_pc_success_prop) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = avg_tc_pc_success_prop, group = first_6_lab, color = first_6_lab)) +
+  geom_rect(aes(xmin = as.Date("2019-04-01"), xmax = as.Date("2019-10-01"),
+                ymin = 0, ymax = 1),
+            alpha = 0.002,
+            fill = "blue",
+            inherit.aes = FALSE) +
+  geom_rect(aes(xmin = as.Date("2020-04-01"), xmax = as.Date("2020-10-01"),
+                ymin = 0, ymax = 1),
+            alpha = 0.002,
+            fill = "red",
+            inherit.aes = FALSE) +
+  geom_line(size = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank()) +
+  labs(y = "Average Timely Care Success Rate")
+```
+
+## Among CBOCs Only  
+* The boxplots below are comparing average timely care success rate, between the `r access_6mos_df%>% filter(first_6_mos_w_10_flag == 1 & s_abbr %in% c("PCCBOC", "MSCBOC")) %>% select(sta5a) %>% n_distinct` sta5as classified as __CBOCs__ and the `r access_6mos_df%>% filter(table_1_columns == "No CRH" & s_abbr %in% c("PCCBOC", "MSCBOC")) %>% select(sta5a) %>% n_distinct` sta5as classified as __CBOCs__ that have never had a PC CRH encounter  
+
+```{r}
+access_6mos_df %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH") & s_abbr %in% c("PCCBOC", "MSCBOC")) %>%
+  select(sta5a, vssc_month, tc_pc_success_prop, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(sta5a, analytic_period, first_6_lab) %>%
+  summarize(avg_tc_pc_success_prop = mean(tc_pc_success_prop, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = analytic_period, y = avg_tc_pc_success_prop, fill = first_6_lab)) +
+  geom_boxplot() +
+  theme(legend.title = element_blank()) +
+  labs(x = "Analytic Period",
+       y = "Average Timely Care",
+       caption = "*CBOCs Only") +
+  ggsci::scale_fill_lancet() +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+
+```
+
+
+```{r}
+access_6mos_df %>%
+  filter((first_6_mos_w_10_flag == 1 | table_1_columns == "No CRH") & s_abbr %in% c("PCCBOC", "MSCBOC")) %>%
+  select(sta5a, vssc_month, tc_pc_success_prop, first_6_mos_w_10_flag, analytic_period) %>%
+  mutate(first_6_lab = if_else(is.na(first_6_mos_w_10_flag) == TRUE, "Never Had PC CRH", "Had PC CRH All 1st 6 Months")) %>%
+  group_by(vssc_month, first_6_lab) %>%
+  summarise(avg_tc_pc_success_prop = mean(tc_pc_success_prop, na.rm = T),
+            sd_tc_pc_success_prop = sd(tc_pc_success_prop, na.rm = T)) %>%
+  mutate(val_plus_sd = avg_tc_pc_success_prop + sd_tc_pc_success_prop,
+         val_min_sd = avg_tc_pc_success_prop - sd_tc_pc_success_prop) %>%
+  ggplot(data = .,
+         aes(x = vssc_month, y = avg_tc_pc_success_prop, group = first_6_lab, color = first_6_lab)) +
+  geom_rect(aes(xmin = as.Date("2019-04-01"), xmax = as.Date("2019-10-01"),
+                ymin = 0, ymax = 1),
+            alpha = 0.002,
+            fill = "blue",
+            inherit.aes = FALSE) +
+  geom_rect(aes(xmin = as.Date("2020-04-01"), xmax = as.Date("2020-10-01"),
+                ymin = 0, ymax = 1),
+            alpha = 0.002,
+            fill = "red",
+            inherit.aes = FALSE) +
+  geom_line(size = 1) +
+  theme(legend.title = element_blank(),
+        axis.title.x = element_blank()) +
+  labs(y = "Average Timely Care Success Rate",
+       caption = "*CBOCs Only") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))
+```

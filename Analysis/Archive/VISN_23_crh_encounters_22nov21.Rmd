@@ -1,0 +1,374 @@
+---
+title: "CRH Encounters Over Time - VISN 23"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+hubs <- dbGetQuery(oabi_con,
+                   "select distinct hub_sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY20]
+                    UNION 
+                    select distinct Hub_Sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY21_working]") %>%
+  pull
+#--
+institution_lookup <- dbGetQuery(oabi_con,
+                                 "select distinct a.InstitutionName, b.Sta6a
+                                  from [CDWWork].[Dim].Institution as a
+                                  left join [CDWWork].[Dim].Division as b
+                                  	on a.InstitutionSID = b.InstitutionSID
+                                  where b.Sta6a IS NOT NULL and a.InstitutionName <> '*Missing*'") %>%
+  rename_all(tolower)
+#
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#-----
+crh_encounters_v23 <- dbGetQuery(oabi_con,
+                         "select * from [PACT_CC].[CRH].[crh_full_utilization_final_fy20_21]") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  filter(fy %in% c(2020, 2021) & care_type %ni% c("Specialty", "Missing")) %>%
+  left_join(., vast, by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  filter(parent_visn == 23) %>%
+  mutate(source = "PCAT")
+#--
+v23_dina_check <- read_xlsx("H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/CRH_r_project/Input/Data/CRH_PCAT_Check.xlsx") %>%
+  rename_all(tolower) %>%
+  left_join(., institution_lookup) %>%
+  mutate(psc = as.numeric(str_sub(stopcodename, start = 2, end = 4)),
+         ssc = if_else(creditstopname == "NULL", NA_real_, as.numeric(str_sub(creditstopname, start = 2, end = 4))),
+         care_type = 
+           case_when(
+             (psc %in% c(156, 176, 177, 178, 301, 322, 323, 338, 348) 
+              & (ssc != 160 | is.na(ssc) == T)) 
+             | (psc != 160 
+                & ssc %in% c(156, 176, 177, 178, 301, 322, 323, 338, 348))    ~ "Primary Care",
+             (psc %in% c(502, 509, 510, 513, 516, 527, 538, 545, 550, 562, 576, 579, 586, 587) 
+              & (ssc %ni% c(160, 534) | is.na(ssc) == T)) 
+             | (psc %ni% c(160, 534)
+                & ssc %in% c(502, 509, 510, 513, 516, 527, 538, 545, 550, 
+                                    562, 576, 579, 586, 587))                  ~ "Mental Health",
+             (psc %in% c(534, 539) 
+              & (ssc != 160 | is.na(ssc) == T)) 
+             | (psc != 160 & ssc %in% c(534, 539)) ~ "PCMHI",
+             psc == 160 | ssc == 160  ~ "Pharmacy",
+             is.na(psc) == T ~ "Missing",
+             TRUE                                                                          ~ "Specialty"),
+         visitdate = as_date(visitdatetime),
+         hub_flag = if_else(sta6a %in% hubs, 2, 1),
+         visit_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(visitdate) > 9, year(visitdate) + 1, year(visitdate)),
+         qtr = case_when(month(visitdate) %in% c(10, 11, 12) ~ 1,
+                         month(visitdate) %in% c(1, 2, 3) ~ 2,
+                         month(visitdate) %in% c(4, 5, 6) ~ 3,
+                         month(visitdate) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  arrange(`pat id`, visitdatetime, hub_flag) %>%
+  group_by(`pat id`, visitdatetime, care_type) %>%
+  mutate(rowNum = row_number()) %>%
+  filter(rowNum == 1 & care_type %ni% c("Specialty", "Missing")) %>%
+  mutate(source = "V23 MCAA")
+```
+
+```{r}
+pcat_total_df <- crh_encounters_v23 %>%
+  group_by(fyqtr, source) %>%
+  summarise(crh_encounters = n())
+#
+v23_total_df <- v23_dina_check %>%
+  group_by(fyqtr, source) %>%
+  summarise(crh_encounters = n())
+#--
+total_df <- pcat_total_df %>%
+  bind_rows(., v23_total_df)
+#---===
+pcat_type_df <- crh_encounters_v23 %>%
+  group_by(fyqtr, care_type, source) %>%
+  summarise(crh_encounters = n())
+#
+v23_type_df <- v23_dina_check %>%
+  group_by(fyqtr, care_type, source) %>%
+  summarise(crh_encounters = n())
+#--
+type_df <- pcat_type_df %>%
+  bind_rows(., v23_type_df)
+```
+
+# VISN 23  
+## Total       
+```{r}
+total_df %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = source, color = source)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_lancet() +
+  theme(legend.title = element_blank()) +
+  labs(x = "FY-Quarter",
+       y = "CRH Encounters")
+```
+
+### As a table  
+
+```{r results = 'asis'}
+total_df %>%
+  filter(str_detect(fyqtr, "2020") == F) %>%
+  pivot_wider(names_from = fyqtr, values_from = crh_encounters) %>%
+  rename("Source" = source) %>%
+  janitor::adorn_totals(where = "col") %>%
+  kbl(format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position"))
+```
+
+## By Care Type     
+```{r}
+type_df %>%
+  ggplot(data = .,
+         aes(x = fyqtr, y = crh_encounters, group = source, color = source)) +
+  geom_line(size = 1) +
+  scale_y_continuous(limits = c(0, NA),
+                     labels = scales::comma_format(accuracy = 1)) +
+  ggsci::scale_color_lancet() +
+  theme(legend.title = element_blank(),
+        axis.text.x = element_text(angle = 270, vjust = 0.3)) +
+  labs(x = "FY-Quarter",
+       y = "CRH Encounters") +
+  facet_wrap(~care_type)
+```
+
+### As a table - Mental Health  
+```{r}
+type_df %>%
+  ungroup %>%
+  filter(str_detect(fyqtr, "2020") == F & care_type == "Mental Health") %>%
+  select(-care_type) %>%
+  pivot_wider(names_from = fyqtr, values_from = crh_encounters) %>%
+  rename("Source" = source) %>%
+  janitor::adorn_totals(where = "col") %>%
+  kbl(format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position"))
+```
+
+### As a table - Primary Care  
+```{r}
+type_df %>%
+  ungroup %>%
+  filter(str_detect(fyqtr, "2020") == F & care_type == "Primary Care") %>%
+  select(-care_type) %>%
+  pivot_wider(names_from = fyqtr, values_from = crh_encounters) %>%
+  rename("Source" = source) %>%
+  janitor::adorn_totals(where = "col") %>%
+  kbl(format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position"))
+```
+
+### As a table - Pharmacy    
+```{r}
+type_df %>%
+  ungroup %>%
+  filter(str_detect(fyqtr, "2020") == F & care_type == "Pharmacy") %>%
+  select(-care_type) %>%
+  pivot_wider(names_from = fyqtr, values_from = crh_encounters) %>%
+  rename("Source" = source) %>%
+  janitor::adorn_totals(where = "col") %>%
+  kbl(format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position"))
+```
+
+### As a table - PCMHI  
+```{r}
+type_df %>%
+  ungroup %>%
+  filter(str_detect(fyqtr, "2020") == F & care_type == "PCMHI") %>%
+  select(-care_type) %>%
+  pivot_wider(names_from = fyqtr, values_from = crh_encounters) %>%
+  rename("Source" = source) %>%
+  janitor::adorn_totals(where = "col") %>%
+  kbl(format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position"))
+```
+
+# Sta5a  
+
+```{r}
+pcat_sta5a_total_df <- crh_encounters_v23 %>%
+  group_by(fyqtr, spoke_sta5a_combined_cdw, source) %>%
+  summarise(crh_encounters = n())
+#
+v23_sta5a_total_df <- v23_dina_check %>%
+  rename(spoke_sta5a_combined_cdw = sta6a) %>%
+  group_by(fyqtr, spoke_sta5a_combined_cdw, source) %>%
+  summarise(crh_encounters = n())
+#--
+total_sta5a_df <- pcat_sta5a_total_df %>%
+  bind_rows(., v23_sta5a_total_df) %>%
+  left_join(., vast %>% select(sta5a, short_name), by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  ungroup %>%
+  mutate(sta5a_lab = paste0("(", spoke_sta5a_combined_cdw, ") ", short_name)) %>%
+  select(-spoke_sta5a_combined_cdw, -short_name)
+#---===
+pcat_sta5a_type_df <- crh_encounters_v23 %>%
+  group_by(fyqtr, spoke_sta5a_combined_cdw, care_type, source) %>%
+  summarise(crh_encounters = n())
+#
+v23_sta5a_type_df <- v23_dina_check %>%
+  rename(spoke_sta5a_combined_cdw = sta6a) %>%
+  group_by(fyqtr, spoke_sta5a_combined_cdw, care_type, source) %>%
+  summarise(crh_encounters = n())
+#--
+type_sta5a_df <- pcat_sta5a_type_df %>%
+  bind_rows(., v23_sta5a_type_df) %>%
+  left_join(., vast %>% select(sta5a, short_name), by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  ungroup %>%
+  mutate(sta5a_lab = paste0("(", spoke_sta5a_combined_cdw, ") ", short_name)) %>%
+  select(-spoke_sta5a_combined_cdw, -short_name)
+```
+
+## Total as a Table  
+
+```{r, results='asis'}
+total_sta5a_df %>% 
+  filter(str_detect(fyqtr, "2020") == F) %>%
+  pivot_wider(names_from = c(source, fyqtr), values_from = crh_encounters) %>%
+  select(sta5a_lab, contains("-1"), contains("-2"), contains("-3"), contains("-4")) %>%
+  janitor::adorn_totals("row") %>%
+  kbl(col.names = c("Sta5a", rep(c("PCAT", "V23 MCAA"), 4)),
+      format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position")) %>%
+  add_header_above(c(" ", "2021-1" = 2, "2021-2" = 2, "2021-3" = 2, "2021-4" = 2)) %>%
+  column_spec(c(1, 3, 5, 7, 9), border_right = TRUE)
+```
+
+### Mental Health  
+
+```{r, results='asis'}
+type_sta5a_df %>% 
+  filter(str_detect(fyqtr, "2020") == F & care_type == "Mental Health") %>%
+  pivot_wider(names_from = c(source, fyqtr), values_from = crh_encounters) %>%
+  select(sta5a_lab, contains("-1"), contains("-2"), contains("-3"), contains("-4")) %>%
+  janitor::adorn_totals("row") %>%
+  kbl(col.names = c("Sta5a", rep(c("PCAT", "V23 MCAA"), 4)),
+      format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position")) %>%
+  add_header_above(c(" ", "2021-1" = 2, "2021-2" = 2, "2021-3" = 2, "2021-4" = 2)) %>%
+  column_spec(c(1, 3, 5, 7, 9), border_right = TRUE)
+```
+
+
+### Primary Care  
+
+```{r, results='asis'}
+type_sta5a_df %>% 
+  filter(str_detect(fyqtr, "2020") == F & care_type == "Primary Care") %>%
+  pivot_wider(names_from = c(source, fyqtr), values_from = crh_encounters) %>%
+  select(sta5a_lab, contains("-1"), contains("-2"), contains("-3"), contains("-4")) %>%
+  janitor::adorn_totals("row") %>%
+  kbl(col.names = c("Sta5a", rep(c("PCAT", "V23 MCAA"), 4)),
+      format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position")) %>%
+  add_header_above(c(" ", "2021-1" = 2, "2021-2" = 2, "2021-3" = 2, "2021-4" = 2)) %>%
+  column_spec(c(1, 3, 5, 7, 9), border_right = TRUE)
+```
+
+
+### Pharmacy    
+
+```{r, results='asis'}
+type_sta5a_df %>% 
+  filter(str_detect(fyqtr, "2020") == F & care_type == "Pharmacy") %>%
+  pivot_wider(names_from = c(source, fyqtr), values_from = crh_encounters) %>%
+  select(sta5a_lab, contains("-1"), contains("-2"), contains("-3"), contains("-4")) %>%
+  janitor::adorn_totals("row") %>%
+  kbl(col.names = c("Sta5a", rep(c("PCAT", "V23 MCAA"), 4)),
+      format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position")) %>%
+  add_header_above(c(" ", "2021-1" = 2, "2021-2" = 2, "2021-3" = 2, "2021-4" = 2)) %>%
+  column_spec(c(1, 3, 5, 7, 9), border_right = TRUE)
+```
+
+### PCMHI      
+
+```{r, results='asis'}
+type_sta5a_df %>% 
+  filter(str_detect(fyqtr, "2020") == F & care_type == "PCMHI") %>%
+  pivot_wider(names_from = c(source, fyqtr), values_from = crh_encounters) %>%
+  select(sta5a_lab, contains("-1"), contains("-2"), contains("-3"), contains("-4")) %>%
+  janitor::adorn_totals("row") %>%
+  kbl(col.names = c("Sta5a", rep(c("PCAT", "V23 MCAA"), 4)),
+      format.args = list(big.mark = ","),
+      align = c("l", rep("r", 8))) %>%
+  kable_classic("striped", latex_options = c("striped", "hold_position")) %>%
+  add_header_above(c(" ", "2021-1" = 2, "2021-2" = 2, "2021-3" = 2, "2021-4" = 2)) %>%
+  column_spec(c(1, 3, 5, 7, 9), border_right = TRUE)
+```
+

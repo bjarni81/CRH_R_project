@@ -1,0 +1,342 @@
+---
+title: "D-i-D - Not matched, no covariates"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v3_1.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- access_metrics %>%
+  filter(vssc_month < ymd("2020-03-01") & vssc_month > ymd("2018-09-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+  #1: must have Access metrics
+  #2: must be in VAST
+  #3: no missing scrssn_count_cat
+  #4: CBOCs only
+  #5: must have scrssn_count_avg_fy18 >= 450
+sta5as_to_include <- access_metrics %>%#1: must have Access metrics
+  select(sta5a) %>%
+  inner_join(., vast %>% select(sta5a, s_abbr)) %>%#2: must be in VAST
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, "PC CRH", "No PC CRH")) %>%#making the crh_flag
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F #3: no missing scrssn_count_cat
+         & str_detect(s_abbr, "CBOC")#4: CBOCs only
+           & scrssn_count_cat != "< 450")#5: must have scrssn_count_avg_fy18 >= 450
+#this little table is for the functions i wrote for outputting tables, and I don't want to have to look for it later
+# not strictly necissary
+# scrssn_cat_count <- sta5as_to_include %>%
+#   group_by(crh_flag, scrssn_count_cat) %>%
+#   summarise(count = n()) %>%
+#   mutate(count = as.character(count)) %>%
+#   pivot_wider(names_from = scrssn_count_cat, values_from = count)
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      filter(vssc_month < ymd("2020-03-01") & vssc_month > ymd("2018-09-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%#add time column
+      left_join(., crh_flag %>% select(sta5a, first_mo_w_mt9_pc_crh)) %>%
+  group_by(sta5a) %>%
+  mutate(treat = factor(case_when(
+    sta5a %in% crh_sta5as ~ "PC CRH",
+    TRUE ~ "No PC CRH")),
+         post = factor(if_else(vssc_month > ymd("2019-09-01"), 
+                               "Post Intervention (i.e., FY20)",
+                               "Pre-Intervention (i.e., FY19)")),
+    tx_fe = if_else(treat == "PC CRH", 1, 0),
+    post_fe = if_else(post == "Post Intervention (i.e., FY20)", 1, 0)) %>%
+  ungroup()
+#
+tx_pre <- analytic_df %>%
+  filter(tx_fe == 1 & post_fe == 0)
+#
+tx_post <- analytic_df %>%
+  filter(tx_fe == 1 & post_fe == 1)
+#
+noTx_pre <- analytic_df %>%
+  filter(tx_fe == 0 & post_fe == 0)
+#
+noTx_post <- analytic_df %>%
+  filter(tx_fe == 0 & post_fe == 1)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a Difference-in-Differences analysis of 3 outcomes by whether or not the sta5a met our PC CRH inclusion criteria before March, 2020  
+    + Because, according to Hallberg et al. CITS = DiD, I am not going to estimate the DiD by regression but rather just by the grouped mean
+
+## Decision Points  
+
+* This is analysis __1Ai__ from the Project Face Sheet
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, crh_flag) %>% distinct() %>% summarise(tot = sum(crh_flag == "PC CRH"))` of these met our criteria for PC CRH before March, 2020
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+    + Each row is a sta5a-month
+    
+    
+* Description of _Propensity Score_ matching
+    + There is no matching in this analysis 
+
+* Description of analyses    
+    + I am analyzing our 3 primary outcomes: New and Established patient wait time, and Third-next available
+* DiD analysis is reasonably straight-forward:
+    1. Estimate 4 mean outcome values
+      + Treated, pre intervention
+      + Treated, post intervention
+      + Not treated, pre intervention
+      + Not treated, post intervention
+    2. Take difference of differences to estimate the Average Treatment Effect Among the Treated (ATT)
+      + $(Treated_{post}-Treated_{pre})-(Not Treated_{post}-Not Treated_{pre})$
+      + $(Treated_{post}-NotTreated_{post})-(Treated_{pre}-NotTreated_{pre})$
+
+
+# New Patient Wait Time   
+```{r}
+newPtWt_tx_pre <- tx_pre %>%
+  summarise(avg_val = mean(new_pc_pt_wt, na.rm = T))
+#
+newPtWt_tx_post <- tx_post %>%
+  summarise(avg_val = mean(new_pc_pt_wt, na.rm = T))
+#
+newPtWt_noTx_pre <- noTx_pre %>%
+  summarise(avg_val = mean(new_pc_pt_wt, na.rm = T))
+#
+newPtWt_noTx_post <- noTx_post %>%
+  summarise(avg_val = mean(new_pc_pt_wt, na.rm = T))
+#---
+did_1 <- (newPtWt_tx_post$avg_val - newPtWt_tx_pre$avg_val) - (newPtWt_noTx_post$avg_val - newPtWt_noTx_pre$avg_val)
+#---
+did_2 <- (newPtWt_tx_post$avg_val - newPtWt_noTx_post$avg_val) - (newPtWt_tx_pre$avg_val - newPtWt_noTx_pre$avg_val)
+#---
+cf_value_at_start <- newPtWt_tx_pre$avg_val
+cf_value_at_end <- newPtWt_tx_post$avg_val - did_1
+#--
+plot_df <- tibble(
+  group = c("PC CRH", "PC CRH",
+            "No PC CRH", "No PC CRH",
+            "Counterfactual", "Counterfactual"),
+  time = factor(rep(c("Pre", "Post"), 3),
+                ordered = TRUE,
+                levels = c("Pre", "Post")),
+  value = c(newPtWt_tx_pre$avg_val, newPtWt_tx_post$avg_val,
+            newPtWt_noTx_pre$avg_val, newPtWt_noTx_post$avg_val,
+            cf_value_at_start, cf_value_at_end)
+)
+```
+
+* The difference in differences is __0.65 days__ (`r round(did_2, 4)`)  
+
+```{r}
+ggplot(plot_df,
+       aes(x = time, y = value, group = group, color = group)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Time", y = "Avg. New Patient Wait Time (days)")
+  
+```
+
+
+# Established Patient Wait Time   
+```{r}
+estPtWt_tx_pre <- tx_pre %>%
+  summarise(avg_val = mean(est_pc_pt_wt, na.rm = T))
+#
+estPtWt_tx_post <- tx_post %>%
+  summarise(avg_val = mean(est_pc_pt_wt, na.rm = T))
+#
+estPtWt_noTx_pre <- noTx_pre %>%
+  summarise(avg_val = mean(est_pc_pt_wt, na.rm = T))
+#
+estPtWt_noTx_post <- noTx_post %>%
+  summarise(avg_val = mean(est_pc_pt_wt, na.rm = T))
+#---
+did_1 <- (estPtWt_tx_post$avg_val - estPtWt_tx_pre$avg_val) - (estPtWt_noTx_post$avg_val - estPtWt_noTx_pre$avg_val)
+#---
+did_2 <- (estPtWt_tx_post$avg_val - estPtWt_noTx_post$avg_val) - (estPtWt_tx_pre$avg_val - estPtWt_noTx_pre$avg_val)
+#---
+cf_value_at_start <- estPtWt_tx_pre$avg_val
+cf_value_at_end <- estPtWt_tx_post$avg_val - did_1
+#--
+plot_df <- tibble(
+  group = c("PC CRH", "PC CRH",
+            "No PC CRH", "No PC CRH",
+            "Counterfactual", "Counterfactual"),
+  time = factor(rep(c("Pre", "Post"), 3),
+                ordered = TRUE,
+                levels = c("Pre", "Post")),
+  value = c(estPtWt_tx_pre$avg_val, estPtWt_tx_post$avg_val,
+            estPtWt_noTx_pre$avg_val, estPtWt_noTx_post$avg_val,
+            cf_value_at_start, cf_value_at_end)
+)
+```
+
+* The difference in differences is __-0.66 days__ (`r round(did_2, 4)`)  
+
+```{r}
+ggplot(plot_df,
+       aes(x = time, y = value, group = group, color = group)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Time", y = "Avg. Established Patient Wait Time (days)")
+  
+```
+
+
+# Third Next Available     
+```{r}
+tna_tx_pre <- tx_pre %>%
+  summarise(avg_val = mean(third_next_avail, na.rm = T))
+#
+tna_tx_post <- tx_post %>%
+  summarise(avg_val = mean(third_next_avail, na.rm = T))
+#
+tna_noTx_pre <- noTx_pre %>%
+  summarise(avg_val = mean(third_next_avail, na.rm = T))
+#
+tna_noTx_post <- noTx_post %>%
+  summarise(avg_val = mean(third_next_avail, na.rm = T))
+#---
+did_1 <- (tna_tx_post$avg_val - tna_tx_pre$avg_val) - (tna_noTx_post$avg_val - tna_noTx_pre$avg_val)
+#---
+did_2 <- (tna_tx_post$avg_val - tna_noTx_post$avg_val) - (tna_tx_pre$avg_val - tna_noTx_pre$avg_val)
+#---
+cf_value_at_start <- tna_tx_pre$avg_val
+cf_value_at_end <- tna_tx_post$avg_val - did_1
+#--
+plot_df <- tibble(
+  group = c("PC CRH", "PC CRH",
+            "No PC CRH", "No PC CRH",
+            "Counterfactual", "Counterfactual"),
+  time = factor(rep(c("Pre", "Post"), 3),
+                ordered = TRUE,
+                levels = c("Pre", "Post")),
+  value = c(tna_tx_pre$avg_val, tna_tx_post$avg_val,
+            tna_noTx_pre$avg_val, tna_noTx_post$avg_val,
+            cf_value_at_start, cf_value_at_end)
+)
+```
+
+* The difference in differences is __-0.69 days__ (`r round(did_2, 4)`)  
+
+```{r}
+ggplot(plot_df,
+       aes(x = time, y = value, group = group, color = group)) +
+  geom_line(linewidth = 1) +
+  scale_y_continuous(limits = c(0, NA)) +
+  labs(x = "Time", y = "Avg. Third-Next Available (days)")
+  
+```

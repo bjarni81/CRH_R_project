@@ -1,0 +1,231 @@
+---
+title: "CRH Encounters by Site Type"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, echo = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         #initiated before february to account for needing two consecutive months with > 9
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v3_1.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- access_metrics %>%
+  filter(vssc_month < ymd("2020-03-01") & vssc_month > ymd("2018-09-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+      filter(vssc_month < ymd("2020-03-01") & vssc_month > ymd("2018-09-01")) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, pcccr_per_10k_uniques,
+         avg_age_oct1_2020, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+```
+
+```{r}
+analytic_df <- dbGetQuery(oabi_con,
+                          "with CTE as (
+	select count(*) as crh_encounter_count, spoke_sta5a_combined_cdw as sta5a
+	from [PACT_CC].[CRH].C_crh_utilization_final
+	where care_type = 'Primary Care'
+		AND visitdate < cast('2020-03-01' as date)
+		AND visitdate > cast('2018-09-30' as date)
+	group by spoke_sta5a_combined_cdw
+	),
+cte2 as (
+	select *
+		, initiated_b4_feb2020 = case when first_mo_w_mt9_pc_crh < cast('2020-02-01' as date) then 1 else 0 end
+	from [OABI_MyVAAccess].[crh_eval].C1_crh_flag
+	)
+select a.*, b.initiated_b4_feb2020, c.s_abbr
+from CTE as a
+left join cte2 as b
+	on a.sta5a = b.sta5a
+left join [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06 as c
+	on a.sta5a = c.sta5a
+") %>%
+  filter(initiated_b4_feb2020 == 1)
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This report produces tables of __PC CRH Encounter Counts__ by __Site Type (e.g., PCCBOC)__
+
+## Decision Points  
+
+* This was the lowest-hanging fruit from our meeting with Matt, Ashok, and Chelle on 12/7/2022
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs in October, 2018
+    + The last observation in the data occurs in February, 2020
+    + These are the `r nrow(analytic_df)` sta5as that met our inclusion criteria before February, 2020
+    
+* Description of _Propensity Score_ matching
+    + There is __No PS Matching__ applied 
+
+
+## As a Table  
+```{r}
+analytic_df %>%
+  group_by(s_abbr) %>%
+  summarise(sum_crh_encounter_count = sum(crh_encounter_count),
+            sta5a_count = n()) %>%
+  mutate(sum_prop = sum_crh_encounter_count / sum(sum_crh_encounter_count),
+         count_prop = sta5a_count / sum(sta5a_count)) %>%
+  adorn_totals() %>%
+  mutate(across(c(4, 5), ~percent(.x,accuracy = 0.1))) %>%
+  mutate(across(c(2, 3), ~comma(.x, accuracy = 1))) %>%
+  mutate(sum_val = paste0(sum_crh_encounter_count, " (", sum_prop, ")"),
+         count_val = paste0(sta5a_count, " (", count_prop, ")")) %>%
+  select(1, 6, 7) %>%
+  kbl(col.names = c("Site Type", "PC CRH Encounters", "Sta5as"),
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(6, bold = TRUE)
+
+```
+
+## As Boxplots  
+```{r}
+analytic_df %>%
+  ggplot(data = .,
+         aes(x = s_abbr, y = crh_encounter_count,
+             fill = s_abbr)) +
+  geom_boxplot() +
+  theme(legend.position = "none", 
+        axis.title.x = element_blank()) +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "Total PC CRH Encounters Before March 2020")
+```
+
+## Looking closer at OOS and HCC sites    
+
+```{r}
+oos_hcc_sites <- analytic_df %>%
+  filter(s_abbr %in% c("HCC", "OOS")) %>%
+  left_join(., vast %>% select(sta5a, urh_vast, short_name, parent_visn, city, state)) %>%
+  select(sta5a, s_abbr, crh_encounter_count, urh_vast, city, state) %>%
+  arrange(s_abbr) %>%
+  mutate(crh_encounter_count = comma(crh_encounter_count, accuracy = 1))
+#
+pcmm_count_avg_fy19 <- covariates %>%
+  filter(sta5a %in% oos_hcc_sites$sta5a
+         & vssc_month > ymd("2018-09-01")
+         & vssc_month < ymd("2020-03-01")) %>%
+  group_by(sta5a) %>%
+  summarise(avg_pcmm_count = comma(mean(pcmm_count_fy_qtr, na.rm = T), accuracy = 0.1))
+#
+oos_hcc_sites %>%
+  left_join(., pcmm_count_avg_fy19) %>%
+  kbl(col.names = c("Sta5a", "Site Type", "PC CRH Encounters", "URH (VAST)",
+                    "City", "State", "Average Uniques in PCMM, FY19"),
+      align = c("l", "l", "r", "l", "l", "l", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```

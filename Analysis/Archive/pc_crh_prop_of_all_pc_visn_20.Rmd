@@ -1,0 +1,278 @@
+---
+title: "PC CRH & Total PC Over Time - VISN 20"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 8, fig.height = 8)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].[C2_vast_from_a06]")
+#
+penRate <- dbGetQuery(oabi_con,
+                      "select pr.*
+                    	, crh_flag = case 
+                    		when c1.crh_10_flag = 1 then 1
+                    		else 0 end
+                      from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate as pr
+                      left join [OABI_MyVAAccess].[crh_eval].C1_crh_flag as c1
+	                    on pr.sta5a = c1.sta5a") %>%
+  inner_join(., vast) %>%
+  mutate(crh_month = ymd(crh_month),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(
+           month(crh_month) %in% c(10, 11, 12) ~ 1,
+           month(crh_month) %in% c(1, 2, 3) ~ 2,
+           month(crh_month) %in% c(4, 5, 6) ~ 3,
+           month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fy_qtr = str_c(fy, qtr, sep = "-"),
+         short_name = gsub(",.*", "", short_name),
+         sta5a_lab = paste0("(", sta5a, ") ", short_name))
+```
+
+# The Denominator  
+* In the following plots, the __Denominator__ (i.e., "Total PC") is defined as:
+1. Include any workload, outpatient encounter WHERE 
+    + PrimaryStopCode IN(322, 323, 338, 348, 350, 704) AND (SecondaryStopCode NOT IN(107, 115, 152, 311, 321, 328, 329, 333, 334, 430, 435, 474, 710, 999) OR SecondaryStopCode IS NULL))
+    + OR SecondaryStopCode IN(322, 323, 348, 350, 704)
+2. Restrict to MDs, PAs, and NPs making:
+    + <u>Telephone Encounters</u>: PrimaryStopCode = 338 AND (SecondaryStopCode IN(185, 186, 187, 188) OR SecondaryStopCode IS NULL)
+    + <u>Video Encounters</u>: SecondaryStopCode = 179 OR (SecondaryStopCode > 689 AND SecondaryStopCode < 700)
+    + <u>In-Person Encounters</u>: PrimaryStopCode <> 338 and (SecondaryStopCode IN(185, 186, 187, 188) OR SecondaryStopCode IS NULL)
+
+
+# VISN 20 I  
+ 
+* The results below include only those sta5as meeting our inclusion criteria of at least 2 consecutive months with 10 or more Primary Care CRH Encounters
+
+```{r}
+visn_20_sta5as <- penRate %>%
+  filter(parent_visn == "20" & crh_flag == 1) %>%
+  select(sta5a) %>%
+  distinct %>% pull
+
+```
+
+
+## Totals  
+```{r}
+#======
+penRate %>%
+  filter(crh_flag == 1 & parent_visn == "20" & sta5a %in% visn_20_sta5as[1:8]) %>%
+  group_by(fy_qtr, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "Total PC" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name, fill = name)) +
+  geom_bar(position = "stack", stat = "identity") +
+  ggsci::scale_fill_aaas() +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "Count",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.position = "bottom") +
+  facet_wrap(~sta5a_lab)
+```
+
+## Proportion of Total  
+
+```{r}
+penRate %>%
+  filter(crh_flag == 1 & parent_visn == "20" & sta5a %in% visn_20_sta5as[1:8]) %>%
+  group_by(fy_qtr, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "Total PC" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name, fill = name)) +
+  geom_bar(position = "fill", stat = "identity") +
+  ggsci::scale_fill_aaas() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(y = "Proportion",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.title = element_blank()) +
+  facet_wrap(~sta5a_lab)
+```
+
+# VISN 20 II  
+
+
+## Totals  
+```{r}
+#======
+penRate %>%
+  filter(crh_flag == 1 & parent_visn == "20" & sta5a %in% visn_20_sta5as[9:15]) %>%
+  group_by(fy_qtr, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "Total PC" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name, fill = name)) +
+  geom_bar(position = "stack", stat = "identity") +
+  ggsci::scale_fill_npg() +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "Count",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.position = "bottom") +
+  facet_wrap(~sta5a_lab)
+```
+
+## Proportion of Total  
+
+```{r}
+penRate %>%
+  filter(crh_flag == 1 & parent_visn == "20" & sta5a %in% visn_20_sta5as[9:15]) %>%
+  group_by(fy_qtr, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "Total PC" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name, fill = name)) +
+  geom_bar(position = "fill", stat = "identity") +
+  ggsci::scale_fill_npg() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(y = "Proportion",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.title = element_blank()) +
+  facet_wrap(~sta5a_lab)
+```
+
+# VISN 20 III  
+* Note that Spokane went to Cerner starting Q2 of FY2021
+
+
+## Totals  
+```{r}
+#======
+penRate %>%
+  filter(crh_flag == 1 & parent_visn == "20" & sta5a %in% visn_20_sta5as[16:22]) %>%
+  group_by(fy_qtr, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "Total PC" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name, fill = name)) +
+  geom_bar(position = "stack", stat = "identity") +
+  ggsci::scale_fill_npg() +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "Count",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.position = "bottom") +
+  facet_wrap(~sta5a_lab)
+```
+
+## Proportion of Total  
+
+```{r}
+penRate %>%
+  filter(crh_flag == 1 & parent_visn == "20" & sta5a %in% visn_20_sta5as[16:22]) %>%
+  group_by(fy_qtr, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "Total PC" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name, fill = name)) +
+  geom_bar(position = "fill", stat = "identity") +
+  ggsci::scale_fill_npg() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(y = "Proportion",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.title = element_blank()) +
+  facet_wrap(~sta5a_lab)
+```
+
+# VISN 20 IV  
+
+
+## Totals  
+```{r}
+#======
+penRate %>%
+  filter(crh_flag == 1 & parent_visn == "20" & sta5a %in% visn_20_sta5as[23:30]) %>%
+  group_by(fy_qtr, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "Total PC" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name, fill = name)) +
+  geom_bar(position = "stack", stat = "identity") +
+  ggsci::scale_fill_npg() +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  labs(y = "Count",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.position = "bottom") +
+  facet_wrap(~sta5a_lab)
+```
+
+## Proportion of Total  
+
+```{r}
+penRate %>%
+  filter(crh_flag == 1 & parent_visn == "20" & sta5a %in% visn_20_sta5as[23:30]) %>%
+  group_by(fy_qtr, sta5a_lab) %>%
+  summarise("PC CRH" = sum(crh_encounter_count, na.rm = T),
+            "Total PC" = sum(pc_encounter_total, na.rm = T)) %>%
+  pivot_longer(-c(fy_qtr, sta5a_lab)) %>%
+  ggplot(data = .,
+         aes(x = fy_qtr, y = value, group = name, fill = name)) +
+  geom_bar(position = "fill", stat = "identity") +
+  ggsci::scale_fill_npg() +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  labs(y = "Proportion",
+       x = "FY-Qtr") +
+  theme(axis.text.x = element_text(angle = 270, vjust = 0.3),
+        legend.title = element_blank()) +
+  facet_wrap(~sta5a_lab)
+```

@@ -1,0 +1,768 @@
+---
+title: "PC CRH Analysis: Difference-in-Difference"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+pactcc_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  mutate(first_mo_w_mt9_pc_crh = ymd(first_mo_w_mt9_pc_crh),
+         initiated_pc_crh_b4_march_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-03-01"), TRUE, FALSE),
+         initiated_pc_crh_b4_feb_2020 = if_else(first_mo_w_mt9_pc_crh < ymd("2020-02-01"), TRUE, FALSE)) %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#
+pilot_sites <- dbGetQuery(pactcc_con,
+                          "select distinct spoke_sta5a, vimpact_pilot
+                          from PACT_CC.CRH.CRH_sites_FY20_working 
+                          UNION
+                          select distinct spoke_sta5a, vimpact_pilot
+                          from PACT_CC.CRH.CRH_sites_FY21_working ") %>%
+  filter(vimpact_pilot == 1) %>%
+  select(sta5a = spoke_sta5a)
+#
+ps_matched <- read_csv(here::here("Input", "Data", "ps_matched_sta5as.csv"))
+#==
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month))
+```
+
+# 1A: All Sta5as that met PC CRH inclusion criteria before February, 2020  
+```{r}
+included_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE) %>%
+  select(sta5a) %>%
+  inner_join(., ps_matched) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a, at_least_10_pc_crh_flag)
+#----------------------------------------------------------
+new_pt_wt <- access_metrics %>%
+  select(sta5a, vssc_month, new_pc_pt_wt) %>%
+  inner_join(., included_sta5as) %>%
+  filter(vssc_month %in% c(ymd("2019-09-01"), ymd("2020-02-01"))) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH")))
+```
+
+* There were `r nrow(included_sta5as) / 2` sta5as that met inclusion criteria before February, 2020  
+
+## Distribution of New Patient Wait Times    
+```{r}
+p1 <- new_pt_wt %>%
+  filter(vssc_month == ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(x = new_pc_pt_wt, 
+             fill = crh_flag, 
+             group = crh_flag)) +
+  geom_histogram(aes(y=c(..count..[..group..==1]/sum(..count..[..group..==1]),
+                         ..count..[..group..==2]/sum(..count..[..group..==2]))),
+                 position = "dodge",
+                 bins = 25) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  scale_x_continuous(limits = c(0, 75)) +
+  labs(x = "New Patient Wait Time",
+       y = "Proportion of Sta5as",
+       title = "September, 2019") +
+  theme(legend.title = element_blank())
+#--
+p2 <- new_pt_wt %>%
+  filter(vssc_month != ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(x = new_pc_pt_wt, 
+             fill = crh_flag, 
+             group = crh_flag)) +
+  geom_histogram(aes(y=c(..count..[..group..==1]/sum(..count..[..group..==1]),
+                         ..count..[..group..==2]/sum(..count..[..group..==2]))),
+                 position = "dodge",
+                 bins = 25) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  scale_x_continuous(limits = c(0, 75)) +
+  labs(x = "New Patient Wait Time",
+       y = "Proportion of Sta5as",
+       title = "February, 2020") +
+  theme(legend.title = element_blank())
+#
+multiplot(p1, p2, cols = 2)
+```
+
+```{r}
+p1 <- new_pt_wt %>%
+  filter(vssc_month == ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(y = new_pc_pt_wt, 
+             fill = crh_flag, 
+             x = crh_flag)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time",
+       title = "September, 2019")
+#
+p2 <- new_pt_wt %>%
+  filter(vssc_month != ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(y = new_pc_pt_wt, 
+             fill = crh_flag, 
+             x = crh_flag)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time",
+       title = "February, 2020")
+#
+multiplot(p1, p2, cols = 2)
+```
+
+
+```{r}
+differences <- new_pt_wt %>%
+  group_by(crh_flag, vssc_month) %>%
+  summarise(new_pc_pt_wt = mean(new_pc_pt_wt, na.rm = T)) %>%
+  mutate(vssc_month = format(vssc_month, "%b, %Y"))
+#
+crh_sep <- differences[3,3] %>% pull
+crh_feb <- differences[4,3] %>% pull
+noCrh_sep <- differences[1,3] %>% pull
+noCrh_feb <- differences[2,3] %>% pull
+#
+foo <- tibble(
+  crh_flag = rep("PC CRH (counterfactual)", 2),
+  vssc_month = c(format(ymd("2019-09-01"), "%b, %Y"),
+                 format(ymd("2020-02-01"), "%b, %Y")),
+  new_pc_pt_wt = c(crh_sep, (crh_sep + (noCrh_feb - noCrh_sep)))
+)
+#
+differences %>%
+  bind_rows(., foo) %>%
+  mutate(new_pc_pt_wt = round(new_pc_pt_wt, 1)) %>%
+  kbl(col.names = c("CRH Flag", "Month", "Average New Pat. WT")) %>%
+  kable_classic("striped",
+      full_width = FALSE, font_size = 16) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## DiD Plot  
+
+```{r}
+did_plot_df <- tibble(
+  label_name = c("No PC CRH", "PC CRH", "PC CRH (Counterfactual)",
+                 "No PC CRH", "PC CRH", "PC CRH (Counterfactual)"),
+  timepoint = c("September, 2019", "September, 2019", "September, 2019",
+                "February, 2020", "February, 2020", "February, 2020"),
+  value = c(noCrh_sep, crh_sep, crh_sep,
+            noCrh_feb, crh_feb, 
+              (crh_sep + (noCrh_feb - noCrh_sep)))) %>%
+  mutate(timepoint = factor(timepoint,
+                            ordered = TRUE,
+                            levels = c("September, 2019", "February, 2020")))
+#
+ggplot(data = did_plot_df,
+       aes(x = timepoint, y = value, group = label_name, color = label_name)) +
+  geom_line(size = 1.5) +
+  scale_y_continuous(limits = c(plyr::round_any(min(did_plot_df$value), 5, floor), 
+                                plyr::round_any(max(did_plot_df$value), 5, ceiling)),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.position = "right",
+        axis.title.x = element_blank()) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  geom_segment(aes(x = 2.02, xend = 2.02,
+                   y = (crh_sep + (noCrh_feb - noCrh_sep)), 
+                   yend = crh_feb),
+               color = "black",
+               arrow = arrow(angle = 90, ends = "both", length = unit(0.125, "cm"))) +
+  geom_curve(aes(x = 2.3, xend = 2.05,
+                 y = (crh_sep + (noCrh_feb - noCrh_sep)) - 0.85,
+                 yend = (crh_sep + (noCrh_feb - noCrh_sep)) + (crh_feb - (crh_sep + (noCrh_feb - noCrh_sep)))/2),
+             color = "black",
+             arrow = arrow(type = "closed", length = unit(0.25, "cm"))) +
+  annotate("text",
+           x = 2.125, y = (crh_sep + (noCrh_feb - noCrh_sep)) - 1,
+           label = "{Difference-in-Differences}") +
+  labs(y = "New Patient Wait Time (days)")
+```
+
+## Regression  
+
+```{r}
+foo <- new_pt_wt %>%
+  mutate(february2020 = if_else(vssc_month == ymd("2020-02-01"), 1, 0),
+         did = february2020 * at_least_10_pc_crh_flag)
+#
+didreg = lm(new_pc_pt_wt ~ at_least_10_pc_crh_flag*february2020, data = foo)
+summary(didreg)
+```
+
+# 1B: No pilot sites, all Sta5as that met PC CRH inclusion criteria before February, 2020  
+```{r}
+included_sta5as <- crh_flag %>%
+  filter(initiated_pc_crh_b4_feb_2020 == TRUE
+         & sta5a %ni% pilot_sites$sta5a) %>%
+  select(sta5a) %>%
+  inner_join(., ps_matched) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a, at_least_10_pc_crh_flag)
+#----------------------------------------------------------
+new_pt_wt <- access_metrics %>%
+  select(sta5a, vssc_month, new_pc_pt_wt) %>%
+  inner_join(., included_sta5as) %>%
+  filter(vssc_month %in% c(ymd("2019-09-01"), ymd("2020-02-01"))) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH")))
+```
+
+* There were `r nrow(included_sta5as) / 2` non-pilot sta5as that met inclusion criteria before February, 2020  
+
+## Distribution of New Patient Wait Times    
+```{r}
+p1 <- new_pt_wt %>%
+  filter(vssc_month == ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(x = new_pc_pt_wt, 
+             fill = crh_flag, 
+             group = crh_flag)) +
+  geom_histogram(aes(y=c(..count..[..group..==1]/sum(..count..[..group..==1]),
+                         ..count..[..group..==2]/sum(..count..[..group..==2]))),
+                 position = "dodge",
+                 bins = 25) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  scale_x_continuous(limits = c(0, 75)) +
+  labs(x = "New Patient Wait Time",
+       y = "Proportion of Sta5as",
+       title = "September, 2019") +
+  theme(legend.title = element_blank())
+#--
+p2 <- new_pt_wt %>%
+  filter(vssc_month != ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(x = new_pc_pt_wt, 
+             fill = crh_flag, 
+             group = crh_flag)) +
+  geom_histogram(aes(y=c(..count..[..group..==1]/sum(..count..[..group..==1]),
+                         ..count..[..group..==2]/sum(..count..[..group..==2]))),
+                 position = "dodge",
+                 bins = 25) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  scale_x_continuous(limits = c(0, 75)) +
+  labs(x = "New Patient Wait Time",
+       y = "Proportion of Sta5as",
+       title = "February, 2020") +
+  theme(legend.title = element_blank())
+#
+multiplot(p1, p2, cols = 2)
+```
+
+```{r}
+p1 <- new_pt_wt %>%
+  filter(vssc_month == ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(y = new_pc_pt_wt, 
+             fill = crh_flag, 
+             x = crh_flag)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time",
+       title = "September, 2019")
+#
+p2 <- new_pt_wt %>%
+  filter(vssc_month != ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(y = new_pc_pt_wt, 
+             fill = crh_flag, 
+             x = crh_flag)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time",
+       title = "February, 2020")
+#
+multiplot(p1, p2, cols = 2)
+```
+
+
+```{r}
+differences <- new_pt_wt %>%
+  group_by(crh_flag, vssc_month) %>%
+  summarise(new_pc_pt_wt = mean(new_pc_pt_wt, na.rm = T)) %>%
+  mutate(vssc_month = format(vssc_month, "%b, %Y"))
+#
+crh_sep <- differences[3,3] %>% pull
+crh_feb <- differences[4,3] %>% pull
+noCrh_sep <- differences[1,3] %>% pull
+noCrh_feb <- differences[2,3] %>% pull
+#
+foo <- tibble(
+  crh_flag = rep("PC CRH (counterfactual)", 2),
+  vssc_month = c(format(ymd("2019-09-01"), "%b, %Y"),
+                 format(ymd("2020-02-01"), "%b, %Y")),
+  new_pc_pt_wt = c(crh_sep, (crh_sep + (noCrh_feb - noCrh_sep)))
+)
+#
+differences %>%
+  bind_rows(., foo) %>%
+  mutate(new_pc_pt_wt = round(new_pc_pt_wt, 1)) %>%
+  kbl(col.names = c("CRH Flag", "Month", "Average New Pat. WT")) %>%
+  kable_classic("striped",
+      full_width = FALSE, font_size = 16) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## DiD Plot  
+
+```{r}
+did_plot_df <- tibble(
+  label_name = c("No PC CRH", "PC CRH", "PC CRH (Counterfactual)",
+                 "No PC CRH", "PC CRH", "PC CRH (Counterfactual)"),
+  timepoint = c("September, 2019", "September, 2019", "September, 2019",
+                "February, 2020", "February, 2020", "February, 2020"),
+  value = c(noCrh_sep, crh_sep, crh_sep,
+            noCrh_feb, crh_feb, 
+              (crh_sep + (noCrh_feb - noCrh_sep)))) %>%
+  mutate(timepoint = factor(timepoint,
+                            ordered = TRUE,
+                            levels = c("September, 2019", "February, 2020")))
+#
+ggplot(data = did_plot_df,
+       aes(x = timepoint, y = value, group = label_name, color = label_name)) +
+  geom_line(size = 1.5) +
+  scale_y_continuous(limits = c(plyr::round_any(min(did_plot_df$value), 5, floor), 
+                                plyr::round_any(max(did_plot_df$value), 5, ceiling)),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.position = "right",
+        axis.title.x = element_blank()) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  geom_segment(aes(x = 2.02, xend = 2.02,
+                   y = (crh_sep + (noCrh_feb - noCrh_sep)), 
+                   yend = crh_feb),
+               color = "black",
+               arrow = arrow(angle = 90, ends = "both", length = unit(0.125, "cm"))) +
+  geom_curve(aes(x = 2.3, xend = 2.05,
+                 y = (crh_sep + (noCrh_feb - noCrh_sep)) - 0.85,
+                 yend = (crh_sep + (noCrh_feb - noCrh_sep)) + (crh_feb - (crh_sep + (noCrh_feb - noCrh_sep)))/2),
+             color = "black",
+             arrow = arrow(type = "closed", length = unit(0.25, "cm"))) +
+  annotate("text",
+           x = 2.125, y = (crh_sep + (noCrh_feb - noCrh_sep)) - 1,
+           label = "{Difference-in-Differences}") +
+  labs(y = "New Patient Wait Time (days)")
+```
+
+## Regression  
+
+```{r}
+foo <- new_pt_wt %>%
+  mutate(february2020 = if_else(vssc_month == ymd("2020-02-01"), 1, 0),
+         did = february2020 * at_least_10_pc_crh_flag)
+#
+didreg = lm(new_pc_pt_wt ~ at_least_10_pc_crh_flag*february2020, data = foo)
+summary(didreg)
+```
+
+
+# 2A: All Sta5as meeting inclusion criteria for all first 6 months of FY20   
+```{r}
+included_sta5as <- crh_flag %>%
+  filter(first_6_mos_w_10_flag == TRUE) %>%
+  select(sta5a) %>%
+  inner_join(., ps_matched) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a, at_least_10_pc_crh_flag)
+#----------------------------------------------------------
+new_pt_wt <- access_metrics %>%
+  select(sta5a, vssc_month, new_pc_pt_wt) %>%
+  inner_join(., included_sta5as) %>%
+  filter(vssc_month %in% c(ymd("2019-09-01"), ymd("2020-02-01"))) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH")))
+```
+
+* There were `r nrow(included_sta5as) / 2` sta5as that met inclusion criteria for all first 6 months of FY20  
+
+## Distribution of New Patient Wait Times    
+```{r}
+p1 <- new_pt_wt %>%
+  filter(vssc_month == ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(x = new_pc_pt_wt, 
+             fill = crh_flag, 
+             group = crh_flag)) +
+  geom_histogram(aes(y=c(..count..[..group..==1]/sum(..count..[..group..==1]),
+                         ..count..[..group..==2]/sum(..count..[..group..==2]))),
+                 position = "dodge",
+                 bins = 25) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  scale_x_continuous(limits = c(0, 75)) +
+  labs(x = "New Patient Wait Time",
+       y = "Proportion of Sta5as",
+       title = "September, 2019") +
+  theme(legend.title = element_blank())
+#--
+p2 <- new_pt_wt %>%
+  filter(vssc_month != ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(x = new_pc_pt_wt, 
+             fill = crh_flag, 
+             group = crh_flag)) +
+  geom_histogram(aes(y=c(..count..[..group..==1]/sum(..count..[..group..==1]),
+                         ..count..[..group..==2]/sum(..count..[..group..==2]))),
+                 position = "dodge",
+                 bins = 25) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  scale_x_continuous(limits = c(0, 75)) +
+  labs(x = "New Patient Wait Time",
+       y = "Proportion of Sta5as",
+       title = "February, 2020") +
+  theme(legend.title = element_blank())
+#
+multiplot(p1, p2, cols = 2)
+```
+
+```{r}
+p1 <- new_pt_wt %>%
+  filter(vssc_month == ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(y = new_pc_pt_wt, 
+             fill = crh_flag, 
+             x = crh_flag)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time",
+       title = "September, 2019")
+#
+p2 <- new_pt_wt %>%
+  filter(vssc_month != ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(y = new_pc_pt_wt, 
+             fill = crh_flag, 
+             x = crh_flag)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time",
+       title = "February, 2020")
+#
+multiplot(p1, p2, cols = 2)
+```
+
+
+```{r}
+differences <- new_pt_wt %>%
+  group_by(crh_flag, vssc_month) %>%
+  summarise(new_pc_pt_wt = mean(new_pc_pt_wt, na.rm = T)) %>%
+  mutate(vssc_month = format(vssc_month, "%b, %Y"))
+#
+crh_sep <- differences[3,3] %>% pull
+crh_feb <- differences[4,3] %>% pull
+noCrh_sep <- differences[1,3] %>% pull
+noCrh_feb <- differences[2,3] %>% pull
+#
+foo <- tibble(
+  crh_flag = rep("PC CRH (counterfactual)", 2),
+  vssc_month = c(format(ymd("2019-09-01"), "%b, %Y"),
+                 format(ymd("2020-02-01"), "%b, %Y")),
+  new_pc_pt_wt = c(crh_sep, (crh_sep + (noCrh_feb - noCrh_sep)))
+)
+#
+differences %>%
+  bind_rows(., foo) %>%
+  mutate(new_pc_pt_wt = round(new_pc_pt_wt, 1)) %>%
+  kbl(col.names = c("CRH Flag", "Month", "Average New Pat. WT")) %>%
+  kable_classic("striped",
+      full_width = FALSE, font_size = 16) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## DiD Plot  
+
+```{r}
+did_plot_df <- tibble(
+  label_name = c("No PC CRH", "PC CRH", "PC CRH (Counterfactual)",
+                 "No PC CRH", "PC CRH", "PC CRH (Counterfactual)"),
+  timepoint = c("September, 2019", "September, 2019", "September, 2019",
+                "February, 2020", "February, 2020", "February, 2020"),
+  value = c(noCrh_sep, crh_sep, crh_sep,
+            noCrh_feb, crh_feb, 
+              (crh_sep + (noCrh_feb - noCrh_sep)))) %>%
+  mutate(timepoint = factor(timepoint,
+                            ordered = TRUE,
+                            levels = c("September, 2019", "February, 2020")))
+#
+ggplot(data = did_plot_df,
+       aes(x = timepoint, y = value, group = label_name, color = label_name)) +
+  geom_line(size = 1.5) +
+  scale_y_continuous(limits = c(plyr::round_any(min(did_plot_df$value), 5, floor), 
+                                plyr::round_any(max(did_plot_df$value), 5, ceiling)),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.position = "right",
+        axis.title.x = element_blank()) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  geom_segment(aes(x = 2.02, xend = 2.02,
+                   y = (crh_sep + (noCrh_feb - noCrh_sep)), 
+                   yend = crh_feb),
+               color = "black",
+               arrow = arrow(angle = 90, ends = "both", length = unit(0.125, "cm"))) +
+  geom_curve(aes(x = 2.3, xend = 2.05,
+                 y = (crh_sep + (noCrh_feb - noCrh_sep)) - 0.85,
+                 yend = (crh_sep + (noCrh_feb - noCrh_sep)) + (crh_feb - (crh_sep + (noCrh_feb - noCrh_sep)))/2),
+             color = "black",
+             arrow = arrow(type = "closed", length = unit(0.25, "cm"))) +
+  annotate("text",
+           x = 2.125, y = (crh_sep + (noCrh_feb - noCrh_sep)) - 1,
+           label = "{Difference-in-Differences}") +
+  labs(y = "New Patient Wait Time (days)")
+```
+
+
+## Regression  
+
+```{r}
+foo <- new_pt_wt %>%
+  mutate(february2020 = if_else(vssc_month == ymd("2020-02-01"), 1, 0),
+         did = february2020 * at_least_10_pc_crh_flag)
+#
+didreg = lm(new_pc_pt_wt ~ at_least_10_pc_crh_flag*february2020, data = foo)
+summary(didreg)
+```
+
+
+# 2B: No pilot sites, all Sta5as meeting inclusion criteria for all first 6 months of FY20   
+```{r}
+included_sta5as <- crh_flag %>%
+  filter(first_6_mos_w_10_flag == TRUE
+         & sta5a %ni% pilot_sites$sta5a) %>%
+  select(sta5a) %>%
+  inner_join(., ps_matched) %>%
+  select(subclass) %>%
+  inner_join(., ps_matched) %>%
+  select(sta5a, at_least_10_pc_crh_flag)
+#----------------------------------------------------------
+new_pt_wt <- access_metrics %>%
+  select(sta5a, vssc_month, new_pc_pt_wt) %>%
+  inner_join(., included_sta5as) %>%
+  filter(vssc_month %in% c(ymd("2019-09-01"), ymd("2020-02-01"))) %>%
+  mutate(crh_flag = factor(if_else(at_least_10_pc_crh_flag == 1, "PC CRH", "No PC CRH")))
+```
+
+* There were `r nrow(included_sta5as) / 2` non-pilot sta5as that met inclusion criteria for all first 6 months of FY20  
+
+## Distribution of New Patient Wait Times    
+
+```{r}
+p1 <- new_pt_wt %>%
+  filter(vssc_month == ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(x = new_pc_pt_wt, 
+             fill = crh_flag, 
+             group = crh_flag)) +
+  geom_histogram(aes(y=c(..count..[..group..==1]/sum(..count..[..group..==1]),
+                         ..count..[..group..==2]/sum(..count..[..group..==2]))),
+                 position = "dodge",
+                 bins = 22) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  scale_x_continuous(limits = c(0, 75)) +
+  labs(x = "New Patient Wait Time",
+       y = "Proportion of Sta5as",
+       title = "September, 2019") +
+  theme(legend.title = element_blank())
+#--
+p2 <- new_pt_wt %>%
+  filter(vssc_month != ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(x = new_pc_pt_wt, 
+             fill = crh_flag, 
+             group = crh_flag)) +
+  geom_histogram(aes(y=c(..count..[..group..==1]/sum(..count..[..group..==1]),
+                         ..count..[..group..==2]/sum(..count..[..group..==2]))),
+                 position = "dodge",
+                 bins = 22) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  scale_x_continuous(limits = c(0, 75)) +
+  labs(x = "New Patient Wait Time",
+       y = "Proportion of Sta5as",
+       title = "February, 2020") +
+  theme(legend.title = element_blank())
+#
+multiplot(p1, p2, cols = 2)
+```
+
+```{r}
+p1 <- new_pt_wt %>%
+  filter(vssc_month == ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(y = new_pc_pt_wt, 
+             fill = crh_flag, 
+             x = crh_flag)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time",
+       title = "September, 2019")
+#
+p2 <- new_pt_wt %>%
+  filter(vssc_month != ymd("2019-09-01")) %>%
+  ggplot(data = .,
+         aes(y = new_pc_pt_wt, 
+             fill = crh_flag, 
+             x = crh_flag)) +
+  geom_boxplot() +
+  ggsci::scale_fill_nejm() +
+  theme(legend.position = "none",
+        axis.title.x = element_blank()) +
+  labs(y = "New Patient Wait Time",
+       title = "February, 2020")
+#
+multiplot(p1, p2, cols = 2)
+```
+
+
+```{r}
+differences <- new_pt_wt %>%
+  group_by(crh_flag, vssc_month) %>%
+  summarise(new_pc_pt_wt = mean(new_pc_pt_wt, na.rm = T)) %>%
+  mutate(vssc_month = format(vssc_month, "%b, %Y"))
+#
+crh_sep <- differences[3,3] %>% pull
+crh_feb <- differences[4,3] %>% pull
+noCrh_sep <- differences[1,3] %>% pull
+noCrh_feb <- differences[2,3] %>% pull
+#
+foo <- tibble(
+  crh_flag = rep("PC CRH (counterfactual)", 2),
+  vssc_month = c(format(ymd("2019-09-01"), "%b, %Y"),
+                 format(ymd("2020-02-01"), "%b, %Y")),
+  new_pc_pt_wt = c(crh_sep, (crh_sep + (noCrh_feb - noCrh_sep)))
+)
+#
+differences %>%
+  bind_rows(., foo) %>%
+  mutate(new_pc_pt_wt = round(new_pc_pt_wt, 1)) %>%
+  kbl(col.names = c("CRH Flag", "Month", "Average New Pat. WT")) %>%
+  kable_classic("striped",
+      full_width = FALSE, font_size = 16) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## DiD Plot  
+
+```{r}
+did_plot_df <- tibble(
+  label_name = c("No PC CRH", "PC CRH", "PC CRH (Counterfactual)",
+                 "No PC CRH", "PC CRH", "PC CRH (Counterfactual)"),
+  timepoint = c("September, 2019", "September, 2019", "September, 2019",
+                "February, 2020", "February, 2020", "February, 2020"),
+  value = c(noCrh_sep, crh_sep, crh_sep,
+            noCrh_feb, crh_feb, 
+              (crh_sep + (noCrh_feb - noCrh_sep)))) %>%
+  mutate(timepoint = factor(timepoint,
+                            ordered = TRUE,
+                            levels = c("September, 2019", "February, 2020")))
+#
+ggplot(data = did_plot_df,
+       aes(x = timepoint, y = value, group = label_name, color = label_name)) +
+  geom_line(size = 1.5) +
+  scale_y_continuous(limits = c(plyr::round_any(min(did_plot_df$value), 5, floor), 
+                                plyr::round_any(max(did_plot_df$value), 5, ceiling)),
+                     labels = scales::comma_format(accuracy = 1)) +
+  theme(legend.position = "right",
+        axis.title.x = element_blank()) +
+  guides(color = guide_legend(override.aes = list(size = 3))) +
+  geom_segment(aes(x = 2.02, xend = 2.02,
+                   y = (crh_sep + (noCrh_feb - noCrh_sep)), 
+                   yend = crh_feb),
+               color = "black",
+               arrow = arrow(angle = 90, ends = "both", length = unit(0.125, "cm"))) +
+  geom_curve(aes(x = 2.3, xend = 2.05,
+                 y = (crh_sep + (noCrh_feb - noCrh_sep)) - 4.85,
+                 yend = (crh_sep + (noCrh_feb - noCrh_sep)) + (crh_feb - (crh_sep + (noCrh_feb - noCrh_sep)))/2),
+             color = "black",
+             arrow = arrow(type = "closed", length = unit(0.25, "cm"))) +
+  annotate("text",
+           x = 2.125, y = (crh_sep + (noCrh_feb - noCrh_sep)) - 5,
+           label = "{Difference-in-Differences}") +
+  labs(y = "New Patient Wait Time (days)")
+```
+
+
+## Regression  
+
+```{r}
+foo <- new_pt_wt %>%
+  mutate(february2020 = if_else(vssc_month == ymd("2020-02-01"), 1, 0),
+         did = february2020 * at_least_10_pc_crh_flag)
+#
+didreg = lm(new_pc_pt_wt ~ at_least_10_pc_crh_flag*february2020, data = foo)
+summary(didreg)
+```

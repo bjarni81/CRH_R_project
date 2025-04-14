@@ -1,0 +1,607 @@
+---
+title: "CRH Encounters & PC CC Referrals Plotted Together"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+pactcc_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "PACT_CC",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#
+every_nth = function(n) {
+  return(function(x) {x[c(TRUE, rep(FALSE, n - 1))]})
+}
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+#source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+t.test2 <- function(m1, m2, s1, s2, n1, n2, m0=0, equal.variances = FALSE){
+  if(equal.variances == FALSE)
+  {
+    se <- round(sqrt((s1 ^ 2 / n1) + (s2^2 / n2)), 8)
+    #welch-satterwaithe df
+    df <- ((s1^2 / n1 + s2 ^ 2 / n2) ^2 ) / ((s1 ^ 2 / n1) ^ 2 / (n1 - 1) + (s2 ^ 2 / n2) ^ 2 / (n2 - 1))
+  }
+  else
+  {
+    se <- sqrt((1 / n1 + 1/ n2) * ((n1 - 1) * s1^2 +(n2-1) * s2^2) / (n1 + n2 - 2))
+    df <- n1 + n2 - 2
+  }
+  t <- round((m1 - m2 - m0)/ se, 4)
+  se <- round(se, 4)
+  mean_diff <- round((m1 - m2), 4)
+  pval <- if_else(2*pt(-abs(t), df) < 0.00001, "<0.00001", as.character(2*pt(-abs(t), df)))
+  dat <- c(mean_diff, se, t, pval)
+  names(dat) <- c("difference_of_means", "std_Error", "t", "p_value")
+  return(dat)
+}
+```
+
+
+
+```{r cdw_cc_refs}
+cc_refs_cdw <- dbGetQuery(oabi_con,
+                          "--
+select count(*) as referral_count
+	, actyMonth, non_va, stopCode_group
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+group by actyMonth, non_va, stopCode_group") %>%
+  mutate(actyMonth = ymd(actyMonth),
+         fy = if_else(month(actyMonth) > 9, year(actyMonth) + 1, year(actyMonth))) %>%
+  filter(actyMonth < ymd("2022-10-01")
+         & actyMonth > ymd("2017-12-01"))
+#
+non_va_cc_refs <- cc_refs_cdw %>%
+  filter(non_va == 1) %>%
+  rename(non_va_referral_count = referral_count) %>%
+  select(-non_va)
+#
+yes_va_cc_refs <- cc_refs_cdw %>%
+  filter(non_va == 0) %>%
+  rename(yes_va_referral_count = referral_count) %>%
+  select(-non_va)
+#--
+cc_ref_totals <- non_va_cc_refs %>%
+  left_join(., yes_va_cc_refs) %>%
+  mutate(total_referrals = yes_va_referral_count + non_va_referral_count,
+         non_va_as_prop_of_total = non_va_referral_count / total_referrals)
+```
+
+# Total Referrals over time  
+
+```{r}
+cc_ref_totals %>%
+  select(actyMonth, total_referrals, stopCode_group) %>%
+  mutate(stopCode_group = fct_reorder(stopCode_group, total_referrals, tail, n = 1, .desc = TRUE)) %>%
+  ggplot(data = .,
+         aes(x = actyMonth, y = total_referrals, group = stopCode_group, color = stopCode_group)) +
+  geom_line(size = 1) +
+  scale_y_continuous(labels = comma_format(accuracy = 1),
+                     limits = c(0, NA)) +
+  labs(x = "Month of Referral",
+       y = "Total Referrals")
+
+#
+yes_va_cc_refs %>%
+  rename(referral_count = yes_va_referral_count) %>%
+  mutate(label = "Yes VA") %>%
+  bind_rows(., non_va_cc_refs %>%
+              rename(referral_count = non_va_referral_count) %>%
+              mutate(label = "Non VA")) %>%
+  ggplot(data = .,
+         aes(x = actyMonth, y = referral_count, group = label, lty = label)) +
+  geom_line(size = 1) +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  facet_wrap(~stopCode_group) +
+  labs(y = "Referrals") +
+  theme(axis.text.x = element_text(angle = 270,
+                                   vjust = 0.3),
+        axis.title.x = element_blank())
+```
+
+# Non-VA Referrals as a Proportion of Total Referrals  
+```{r}
+cc_ref_totals %>%
+  select(actyMonth, non_va_as_prop_of_total, stopCode_group) %>%
+  mutate(stopCode_group = factor(stopCode_group,
+                                 ordered = TRUE, levels = c("Hematology/Oncology", "Urology clinic",
+                                                            "Cardiology", "Primary care"))) %>%
+  ggplot(data = .,
+         aes(x = actyMonth, y = non_va_as_prop_of_total, group = stopCode_group, color = stopCode_group)) +
+  geom_line(size = 1) +
+  scale_y_continuous(labels = percent_format(accuracy = 1),
+                     limits = c(0, 1)) +
+  labs(x = "Month of Referral",
+       y = "Proportion of Referrals That Are Non-VA") +
+  ggsci::scale_color_aaas()
+```
+
+# Tables  
+
+## Primary Care  
+```{r pc_total_referrals}
+total_refs_by_nonVA <- dbGetQuery(oabi_con,
+           "select count(*) as referral_count, stopCode_group, non_va
+           from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+           group by stopCode_group, non_va") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_total <- total_refs_by_nonVA %>%
+  filter(stopCode_group == "Primary care")
+#
+pc_total_refs_table <- tibble(
+  name = "Total Referrals",
+  yes_va = comma(pc_refs_total[[1]][1], accuracy = 1),
+  non_va = comma(pc_refs_total[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+uniques_by_nonVA <- dbGetQuery(oabi_con,
+           "select count(distinct scrssn) as referral_count, stopCode_group, non_va
+           from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+           group by stopCode_group, non_va") %>%
+  arrange(stopCode_group, non_va)
+#
+uniques_pc <- uniques_by_nonVA %>%
+  filter(stopCode_group == "Primary care")
+# 
+pc_uniques_table <- tibble(
+  name = "Uniques Receiving Referrals",
+  yes_va = comma(uniques_pc[[1]][1], accuracy = 1),
+  non_va = comma(uniques_pc[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+refs_by_urh <- dbGetQuery(oabi_con,
+           "with CTE as(
+	select *, urban_flag = case when urh = 'U' then 1 else 0 end
+	from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+	)
+select AVG(cast(urban_flag as float)) as avg_urban
+	, STDEV(urban_flag) as sd_urban
+	, sum(urban_flag) as sum_urban
+	, non_va, stopCode_group
+from CTE
+group by non_va, stopCode_group
+") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_urh1 <- refs_by_urh %>%
+  filter(stopCode_group == "Primary care")
+#
+urh_pc_ttest <- t.test2(pc_refs_urh1[[1]][1], pc_refs_urh1[[1]][2],
+                        pc_refs_urh1[[2]][1], pc_refs_urh1[[2]][2],
+                        pc_refs_urh1[[3]][1], pc_refs_urh1[[3]][2])
+#
+pc_refs_urh <- pc_refs_urh1  %>%
+  mutate_at(c(1, 2), ~percent(., accuracy = 0.1))
+#
+pc_urh_table <- tibble(
+  name = "Urban Patients % (SD)",
+  yes_va = paste0(pc_refs_urh[[1]][1], " (", pc_refs_urh[[2]][1], ")"),
+  non_va = paste0(pc_refs_urh[[1]][2], " (", pc_refs_urh[[2]][2], ")"),
+  p_val = urh_pc_ttest[4]
+)
+#####
+refs_by_dta <- dbGetQuery(oabi_con,
+                          "
+  select AVG(cast(dta as float)) as avg_dta
+	, STDEV(dta) as sd_dta
+	, count(*) as sum_dta
+	, non_va, stopCode_group
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+group by non_va, stopCode_group") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_dta <- refs_by_dta %>%
+  filter(stopCode_group == "Primary care")
+#
+dta_pc_ttest <- t.test2(pc_refs_dta[[1]][1], pc_refs_dta[[1]][2],
+                        pc_refs_dta[[2]][1], pc_refs_dta[[2]][2],
+                        pc_refs_dta[[3]][1], pc_refs_dta[[3]][2])
+#
+pc_dta_table <- tibble(
+  name = "Days to Approved (SD)",
+  yes_va = paste0(comma(pc_refs_dta[[1]][1], accuracy = 0.1), " (", comma(pc_refs_dta[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(pc_refs_dta[[1]][2], accuracy = 0.1), " (", comma(pc_refs_dta[[2]][2], accuracy = 0.1), ")"),
+  p_val = dta_pc_ttest[4]
+)
+#####
+refs_by_dts <- dbGetQuery(oabi_con,
+                          "
+  select AVG(cast(dts as float)) as avg_dts
+	, STDEV(dts) as sd_dts
+	, count(*) as sum_dts
+	, non_va, stopCode_group
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+group by non_va, stopCode_group") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_dts <- refs_by_dts %>%
+  filter(stopCode_group == "Primary care")
+#
+dts_pc_ttest <- t.test2(pc_refs_dts[[1]][1], pc_refs_dts[[1]][2],
+                        pc_refs_dts[[2]][1], pc_refs_dts[[2]][2],
+                        pc_refs_dts[[3]][1], pc_refs_dts[[3]][2])
+#
+pc_dts_table <- tibble(
+  name = "Days to Scheduled (SD)",
+  yes_va = paste0(comma(pc_refs_dts[[1]][1], accuracy = 0.1), " (", comma(pc_refs_dts[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(pc_refs_dts[[1]][2], accuracy = 0.1), " (", comma(pc_refs_dts[[2]][2], accuracy = 0.1), ")"),
+  p_val = dts_pc_ttest[4]
+)
+
+#####
+refs_by_dtc <- dbGetQuery(oabi_con,
+                          "
+  select AVG(cast(dtc as float)) as avg_dtc
+	, STDEV(dtc) as sd_dtc
+	, count(*) as sum_dtc
+	, non_va, stopCode_group
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+group by non_va, stopCode_group") %>%
+  arrange(stopCode_group, non_va)
+#
+pc_refs_dtc <- refs_by_dtc %>%
+  filter(stopCode_group == "Primary care")
+#
+dtc_pc_ttest <- t.test2(pc_refs_dtc[[1]][1], pc_refs_dtc[[1]][2],
+                        pc_refs_dtc[[2]][1], pc_refs_dtc[[2]][2],
+                        pc_refs_dtc[[3]][1], pc_refs_dtc[[3]][2])
+#
+pc_dtc_table <- tibble(
+  name = "Days to Completed (SD)",
+  yes_va = paste0(comma(pc_refs_dtc[[1]][1], accuracy = 0.1), " (", comma(pc_refs_dtc[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(pc_refs_dtc[[1]][2], accuracy = 0.1), " (", comma(pc_refs_dtc[[2]][2], accuracy = 0.1), ")"),
+  p_val = dtc_pc_ttest[4]
+)
+
+#####
+foo <- ls(pattern = "_table")
+do.call(bind_rows, mget(foo)) %>%
+  mutate(name = factor(name, 
+                       ordered = TRUE,
+                       levels = c("Total Referrals", "Uniques Receiving Referrals",
+                                  "Urban Patients % (SD)", "Days to Approved (SD)", 
+                                  "Days to Scheduled (SD)", "Days to Completed (SD)"))) %>%
+  arrange(name) %>%
+  kbl(col.names = c("", "Yes VA", "Non-VA", "p-value"),
+      align = c("l", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## Cardiology    
+```{r cardio_total_referrals}
+cardio_refs_total <- total_refs_by_nonVA %>%
+  filter(stopCode_group == "Cardiology")
+#
+cardio_total_refs_table <- tibble(
+  name = "Total Referrals",
+  yes_va = comma(cardio_refs_total[[1]][1], accuracy = 1),
+  non_va = comma(cardio_refs_total[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+uniques_cardio <- uniques_by_nonVA %>%
+  filter(stopCode_group == "Cardiology")
+# 
+cardio_uniques_table <- tibble(
+  name = "Uniques Receiving Referrals",
+  yes_va = comma(uniques_cardio[[1]][1], accuracy = 1),
+  non_va = comma(uniques_cardio[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+cardio_refs_urh1 <- refs_by_urh %>%
+  filter(stopCode_group == "Cardiology")
+#
+urh_cardio_ttest <- t.test2(cardio_refs_urh1[[1]][1], cardio_refs_urh1[[1]][2],
+                        cardio_refs_urh1[[2]][1], cardio_refs_urh1[[2]][2],
+                        cardio_refs_urh1[[3]][1], cardio_refs_urh1[[3]][2])
+#
+cardio_refs_urh <- cardio_refs_urh1  %>%
+  mutate_at(c(1, 2), ~percent(., accuracy = 0.1))
+#
+cardio_urh_table <- tibble(
+  name = "Urban Patients % (SD)",
+  yes_va = paste0(cardio_refs_urh[[1]][1], " (", cardio_refs_urh[[2]][1], ")"),
+  non_va = paste0(cardio_refs_urh[[1]][2], " (", cardio_refs_urh[[2]][2], ")"),
+  p_val = urh_cardio_ttest[4]
+)
+#####
+cardio_refs_dta <- refs_by_dta %>%
+  filter(stopCode_group == "Cardiology")
+#
+dta_cardio_ttest <- t.test2(cardio_refs_dta[[1]][1], cardio_refs_dta[[1]][2],
+                        cardio_refs_dta[[2]][1], cardio_refs_dta[[2]][2],
+                        cardio_refs_dta[[3]][1], cardio_refs_dta[[3]][2])
+#
+cardio_dta_table <- tibble(
+  name = "Days to Approved (SD)",
+  yes_va = paste0(comma(cardio_refs_dta[[1]][1], accuracy = 0.1), " (", comma(cardio_refs_dta[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(cardio_refs_dta[[1]][2], accuracy = 0.1), " (", comma(cardio_refs_dta[[2]][2], accuracy = 0.1), ")"),
+  p_val = dta_cardio_ttest[4]
+)
+#####
+cardio_refs_dts <- refs_by_dts %>%
+  filter(stopCode_group == "Cardiology")
+#
+dts_cardio_ttest <- t.test2(cardio_refs_dts[[1]][1], cardio_refs_dts[[1]][2],
+                        cardio_refs_dts[[2]][1], cardio_refs_dts[[2]][2],
+                        cardio_refs_dts[[3]][1], cardio_refs_dts[[3]][2])
+#
+cardio_dts_table <- tibble(
+  name = "Days to Scheduled (SD)",
+  yes_va = paste0(comma(cardio_refs_dts[[1]][1], accuracy = 0.1), " (", comma(cardio_refs_dts[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(cardio_refs_dts[[1]][2], accuracy = 0.1), " (", comma(cardio_refs_dts[[2]][2], accuracy = 0.1), ")"),
+  p_val = dts_cardio_ttest[4]
+)
+
+#####
+cardio_refs_dtc <- refs_by_dtc %>%
+  filter(stopCode_group == "Cardiology")
+#
+dtc_cardio_ttest <- t.test2(cardio_refs_dtc[[1]][1], cardio_refs_dtc[[1]][2],
+                        cardio_refs_dtc[[2]][1], cardio_refs_dtc[[2]][2],
+                        cardio_refs_dtc[[3]][1], cardio_refs_dtc[[3]][2])
+#
+cardio_dtc_table <- tibble(
+  name = "Days to Completed (SD)",
+  yes_va = paste0(comma(cardio_refs_dtc[[1]][1], accuracy = 0.1), " (", comma(cardio_refs_dtc[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(cardio_refs_dtc[[1]][2], accuracy = 0.1), " (", comma(cardio_refs_dtc[[2]][2], accuracy = 0.1), ")"),
+  p_val = dtc_cardio_ttest[4]
+)
+#####
+foo <- ls(pattern = "^cardio.+table$")
+do.call(bind_rows, mget(foo)) %>%
+  mutate(name = factor(name, 
+                       ordered = TRUE,
+                       levels = c("Total Referrals", "Uniques Receiving Referrals",
+                                  "Urban Patients % (SD)", "Days to Approved (SD)", 
+                                  "Days to Scheduled (SD)", "Days to Completed (SD)"))) %>%
+  arrange(name) %>%
+  kbl(col.names = c("", "Yes VA", "Non-VA", "p-value"),
+      align = c("l", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## Urology      
+```{r uro_total_referrals}
+uro_refs_total <- total_refs_by_nonVA %>%
+  filter(stopCode_group == "Urology clinic")
+#
+uro_total_refs_table <- tibble(
+  name = "Total Referrals",
+  yes_va = comma(uro_refs_total[[1]][1], accuracy = 1),
+  non_va = comma(uro_refs_total[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+uniques_uro <- uniques_by_nonVA %>%
+  filter(stopCode_group == "Urology clinic")
+# 
+uro_uniques_table <- tibble(
+  name = "Uniques Receiving Referrals",
+  yes_va = comma(uniques_uro[[1]][1], accuracy = 1),
+  non_va = comma(uniques_uro[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+uro_refs_urh1 <- refs_by_urh %>%
+  filter(stopCode_group == "Urology clinic")
+#
+urh_uro_ttest <- t.test2(uro_refs_urh1[[1]][1], uro_refs_urh1[[1]][2],
+                        uro_refs_urh1[[2]][1], uro_refs_urh1[[2]][2],
+                        uro_refs_urh1[[3]][1], uro_refs_urh1[[3]][2])
+#
+uro_refs_urh <- uro_refs_urh1  %>%
+  mutate_at(c(1, 2), ~percent(., accuracy = 0.1))
+#
+uro_urh_table <- tibble(
+  name = "Urban Patients % (SD)",
+  yes_va = paste0(uro_refs_urh[[1]][1], " (", uro_refs_urh[[2]][1], ")"),
+  non_va = paste0(uro_refs_urh[[1]][2], " (", uro_refs_urh[[2]][2], ")"),
+  p_val = urh_uro_ttest[4]
+)
+#####
+uro_refs_dta <- refs_by_dta %>%
+  filter(stopCode_group == "Urology clinic")
+#
+dta_uro_ttest <- t.test2(uro_refs_dta[[1]][1], uro_refs_dta[[1]][2],
+                        uro_refs_dta[[2]][1], uro_refs_dta[[2]][2],
+                        uro_refs_dta[[3]][1], uro_refs_dta[[3]][2])
+#
+uro_dta_table <- tibble(
+  name = "Days to Approved (SD)",
+  yes_va = paste0(comma(uro_refs_dta[[1]][1], accuracy = 0.1), " (", comma(uro_refs_dta[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(uro_refs_dta[[1]][2], accuracy = 0.1), " (", comma(uro_refs_dta[[2]][2], accuracy = 0.1), ")"),
+  p_val = dta_uro_ttest[4]
+)
+#####
+uro_refs_dts <- refs_by_dts %>%
+  filter(stopCode_group == "Urology clinic")
+#
+dts_uro_ttest <- t.test2(uro_refs_dts[[1]][1], uro_refs_dts[[1]][2],
+                        uro_refs_dts[[2]][1], uro_refs_dts[[2]][2],
+                        uro_refs_dts[[3]][1], uro_refs_dts[[3]][2])
+#
+uro_dts_table <- tibble(
+  name = "Days to Scheduled (SD)",
+  yes_va = paste0(comma(uro_refs_dts[[1]][1], accuracy = 0.1), " (", comma(uro_refs_dts[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(uro_refs_dts[[1]][2], accuracy = 0.1), " (", comma(uro_refs_dts[[2]][2], accuracy = 0.1), ")"),
+  p_val = dts_uro_ttest[4]
+)
+
+#####
+uro_refs_dtc <- refs_by_dtc %>%
+  filter(stopCode_group == "Urology clinic")
+#
+dtc_uro_ttest <- t.test2(uro_refs_dtc[[1]][1], uro_refs_dtc[[1]][2],
+                        uro_refs_dtc[[2]][1], uro_refs_dtc[[2]][2],
+                        uro_refs_dtc[[3]][1], uro_refs_dtc[[3]][2])
+#
+uro_dtc_table <- tibble(
+  name = "Days to Completed (SD)",
+  yes_va = paste0(comma(uro_refs_dtc[[1]][1], accuracy = 0.1), " (", comma(uro_refs_dtc[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(uro_refs_dtc[[1]][2], accuracy = 0.1), " (", comma(uro_refs_dtc[[2]][2], accuracy = 0.1), ")"),
+  p_val = dtc_uro_ttest[4]
+)
+
+#####
+foo <- ls(pattern = "^uro.+table$")
+do.call(bind_rows, mget(foo)) %>%
+  mutate(name = factor(name, 
+                       ordered = TRUE,
+                       levels = c("Total Referrals", "Uniques Receiving Referrals",
+                                  "Urban Patients % (SD)", "Days to Approved (SD)", 
+                                  "Days to Scheduled (SD)", "Days to Completed (SD)"))) %>%
+  arrange(name) %>%
+  kbl(col.names = c("", "Yes VA", "Non-VA", "p-value"),
+      align = c("l", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+## Hematology/Oncology        
+```{r onco_total_referrals}
+onco_refs_total <- total_refs_by_nonVA %>%
+  filter(stopCode_group == "Hematology/Oncology")
+#
+onco_total_refs_table <- tibble(
+  name = "Total Referrals",
+  yes_va = comma(onco_refs_total[[1]][1], accuracy = 1),
+  non_va = comma(onco_refs_total[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+uniques_onco <- uniques_by_nonVA %>%
+  filter(stopCode_group == "Hematology/Oncology")
+# 
+onco_uniques_table <- tibble(
+  name = "Uniques Receiving Referrals",
+  yes_va = comma(uniques_onco[[1]][1], accuracy = 1),
+  non_va = comma(uniques_onco[[1]][2], accuracy = 1),
+  p_val = "N/A"
+)
+#####
+onco_refs_urh1 <- refs_by_urh %>%
+  filter(stopCode_group == "Hematology/Oncology")
+#
+urh_onco_ttest <- t.test2(onco_refs_urh1[[1]][1], onco_refs_urh1[[1]][2],
+                        onco_refs_urh1[[2]][1], onco_refs_urh1[[2]][2],
+                        onco_refs_urh1[[3]][1], onco_refs_urh1[[3]][2])
+#
+onco_refs_urh <- onco_refs_urh1  %>%
+  mutate_at(c(1, 2), ~percent(., accuracy = 0.1))
+#
+onco_urh_table <- tibble(
+  name = "Urban Patients % (SD)",
+  yes_va = paste0(onco_refs_urh[[1]][1], " (", onco_refs_urh[[2]][1], ")"),
+  non_va = paste0(onco_refs_urh[[1]][2], " (", onco_refs_urh[[2]][2], ")"),
+  p_val = urh_onco_ttest[4]
+)
+#####
+onco_refs_dta <- refs_by_dta %>%
+  filter(stopCode_group == "Hematology/Oncology")
+#
+dta_onco_ttest <- t.test2(onco_refs_dta[[1]][1], onco_refs_dta[[1]][2],
+                        onco_refs_dta[[2]][1], onco_refs_dta[[2]][2],
+                        onco_refs_dta[[3]][1], onco_refs_dta[[3]][2])
+#
+onco_dta_table <- tibble(
+  name = "Days to Approved (SD)",
+  yes_va = paste0(comma(onco_refs_dta[[1]][1], accuracy = 0.1), " (", comma(onco_refs_dta[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(onco_refs_dta[[1]][2], accuracy = 0.1), " (", comma(onco_refs_dta[[2]][2], accuracy = 0.1), ")"),
+  p_val = dta_onco_ttest[4]
+)
+#####
+onco_refs_dts <- refs_by_dts %>%
+  filter(stopCode_group == "Hematology/Oncology")
+#
+dts_onco_ttest <- t.test2(onco_refs_dts[[1]][1], onco_refs_dts[[1]][2],
+                        onco_refs_dts[[2]][1], onco_refs_dts[[2]][2],
+                        onco_refs_dts[[3]][1], onco_refs_dts[[3]][2])
+#
+onco_dts_table <- tibble(
+  name = "Days to Scheduled (SD)",
+  yes_va = paste0(comma(onco_refs_dts[[1]][1], accuracy = 0.1), " (", comma(onco_refs_dts[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(onco_refs_dts[[1]][2], accuracy = 0.1), " (", comma(onco_refs_dts[[2]][2], accuracy = 0.1), ")"),
+  p_val = dts_onco_ttest[4]
+)
+
+#####
+onco_refs_dtc <- refs_by_dtc %>%
+  filter(stopCode_group == "Hematology/Oncology")
+#
+dtc_onco_ttest <- t.test2(onco_refs_dtc[[1]][1], onco_refs_dtc[[1]][2],
+                        onco_refs_dtc[[2]][1], onco_refs_dtc[[2]][2],
+                        onco_refs_dtc[[3]][1], onco_refs_dtc[[3]][2])
+#
+onco_dtc_table <- tibble(
+  name = "Days to Completed (SD)",
+  yes_va = paste0(comma(onco_refs_dtc[[1]][1], accuracy = 0.1), " (", comma(onco_refs_dtc[[2]][1], accuracy = 0.1), ")"),
+  non_va = paste0(comma(onco_refs_dtc[[1]][2], accuracy = 0.1), " (", comma(onco_refs_dtc[[2]][2], accuracy = 0.1), ")"),
+  p_val = dtc_onco_ttest[4]
+)
+
+#####
+foo <- ls(pattern = "^onco.+table$")
+do.call(bind_rows, mget(foo)) %>%
+  mutate(name = factor(name, 
+                       ordered = TRUE,
+                       levels = c("Total Referrals", "Uniques Receiving Referrals",
+                                  "Urban Patients % (SD)", "Days to Approved (SD)", 
+                                  "Days to Scheduled (SD)", "Days to Completed (SD)"))) %>%
+  arrange(name) %>%
+  kbl(col.names = c("", "Yes VA", "Non-VA", "p-value"),
+      align = c("l", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```

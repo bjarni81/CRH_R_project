@@ -1,0 +1,381 @@
+---
+title: "PC CRH Analysis: PS Matching"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12))
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading_in}
+gap_join_dates <- dbGetQuery(oabi_con,
+                             "with cte as(
+select sta5a, dateadd(MONTH, -1, first_mo_w_mt9_pc_crh) as month_for_joining
+from [OABI_MyVAAccess].[crh_eval].C1_crh_flag
+where crh_10_flag = 1)
+select cte.sta5a
+	, cte.month_for_joining
+from cte as cte
+UNION
+select sta5a
+	, cast('2019-09-01' as date) as month_for_joining
+from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06
+where sta5a NOT IN (select sta5a from [OABI_MyVAAccess].[crh_eval].C1_crh_flag where crh_10_flag = 1)") %>%
+  mutate(month_for_joining = ymd(month_for_joining),
+         month_minus_2 = month_for_joining - months(2))
+#=====
+gap_metric <- read_csv("//vhacdwdwhapp15.vha.med.va.gov/PACT_CC/CRH/Documentation/Gap Metric/GapData_Jan2022.csv") %>%
+  rename_all(tolower) %>%
+  mutate(moyear = ymd(moyear))
+#-----
+gap_avg <- gap_join_dates %>%
+  left_join(., gap_metric, by = c("sta5a" = "sta6a")) %>%
+  filter(moyear >= month_minus_2 & moyear <= month_for_joining) %>%
+  group_by(sta5a) %>%
+  summarise(gap_3mo_avg = mean(gap, na.rm = T))
+#===
+sta5a_demog <- dbGetQuery(oabi_con,
+                          "select vast.sta5a
+	, at_least_10_pc_crh_flag = case	
+		when crh_flag.crh_10_flag = 1 then 1
+		else 0 end
+	, vast.parent_visn
+	, urh = case 
+		when vast.urh_vast = 'U' then 'U'
+		when vast.urh_vast <> 'U' then 'R'
+		end
+	, vast.census_division
+	, vast.s_abbr
+	, vssc.nosos_3mo_avg
+	, vssc.obs_exp_panel_ratio_3mo_avg
+	, vssc.team_pcp_ap_fte_total_3mo_avg
+	, pcmm.pcmm_scrssn_count
+	, access.est_pc_pt_wt_3mo_avg
+	, access.new_pc_pt_wt_3mo_avg
+	, access.third_next_avail_3mo_avg
+	, adi.adi_natRnk_avg
+	, prop_adi_GT_75 = cast(adi2.adi_count_in_76_100 as float) / cast(adi2.adi_count as float)
+	, age.avg_age_oct1_2020
+	, prop_GT_69 = (cast(_70_79_count as float) + cast(_80_plus_count as float)) / cast(total as float)
+	, prop_male = cast(demog.male_count as float) / cast(demog.scrssn_count as float)
+	, prop_white = cast(demog.race_white_count as float) / cast(demog.scrssn_count as float)
+	, prop_rural = cast(demog.urh_rural_count as float) / cast(demog.scrssn_count as float)
+from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06 as vast
+left join [OABI_MyVAAccess].[crh_eval].C1_crh_flag as crh_flag
+	on vast.sta5a = crh_flag.sta5a
+left join [OABI_MyVAAccess].[crh_eval].F1_3_vssc_3mo_avg as vssc
+	on vast.sta5a = vssc.sta5a
+left join [OABI_MyVAAccess].[crh_eval].F2_pcmm_scrssn_count_avg as pcmm
+	on vast.sta5a = pcmm.sta5a
+left join [OABI_MyVAAccess].[crh_eval].F3_access_metrics_3mo_avg as access
+	on vast.sta5a = access.sta5a
+left join [OABI_MyVAAccess].[crh_eval].F4_adi_avg as adi
+	on vast.sta5a = adi.sta5a
+left join [OABI_MyVAAccess].[crh_eval].D3_adi_sta5a_qtr as adi2
+	on vast.sta5a = adi2.sta5a
+left join [OABI_MyVAAccess].[crh_eval].D1_age_sta5a_qtr as age
+	on vast.sta5a = age.Sta5a
+left join [OABI_MyVAAccess].[crh_eval].D2_race_gender_urh_count as demog
+	on vast.sta5a = demog.Sta5a
+where age.FY = 2020 AND age.QTR = 1
+	AND demog.fy = 2020 AND demog.qtr = 1
+	AND adi2.fy = 2020 AND adi2.qtr = 1") %>%
+  mutate(parent_visn = factor(parent_visn),
+         adi_cat = case_when(adi_natRnk_avg < 25 ~ "0-24",
+                             adi_natRnk_avg >= 25 & adi_natRnk_avg < 50 ~ "25-49",
+                             adi_natRnk_avg >= 50 & adi_natRnk_avg < 75 ~ "50-74",
+                             adi_natRnk_avg >= 75 ~ "75-100"),
+         treat = if_else(at_least_10_pc_crh_flag == 1, 0, 1),
+         s_abbr2 = case_when(s_abbr %in% c("MSCBOC", "PCCBOC") ~ "CBOC",
+                             s_abbr %in% c("HCC", "VAMC") ~ "VAMC/HCC",
+                             TRUE ~ s_abbr)) %>%
+  left_join(., gap_avg)
+#
+sta5a_demog_no_missing <- sta5a_demog %>%
+  drop_na() %>%
+  mutate(pilot_visn_flag = if_else(parent_visn %in% c("06", "16", "19", "20"), "Pilot VISN", "Not a Pilot VISN"))
+```
+
+```{r PS_matching_s_abbr}
+opt_match_s_abbr <- matchit(at_least_10_pc_crh_flag ~  
+                       pilot_visn_flag
+                      + s_abbr2
+                     + nosos_3mo_avg
+                     + obs_exp_panel_ratio_3mo_avg
+                     + team_pcp_ap_fte_total_3mo_avg
+                     + adi_natRnk_avg
+                     + prop_rural,
+                     data = sta5a_demog_no_missing,
+                     method = "optimal",
+                     distance = "glm",
+                     link = "logit",
+                     exact = ~pilot_visn_flag)
+#--
+opt_matches_s_abbr <- match.data(opt_match_s_abbr)
+```
+
+# Propensity Score "Optimal" Matching
+
+## Model 3a:  
+
+-   Using [Optimal Matching](https://cran.r-project.org/web/packages/MatchIt/vignettes/matching-methods.html#optimal-pair-matching-method-optimal) we get `r nrow(opt_matches_s_abbr) / 2` pairs\
+
+-   Model: Treatment (i.e., at least two consecutive months with \>9 PC CRH encounters) =
+
+    -   Pilot VISN (Exact)
+    -   Site Type
+    -   NOSOS (3 month average)
+    -   Observed:Expected PC Panel Size (3 month average)
+    -   Team PCP/AP FTE (3 month average)
+    -   ADI (3 month average)
+    -   Proportion rural (Q1, FY20)
+
+-   We estimate the propensity score with logistic regression (i.e., GLM and logit link)
+- [Absolute standardized mean difference:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) `r round(summary(opt_match_s_abbr)$sum.matched[1,3], 3)` 
+- [Variance ratio:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) `r round(summary(opt_match_s_abbr)$sum.matched[1,4], 3)`
+- [Empirical CDF:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) 
+    - Mean: `r round(summary(opt_match_s_abbr)$sum.matched[1,5], 2)`
+    - Max: `r round(summary(opt_match_s_abbr)$sum.matched[1,6], 2)`
+
+```{r}
+plot(opt_match_s_abbr, type = "jitter", interactive = FALSE)
+```
+
+### QQ Plots    
+```{r}
+plot(opt_match_s_abbr, type = "qq", interactive = FALSE,
+     which.xs = c('pilot_visn_flag'
+                      , 's_abbr2'
+                     , 'nosos_3mo_avg'
+                     , 'obs_exp_panel_ratio_3mo_avg'
+                     , 'team_pcp_ap_fte_total_3mo_avg'
+                     , 'adi_natRnk_avg'
+                     , 'prop_rural'))
+```
+
+### eCDF Plots  
+```{r}
+plot(opt_match_s_abbr, type = "ecdf", interactive = FALSE,
+     which.xs = c('pilot_visn_flag'
+                      , 's_abbr2'
+                     , 'nosos_3mo_avg'
+                     , 'obs_exp_panel_ratio_3mo_avg'
+                     , 'team_pcp_ap_fte_total_3mo_avg'
+                     , 'adi_natRnk_avg'
+                     , 'prop_rural'))
+```
+
+```{r}
+ps_plot_df_s_abbr <- tibble(
+  covariate = attributes(summary(opt_match_s_abbr)$sum.all)$dimnames[[1]], 
+  smd_matched = summary(opt_match_s_abbr)$sum.matched[,3], 
+  smd_preMatch = summary(opt_match_s_abbr)$sum.all[,3]) %>%
+  mutate(covariate = str_remove(covariate, "s_abbr2|census_division|pilot_visn_flag"),
+         covariate = str_replace(covariate, "parent_visn", "V"),
+         covar_lab = factor(case_when(
+           covariate == "distance" ~ "Distance",
+           str_detect(covariate, "nosos") == TRUE ~ "NOSOS",
+           str_detect(covariate, "obs_exp") == TRUE ~ "Obs:Exp",
+           str_detect(covariate, "team") == TRUE ~ "PCP/AP FTE",
+           str_detect(covariate, "pcmm") == TRUE ~ "PCMM ScrSSN Count",
+           str_detect(covariate, "est_") == TRUE ~ "Established Patient WT",
+           str_detect(covariate, "new_") == TRUE ~ "New Patient WT",
+           str_detect(covariate, "third_") == TRUE ~ "Third-Next Available",
+           str_detect(covariate, "adi") == TRUE ~ "ADI, Avg",
+           str_detect(covariate, "age") == TRUE ~ "Age, Avg",
+           str_detect(covariate, "male") == TRUE ~ "Male %",
+           str_detect(covariate, "white") == TRUE ~ "White %",
+           str_detect(covariate, "rural") == TRUE ~ "Rural %",
+           str_detect(covariate, "gap") == TRUE ~ "Gap Metric",
+           TRUE ~ covariate
+         ), ordered = TRUE, levels = rev(c("Distance","V01","V02","V04","V05","V06","V07" ,"V08","V09","V10",
+                                       "V12","V15","V16","V17","V19","V20" ,"V21","V22","V23","Not a Pilot VISN",
+                                       "Pilot VISN","East North Central","East South Central","Middle Atlantic",
+                                       "Mountain","New England","Pacific","South Atlantic","West North Central",
+                                       "West South Central","CBOC","OOS","VAMC/HCC","NOSOS","Obs:Exp","PCP/AP FTE",
+                                       "PCMM ScrSSN Count","Established Patient WT","New Patient WT",
+                                       "Third-Next Available","ADI, Avg","Age, Avg","Male %","White %",
+                                       "Rural %","Gap Metric")))) %>%
+  select(-covariate) %>%
+  pivot_longer(-covar_lab) %>%
+  mutate(abs_smd = abs(value),
+         name_lab = if_else(name == "smd_matched", "Matched", "Un-Matched"))
+#
+ggplot(data = ps_plot_df_s_abbr,
+       aes(x = abs_smd, y = covar_lab, group = name_lab, fill = name_lab)) +
+  geom_point(shape = 21,
+             size = 2.25) +
+  scale_fill_manual(values = c(
+    "Matched" = "black",
+    "Un-Matched" = "white"
+  )) +
+  labs(x = "Absolute Standardized Mean Difference") +
+  theme(axis.title.y = element_blank()) +
+  geom_vline(xintercept = 0, lty = 1) +
+  geom_vline(xintercept = 0.05, lty = 2) +
+  geom_vline(xintercept = 0.1, lty = 1)
+```
+
+
+```{r PS_matching_pcmm}
+opt_match_pcmm <- matchit(at_least_10_pc_crh_flag ~  
+                       pilot_visn_flag
+                      + pcmm_scrssn_count
+                     + nosos_3mo_avg
+                     + obs_exp_panel_ratio_3mo_avg
+                     + team_pcp_ap_fte_total_3mo_avg
+                     + adi_natRnk_avg
+                     + prop_rural,
+                     data = sta5a_demog_no_missing,
+                     method = "optimal",
+                     distance = "glm",
+                     link = "logit",
+                     exact = ~pilot_visn_flag)
+#--
+opt_matches_pcmm <- match.data(opt_match_pcmm)
+```
+
+
+## Modified Model 3a: PCMM ScrSSN Count Instead of Site Type  
+
+-   Using [Optimal Matching](https://cran.r-project.org/web/packages/MatchIt/vignettes/matching-methods.html#optimal-pair-matching-method-optimal) we get `r nrow(opt_matches_pcmm) / 2` pairs\
+
+-   Model: Treatment (i.e., at least two consecutive months with \>9 PC CRH encounters) =
+
+    -   Pilot VISN (Exact)
+    -   NOSOS (3 month average)
+    -   Observed:Expected PC Panel Size (3 month average)
+    -   Team PCP/AP FTE (3 month average)
+    -   Uniques in PCMM (2 quarter average)
+    -   ADI (3 month average)
+    -   Proportion rural (Q1, FY20)
+
+-   We estimate the propensity score with logistic regression (i.e., GLM and logit link)
+- [Absolute standardized mean difference:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) `r round(summary(opt_match_pcmm)$sum.matched[1,3], 3)` 
+- [Variance ratio:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) `r round(summary(opt_match_pcmm)$sum.matched[1,4], 3)`
+- [Empirical CDF:](https://cran.r-project.org/web/packages/MatchIt/vignettes/assessing-balance.html#recommendations-for-balance-assessment) 
+    - Mean: `r round(summary(opt_match_pcmm)$sum.matched[1,5], 2)`
+    - Max: `r round(summary(opt_match_pcmm)$sum.matched[1,6], 2)`
+
+```{r}
+plot(opt_match_pcmm, type = "jitter", interactive = FALSE)
+```
+
+### QQ Plots    
+```{r}
+plot(opt_match_pcmm, type = "qq", interactive = FALSE,
+     which.xs = c('pcmm_scrssn_count'
+                     , 'nosos_3mo_avg'
+                     , 'obs_exp_panel_ratio_3mo_avg'
+                     , 'team_pcp_ap_fte_total_3mo_avg'
+                     , 'adi_natRnk_avg'
+                     , 'prop_rural'))
+```
+
+### eCDF Plots  
+```{r}
+plot(opt_match_pcmm, type = "ecdf", interactive = FALSE,
+     which.xs = c('pcmm_scrssn_count'
+                     , 'nosos_3mo_avg'
+                     , 'obs_exp_panel_ratio_3mo_avg'
+                     , 'team_pcp_ap_fte_total_3mo_avg'
+                     , 'adi_natRnk_avg'
+                     , 'prop_rural'))
+```
+
+```{r}
+ps_plot_df_pcmm <- tibble(
+  covariate = attributes(summary(opt_match_pcmm)$sum.all)$dimnames[[1]], 
+  smd_matched = summary(opt_match_pcmm)$sum.matched[,3], 
+  smd_preMatch = summary(opt_match_pcmm)$sum.all[,3]) %>%
+  mutate(covariate = str_remove(covariate, "s_abbr2|census_division|pilot_visn_flag"),
+         covariate = str_replace(covariate, "parent_visn", "V"),
+         covar_lab = factor(case_when(
+           covariate == "distance" ~ "Distance",
+           str_detect(covariate, "nosos") == TRUE ~ "NOSOS",
+           str_detect(covariate, "obs_exp") == TRUE ~ "Obs:Exp",
+           str_detect(covariate, "team") == TRUE ~ "PCP/AP FTE",
+           str_detect(covariate, "pcmm") == TRUE ~ "PCMM ScrSSN Count",
+           str_detect(covariate, "est_") == TRUE ~ "Established Patient WT",
+           str_detect(covariate, "new_") == TRUE ~ "New Patient WT",
+           str_detect(covariate, "third_") == TRUE ~ "Third-Next Available",
+           str_detect(covariate, "adi") == TRUE ~ "ADI, Avg",
+           str_detect(covariate, "age") == TRUE ~ "Age, Avg",
+           str_detect(covariate, "male") == TRUE ~ "Male %",
+           str_detect(covariate, "white") == TRUE ~ "White %",
+           str_detect(covariate, "rural") == TRUE ~ "Rural %",
+           str_detect(covariate, "gap") == TRUE ~ "Gap Metric",
+           TRUE ~ covariate
+         ), ordered = TRUE, levels = rev(c("Distance","V01","V02","V04","V05","V06","V07" ,"V08","V09","V10",
+                                       "V12","V15","V16","V17","V19","V20" ,"V21","V22","V23","Not a Pilot VISN",
+                                       "Pilot VISN","East North Central","East South Central","Middle Atlantic",
+                                       "Mountain","New England","Pacific","South Atlantic","West North Central",
+                                       "West South Central","CBOC","OOS","VAMC/HCC","NOSOS","Obs:Exp","PCP/AP FTE",
+                                       "PCMM ScrSSN Count","Established Patient WT","New Patient WT",
+                                       "Third-Next Available","ADI, Avg","Age, Avg","Male %","White %",
+                                       "Rural %","Gap Metric")))) %>%
+  select(-covariate) %>%
+  pivot_longer(-covar_lab) %>%
+  mutate(abs_smd = abs(value),
+         name_lab = if_else(name == "smd_matched", "Matched", "Un-Matched"))
+#
+ggplot(data = ps_plot_df_pcmm,
+       aes(x = abs_smd, y = covar_lab, group = name_lab, fill = name_lab)) +
+  geom_point(shape = 21,
+             size = 2.25) +
+  scale_fill_manual(values = c(
+    "Matched" = "black",
+    "Un-Matched" = "white"
+  )) +
+  labs(x = "Absolute Standardized Mean Difference") +
+  theme(axis.title.y = element_blank()) +
+  geom_vline(xintercept = 0, lty = 1) +
+  geom_vline(xintercept = 0.05, lty = 2) +
+  geom_vline(xintercept = 0.1, lty = 1)
+```
+
+

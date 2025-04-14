@@ -1,0 +1,303 @@
+---
+title: "Established Patient Wait Time: PID vs. Create Date"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v6_post_COVID.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- access_metrics %>%
+  filter(vssc_month > ymd("2020-02-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- ps_matched %>%
+  filter(pc_crh_criteria_met_after_march_20 == 1) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include <- ps_matched %>%
+  inner_join(., vast %>% select(sta5a, s_abbr)) %>%#2: must be in VAST
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, 
+                            "PC CRH", "No PC CRH")) %>%#making the crh_flag
+  left_join(., scrssn_count)
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+      filter(vssc_month > ymd("2020-06-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%
+  filter(scrssn_count_cat != "< 450")#3: must have scrssn_count_avg_fy20 >= 450
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a look at the distribution of our outcomes, and to look for natural cutpoints use in stratified analyses
+
+## Decision Points  
+
+* We are moving forward with the Post-COVID analysis and presentation
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, crh_flag) %>% distinct() %>% summarise(tot = sum(crh_flag == "PC CRH"))` of these met our criteria for PC CRH 
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+* Description of _Propensity Score_ matching
+    + This report uses __Propensity Score v6.0__
+    + PS model v6.0 consists of 
+        + Covariates matched on their average values in FY21 Q2
+        + Outcomes matched on their average values over October 2020 - March 2021
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+        + VISN - Exact
+
+
+# Established Patient Wait-Time  
+
+```{r}
+est_wt_patient_indicated <- read_csv(here("Input", "Data", "VSSC", "Appointments - Completed Summary", 
+                            "est_pc_pt_wt_patient_indicated.csv")) %>%
+  filter(str_detect(DIVISION_FCDMD2, "FY") == T) %>%
+  select(1, 2, 3, 4, 66:86) %>%
+  rename(fy_mo = 2,
+         division = DIVISION_FCDMD3,
+         appt_count = NumberOfAppointments2,
+         avg_wait_time = Textbox121) %>%
+  mutate(days_waited = avg_wait_time * appt_count) %>%
+  group_by(division, fy_mo) %>%
+  summarise(est_pc_pt_wt_pid = (sum(days_waited) / sum(appt_count))) %>%
+  ungroup %>%
+  mutate(mo_c = str_sub(fy_mo, start = -3),
+         mo_n = match(mo_c, month.abb),
+         fy = as.numeric(paste0("20", str_sub(fy_mo, start = 3, end = 4))),
+         cy = if_else(mo_n > 9, fy - 1, fy),
+         report_month = ymd(str_c(cy, mo_n, "01", sep = "-")),
+         sta5a = if_else(str_sub(division, start = 11, end = 11) == ")",
+                         str_sub(division, start = 8, end = 10),
+                         str_sub(division, start = 8, end = 12)))
+#---
+est_wt_created <- read_csv(here("Input", "Data", "VSSC", "Appointments - Completed Summary", 
+                            "est_pc_pt_wt_create_date.csv")) %>%
+  filter(str_detect(DIVISION_FCDMD2, "FY") == T) %>%
+  select(1, 2, 3, 4, 66:86) %>%
+  rename(fy_mo = 2,
+         division = DIVISION_FCDMD3,
+         appt_count = NumberOfAppointments2,
+         avg_wait_time = Textbox121) %>%
+  mutate(days_waited = avg_wait_time * appt_count) %>%
+  group_by(division, fy_mo) %>%
+  summarise(est_pc_pt_wt_create = (sum(days_waited) / sum(appt_count))) %>%
+  ungroup %>%
+  mutate(mo_c = str_sub(fy_mo, start = -3),
+         mo_n = match(mo_c, month.abb),
+         fy = as.numeric(paste0("20", str_sub(fy_mo, start = 3, end = 4))),
+         cy = if_else(mo_n > 9, fy - 1, fy),
+         report_month = ymd(str_c(cy, mo_n, "01", sep = "-")),
+         sta5a = if_else(str_sub(division, start = 11, end = 11) == ")",
+                         str_sub(division, start = 8, end = 10),
+                         str_sub(division, start = 8, end = 12)))
+```
+
+```{r}
+est_create_df <- est_wt_created %>%
+  select(sta5a, vssc_month = report_month, est_pc_pt_wt_create) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  filter(sta5a %in% sta5as_to_include$sta5a
+         & vssc_month > ymd("2020-06-01")
+         & vssc_month < ymd("2023-01-01")) %>%
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F
+         & scrssn_count_cat != "< 450")
+#
+est_pid_df <- est_wt_patient_indicated %>%
+  select(sta5a, vssc_month = report_month, est_pc_pt_wt_pid) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  filter(sta5a %in% sta5as_to_include$sta5a
+         & vssc_month > ymd("2020-06-01")
+         & vssc_month < ymd("2023-01-01")) %>%
+  left_join(., scrssn_count) %>%
+  filter(is.na(scrssn_count_cat) == F
+         & scrssn_count_cat != "< 450")
+```
+
+# Established Pt WT, from Patient Indicated Date  
+```{r}
+est_pid_df %>%
+  rename(value = est_pc_pt_wt_pid) %>%
+  mutate(type = "Patient Indicated") %>%
+  bind_rows(est_create_df %>% mutate(type = "Create Date") %>% 
+              rename(value = est_pc_pt_wt_create)) %>%
+  filter(type == "Patient Indicated") %>%
+  ggplot(data = .,
+         aes(x = value, fill = type)) +
+  geom_histogram(bins = 100,
+                 alpha = 0.5,
+                 color = "black",
+                 position = "identity") +
+  labs(x = "Established Pt WT (days)",
+       y = "Observations") +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  ggsci::scale_fill_jco()
+```
+
+# Established Pt WT, from Create Date  
+```{r}
+est_pid_df %>%
+  rename(value = est_pc_pt_wt_pid) %>%
+  mutate(type = "Patient Indicated") %>%
+  bind_rows(est_create_df %>% mutate(type = "Create Date") %>% 
+              rename(value = est_pc_pt_wt_create)) %>%
+  filter(type != "Patient Indicated") %>%
+  ggplot(data = .,
+         aes(x = value, fill = type)) +
+  geom_histogram(bins = 100,
+                 alpha = 0.5,
+                 color = "black",
+                 position = "identity") +
+  labs(x = "Established Pt WT (days)",
+       y = "Observations") +
+  theme(legend.position = "none") +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  ggsci::scale_fill_igv()
+```
+
+# Established Pt WT, both together    
+```{r}
+est_pid_df %>%
+  rename(value = est_pc_pt_wt_pid) %>%
+  mutate(type = "Patient Indicated") %>%
+  bind_rows(est_create_df %>% mutate(type = "Create Date") %>% 
+              rename(value = est_pc_pt_wt_create)) %>%
+  ggplot(data = .,
+         aes(x = value, fill = type)) +
+  geom_histogram(bins = 100,
+                 alpha = 0.5,
+                 color = "black",
+                 position = "identity") +
+  labs(x = "Established Pt WT (days)",
+       y = "Observations") +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  ggsci::scale_fill_lancet()
+```

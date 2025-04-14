@@ -1,0 +1,466 @@
+---
+title: "CRH Evaluation Brief: 0 PC CRH & Gap < 1.0 for 3 Consecutive Months"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+set.seed(1234)
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+            # legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(drop_flag = if_else(str_detect(short_name, "Mobile") & state != "AL", 1, 0)) %>%
+  filter(drop_flag == 0) %>%
+  select(-drop_flag)
+#propensity score matched sta5as, as well 
+ps_matched <- read_csv(here("Input","Post-COVID", "ps_matched_sites_post_covid.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2020-10-01"), ymd("2023-09-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2020 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PCS_PCAT].[econ].PatientPCP_2020_2024
+                            	where fy = 2020
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy20, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy20 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy20 >= 450 & scrssn_count_avg_fy20 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy20 >= 2400 & scrssn_count_avg_fy20 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy20 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, #pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric, panel_fullness)
+#--
+gap_metric <- dbGetQuery(oabi_con,
+                         "select * from [crh_eval].H_gap_metric") %>%
+  mutate(vssc_month = ymd(vssc_month))
+#--
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month) %>%
+  mutate(tc_pc_success_prop = tc_pc_success_sum / tc_requests_sum)
+#--
+pen_rate <- dbGetQuery(oabi_con, 
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate") %>%
+  rename(vssc_month = crh_month) %>%
+  mutate(vssc_month = ymd(vssc_month))
+#---
+visn_lower_48 <- sf::st_read("//v23.med.va.gov/v23/IOW/Research/HSRD/HSRD_General/General/Bjarni/VA Maps/VISN maps/FY2017_Q4_VISN/visn.48")
+```
+
+```{r}
+sta5as_to_start <- vast %>%
+  left_join(., scrssn_count %>%
+              select(sta5a, scrssn_count_cat)) %>%
+  filter(s_abbr %in% c("PCCBOC", "MSCBOC", "HCC", "OOS", "VAMC")
+         & scrssn_count_cat != "< 450") %>%
+  select(sta5a)
+#==
+analytic_df <- sta5as_to_start %>%
+  cross_join (., dates %>%
+                select(vssc_month)) %>%
+  left_join(., gap_metric %>%
+              select(sta5a, vssc_month, gap_metric)) %>%
+  left_join(., pen_rate %>%
+              select(sta5a, vssc_month, crh_encounter_count)) %>%
+  left_join(., ps_matched %>%
+              select(sta5a, treated, treated_num)) %>%
+  mutate(crh_encounter_count0 = replace_na(crh_encounter_count, 0),
+         treated_num = replace_na(treated_num, 0),
+         treated = replace_na(treated, "Control"),
+         gap_cat = factor(case_when(gap_metric < 1.0 ~ "< 1.0",
+                             gap_metric >= 1.0 & gap_metric <= 1.2 ~ "1.0 - 1.2",
+                             gap_metric > 1.2 ~ "> 1.2",
+                             TRUE ~ "Missing"),
+                          ordered = TRUE,
+                          levels = c("< 1.0", "1.0 - 1.2", "> 1.2", "Missing")))
+```
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This document supplies a table and potential maps for the CRH evaluation brief 
+
+
+```{r}
+no_crh_gap_lt_1 <- analytic_df %>%
+  mutate(flag_ = if_else(treated_num == 0
+         & gap_metric < 1.0
+         & crh_encounter_count0 == 0, 1, 0)) %>%
+  arrange(sta5a, vssc_month) %>%
+  group_by(sta5a) %>%
+  mutate(months_meet_crit_3 = if_else(flag_ == 1 
+                                      & lead(flag_, 1) == 1
+                                      & lead(flag_, 2) == 1, 1, 0)) %>%
+  summarise(keep_me = if_else(sum(months_meet_crit_3) > 0, 1, 0)) %>%
+  filter(keep_me == 1) %>%
+  select(sta5a) %>%
+  distinct()
+#
+treated_ever_never_gap <- analytic_df %>%
+  filter(treated_num == 1) %>%
+  group_by(sta5a) %>%
+  summarise(ever_gap_lt_1 = 
+              if_else(
+                sum(
+                  if_else(gap_metric < 1.0, 1, 0), 
+                  na.rm = T) > 0, 1, 0),
+            month_count = 
+              sum(
+                if_else(gap_metric < 1.0, 1, 0), 
+                na.rm = T))
+```
+
+```{r}
+no_crh_gap_lt_1 %>%
+  left_join(., vast) %>%
+  group_by(parent_visn) %>%
+  tally() %>%
+  left_join(., vast %>%
+              filter(sta5a %in% sta5as_to_start$sta5a) %>%
+              group_by(parent_visn) %>%
+              summarise(tot_sta5a = n())) %>%
+  mutate(prop_sta5as = n / tot_sta5a) %>%
+  left_join(., vast %>%
+              inner_join(., treated_ever_never_gap %>% 
+                           filter(ever_gap_lt_1 == 1) %>%
+                           select(sta5a)) %>%
+              group_by(parent_visn) %>%
+              summarise(count_treated = n()),
+            by = "parent_visn") %>%
+  left_join(., vast %>%
+              inner_join(., treated_ever_never_gap %>% 
+                           filter(ever_gap_lt_1 == 0) %>%
+                           select(sta5a)) %>%
+              group_by(parent_visn) %>%
+              summarise(count_treated = n()),
+            by = "parent_visn") %>%
+  mutate(prop_treated.x = count_treated.x / tot_sta5a,
+         prop_treated.y = count_treated.y / tot_sta5a,
+         across(contains("prop_"), ~percent(.x, accuracy = 0.1))) %>%
+  adorn_totals() %>%
+  mutate(tot_sta5a = comma(tot_sta5a),
+         col.a = paste0(n, " (", prop_sta5as, ")"),
+         col.x = paste0(count_treated.x, " (", prop_treated.x, ")"),
+         col.y = paste0(count_treated.y, " (", prop_treated.y, ")")) %>%
+  select(parent_visn, tot_sta5a, col.a, col.x, col.y) %>%
+  kbl(col.names = c("VISN", "Sta5as in VISN", "Controls w/ at Least 3 months w/ gap < 1.0 & 0 PC CRH (%)",
+                    "Treated Sta5as, Ever Gap (%)", "Treated Sta5as, Never Gap (%)"),
+      full_width = F,
+      align = c("c", rep("r", 4))) %>%
+  kable_classic("striped") %>%
+  row_spec(c(0, 19), bold = TRUE)
+```
+
+```{r}
+prop_sta5as_meet_criteria <- no_crh_gap_lt_1 %>%
+  left_join(., vast) %>%
+  group_by(parent_visn) %>%
+  tally() %>%
+  left_join(., vast %>%
+              filter(sta5a %in% sta5as_to_start$sta5a) %>%
+              group_by(parent_visn) %>%
+              summarise(tot_sta5a = n())) %>%
+  mutate(prop_sta5as = n / tot_sta5a)
+#
+tert_1 <- quantile(prop_sta5as_meet_criteria$prop_sta5as, 0.33)
+tert_2 <- quantile(prop_sta5as_meet_criteria$prop_sta5as, 0.67)
+prop_sta5as_cat <- prop_sta5as_meet_criteria %>%
+  mutate(tertile = factor(case_when(
+    prop_sta5as <= tert_1 ~ "<= 6.1%",
+    prop_sta5as > tert_1 & prop_sta5as < tert_2 ~ "6.1%-13.0%",
+    prop_sta5as >= tert_2 ~ ">= 13.0%"
+  ),
+  ordered = TRUE,
+  levels = c("<= 6.1%", "6.1%-13.0%", ">= 13.0%")))
+#
+visn_map <- left_join(visn_lower_48, prop_sta5as_cat %>% 
+                             select(parent_visn, prop_sta5as, tertile),
+                           by = c("visn" = "parent_visn"))
+```
+
+```{r}
+ggplot(data = visn_map) +
+  geom_sf(aes(fill = prop_sta5as)) +
+  scale_fill_distiller(palette = "RdYlGn",
+                        labels = percent_format()) +
+  theme(legend.position = "right",
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "skyblue"),
+        legend.title = element_blank()) +
+  labs(title = "Proportion of Sta5as w/ 3 Consecutive Months of \n 0 PC CRH and Gap < 1.0")
+```
+
+
+```{r}
+ggplot(data = visn_map) +
+  geom_sf(aes(fill = tertile)) +
+  scale_fill_manual(values = c("green", "yellow", "red"),
+                    labels = c(latex2exp::TeX(r"($\leq 6.1\%$)"), "6.1 - 13.0%", latex2exp::TeX(r"($\geq 13.0\%)"))) +
+  theme(legend.position = "right",
+        axis.text = element_blank(),
+        axis.ticks = element_blank(),
+        panel.background = element_rect(fill = "skyblue"),
+        legend.title = element_blank()) +
+  labs(title = "Proportion of Sta5as w/ 3 Consecutive Months of \n 0 PC CRH and Gap < 1.0")
+```
+
+## More restrictive criteria  
+
+* In the table below sta5as in the "Treated Ever Gap" column needed to have at least 3 consecutive months with a gap < 1.0
+
+```{r}
+treated_3mos_ever_never_gap <- analytic_df %>%
+  filter(treated_num == 1) %>%
+  mutate(gap_lt_1 = if_else(gap_metric < 1.0, 1, 0)) %>%
+  arrange(sta5a, vssc_month) %>%
+  group_by(sta5a) %>%
+  mutate(flag_ = if_else(gap_lt_1 == 1
+                                       & lead(gap_lt_1, 1) == 1
+                                       & lead(gap_lt_1, 2) == 1, 1, 0)) %>%
+  group_by(sta5a) %>%
+  summarise(ge_3mos_gap_lt_1 = if_else(sum(flag_, na.rm = T) > 0, 1, 0),
+            month_count = sum(gap_lt_1, na.rm = T))
+
+#
+no_crh_gap_lt_1 %>%
+  left_join(., vast) %>%
+  group_by(parent_visn) %>%
+  tally() %>%
+  left_join(., vast %>%
+              filter(sta5a %in% sta5as_to_start$sta5a) %>%
+              group_by(parent_visn) %>%
+              summarise(tot_sta5a = n())) %>%
+  mutate(prop_sta5as = n / tot_sta5a) %>%
+  left_join(., vast %>%
+              inner_join(., treated_3mos_ever_never_gap %>% 
+                           filter(ge_3mos_gap_lt_1 == 1) %>%
+                           select(sta5a)) %>%
+              group_by(parent_visn) %>%
+              summarise(count_treated = n()),
+            by = "parent_visn") %>%
+  left_join(., vast %>%
+              inner_join(., treated_3mos_ever_never_gap %>% 
+                           filter(ge_3mos_gap_lt_1 == 0) %>%
+                           select(sta5a)) %>%
+              group_by(parent_visn) %>%
+              summarise(count_treated = n()),
+            by = "parent_visn") %>%
+  mutate(prop_treated.x = count_treated.x / tot_sta5a,
+         prop_treated.y = count_treated.y / tot_sta5a,
+         across(contains("count_"), ~replace_na(.x, 0)),
+         across(contains("prop_"), ~replace_na(.x, 0)),
+         across(contains("prop_"), ~percent(.x, accuracy = 0.1))) %>%
+  adorn_totals() %>%
+  mutate(tot_sta5a = comma(tot_sta5a),
+         col.a = paste0(n, " (", prop_sta5as, ")"),
+         col.x = paste0(count_treated.x, " (", prop_treated.x, ")"),
+         col.y = paste0(count_treated.y, " (", prop_treated.y, ")")) %>%
+  select(parent_visn, tot_sta5a, col.a, col.x, col.y) %>%
+  kbl(col.names = c("VISN", "Sta5as in VISN", "Controls w/ at Least 3 months w/ gap < 1.0 & 0 PC CRH (%)",
+                    "Treated Sta5as, Ever Gap (%)", "Treated Sta5as, Never Gap (%)"),
+      full_width = F,
+      align = c("c", rep("r", 4))) %>%
+  kable_classic("striped") %>%
+  row_spec(c(0, 19), bold = TRUE)
+```
+
+## Number of Months  
+
+```{r}
+months_no_crh_gap_lt_1 <- analytic_df %>%
+  mutate(flag_ = if_else(treated_num == 0
+                         & gap_metric < 1.0
+                         & crh_encounter_count0 == 0, 1, 0)) %>%
+  arrange(sta5a, vssc_month) %>%
+  group_by(sta5a) %>%
+  mutate(months_meet_crit_3 = if_else(flag_ == 1 
+                                      & lead(flag_, 1) == 1
+                                      & lead(flag_, 2) == 1, 1, 0)) %>%
+  summarise(keep_me = if_else(sum(months_meet_crit_3) > 0, 1, 0),
+            month_count = sum(months_meet_crit_3)) %>%
+  filter(keep_me == 1) %>%
+  distinct()
+#--
+months_no_crh_gap_lt_1 %>%
+  left_join(., vast) %>%
+  group_by(parent_visn) %>%
+  summarise(ctrl_gap_sta5a_count = n(),
+            ctrl_month_gap_count = sum(month_count)) %>%
+  left_join(., vast %>%
+              filter(sta5a %in% sta5as_to_start$sta5a) %>%
+              group_by(parent_visn) %>%
+              summarise(sta5a_count_tot = n(),
+                        tot_months = n() * 36)) %>%
+  left_join(., vast %>%
+              select(sta5a, parent_visn) %>%
+              inner_join(., treated_ever_never_gap %>% 
+                           filter(ever_gap_lt_1 == 1)) %>%
+              group_by(parent_visn) %>%
+              summarise(month_count = sum(month_count)),
+            by = "parent_visn") %>%
+  left_join(., vast %>%
+              select(sta5a, parent_visn) %>%
+              inner_join(., treated_ever_never_gap %>% 
+                           filter(ever_gap_lt_1 == 0)) %>%
+              group_by(parent_visn) %>%
+              summarise(month_count = sum(month_count)),
+            by = "parent_visn") %>%
+  mutate(prop.a = ctrl_month_gap_count / tot_months,
+         prop.x = month_count.x / tot_months,
+         prop.y = month_count.y / tot_months,
+         across(contains("prop"), ~percent(.x, accuracy = 0.1))) %>%
+  adorn_totals() %>%
+  mutate(col.a = paste0(ctrl_month_gap_count, " (", prop.a, ")"),
+         col.x = paste0(month_count.x, " (", prop.x, ")"),
+         col.y = paste0(month_count.y, " (", prop.y, ")"),
+         tot_months = comma(tot_months)) %>%
+  select(parent_visn, sta5a_count_tot, tot_months, col.a, col.x, col.y) %>%
+  kbl(col.names = c("VISN", "Sta5as in VISN", "Sta5a-Months of Observation",
+                    "Control Sta5a-Months w/ gap < 1.0 & 0 PC CRH",
+                    "Treated Sta5a-Months w/ gap < 1.0",
+                    "foo"),
+      full_width = F,
+      align = c("c", rep("r", 5))) %>%
+  kable_classic("striped") %>%
+  row_spec(c(0, 19), bold = TRUE)
+```
+
+### More restrictive criteria  
+
+```{r}
+months_no_crh_gap_lt_1 %>%
+  left_join(., vast) %>%
+  group_by(parent_visn) %>%
+  summarise(ctrl_gap_sta5a_count = n(),
+            ctrl_month_gap_count = sum(month_count)) %>%
+  left_join(., vast %>%
+              filter(sta5a %in% sta5as_to_start$sta5a) %>%
+              group_by(parent_visn) %>%
+              summarise(sta5a_count_tot = n(),
+                        tot_months = n() * 36)) %>%
+  left_join(., vast %>%
+              select(sta5a, parent_visn) %>%
+              inner_join(., treated_3mos_ever_never_gap %>% 
+                           filter(ge_3mos_gap_lt_1 == 1)) %>%
+              group_by(parent_visn) %>%
+              summarise(month_count = replace_na(sum(month_count, na.rm = T), 0)),
+            by = "parent_visn") %>%
+  left_join(., vast %>%
+              select(sta5a, parent_visn) %>%
+              inner_join(., treated_3mos_ever_never_gap %>% 
+                           filter(ge_3mos_gap_lt_1 == 0)) %>%
+              group_by(parent_visn) %>%
+              summarise(month_count = replace_na(sum(month_count, na.rm = T), 0)),
+            by = "parent_visn") %>%
+  mutate(across(contains("month_"), ~replace_na(.x, 0)),
+         prop.a = ctrl_month_gap_count / tot_months,
+         prop.x = month_count.x / tot_months,
+         prop.y = month_count.y / tot_months,
+         across(contains("prop"), ~percent(.x, accuracy = 0.1))) %>%
+  adorn_totals() %>%
+  mutate(col.a = paste0(ctrl_month_gap_count, " (", prop.a, ")"),
+         col.x = paste0(month_count.x, " (", prop.x, ")"),
+         col.y = paste0(month_count.y, " (", prop.y, ")"),
+         tot_months = comma(tot_months)) %>%
+  select(parent_visn, sta5a_count_tot, tot_months, col.a, col.x, col.y) %>%
+  kbl(col.names = c("VISN", "Sta5as in VISN", "Sta5a-Months of Observation",
+                    "Control Sta5a-Months w/ gap < 1.0 & 0 PC CRH",
+                    "Treated Sta5a-Months w/ 3 months gap < 1.0",
+                    "Treated Sta5a-Months w/ gap < 1.0"),
+      full_width = F,
+      align = c("c", rep("r", 5))) %>%
+  kable_classic("striped") %>%
+  row_spec(c(0, 19), bold = TRUE)
+```

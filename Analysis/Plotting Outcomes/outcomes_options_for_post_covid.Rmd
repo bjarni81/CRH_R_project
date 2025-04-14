@@ -1,0 +1,401 @@
+---
+title: "When does \"post-COVID\" start II: testing different periods"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#making PC CRH criteria for this analysis
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [crh_eval].C1_crh_flag") %>%
+  left_join(., vast %>% select(sta5a, s_abbr))
+#propensity score matched sta5as if being used
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_v5.csv"))
+#pulling timely care
+timely_care <- dbGetQuery(oabi_con,
+                          "select *
+                          from [OABI_MyVAAccess].[crh_eval].[E3_daysDV_month_sta5a]") %>%
+  mutate(viz_month = ymd(viz_month)) %>%
+  rename(sta5a = req_sta5a,
+         vssc_month = viz_month)
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  left_join(timely_care)
+#making a time column
+dates <- access_metrics %>%
+  filter(vssc_month > ymd("2020-02-01")) %>%
+  select(vssc_month) %>%
+  distinct %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, pcccr_per_10k_uniques,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveDist,
+         shep_access_metric)
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- crh_flag %>%
+  filter(crh_10_flag == 1) %>%
+  select(sta5a) %>%
+  pull
+#this is where exclusion criteria are applied:
+sta5as_to_include <- access_metrics %>%#1: must have Access metrics
+  select(sta5a) %>%
+  inner_join(ps_matched) %>%
+  inner_join(., vast %>% select(sta5a, s_abbr)) %>%#2: must be in VAST
+  distinct %>%
+  mutate(crh_flag = if_else(sta5a %in% crh_sta5as, 
+                            "PC CRH", "No PC CRH")) %>%#making the crh_flag
+  left_join(., scrssn_count) %>%
+  filter(scrssn_count_cat != "< 450")#3: must have scrssn_count_avg_fy18 >= 450
+#=================
+#making the analytic dataset
+analytic_df <- access_metrics %>%# start with access metrics
+      inner_join(., sta5as_to_include) %>%#restrict to our table from above
+     # filter(vssc_month > ymd("2019-09-01")) %>%#restrict to our timeframe
+      left_join(., dates) %>%
+  mutate(periods_option_1 = 
+           factor(case_when(vssc_month < ymd("2020-03-01") ~ "< 3/20",
+                            vssc_month >= ymd("2020-03-01") 
+                              & vssc_month < ymd("2020-07-01") ~ "3/20-6/20",
+                            vssc_month >= ymd("2020-07-01") ~ "7/20-9/22"),
+                  ordered = TRUE,
+                  levels = c("< 3/20", "3/20-6/20", "7/20-9/22")),
+         periods_option_2 = 
+           factor(case_when(vssc_month < ymd("2020-03-01") ~ "< 3/20",
+                            vssc_month >= ymd("2020-03-01") 
+                            & vssc_month < ymd("2021-03-01") ~ "3/20-2/21",
+                            vssc_month >= ymd("2021-03-01") ~ "3/21-9/22"),
+                  ordered = TRUE,
+                  levels = c("< 3/20", "3/20-2/21", "3/21-9/22"))) %>%
+  filter(sta5a != "459GA"
+         & vssc_month < ymd("2022-11-01"))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This a look at our outcomes over time, and comparing the pre-COVID study period to several potential "post-COVID" periods
+
+## Decision Points  
+
+* Per our meeting on January 25th 2023 I am presenting several options for a "post-COVID" period
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a, crh_flag) %>% distinct() %>% summarise(tot = sum(crh_flag == "PC CRH"))` of these met our criteria for PC CRH
+      + I've dropped (459GA) Maui because it had TNA > 200 in FY19 & FY20 
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+* Description of _Propensity Score_ matching
+    + This report uses __Propensity Score v5.0__
+    + PS model v5.0 consists of 
+        + Covariates matched on their average values in FY18 Q4
+        + Outcomes matched on their average values over FY19
+        + Site type (CBOC, VAMC/HCC, OOS) - Exact
+        + VISN - Exact
+
+
+
+
+```{r functions}
+#--
+#--==========
+fxn_plot_months <- function(outcome, month){
+  period_date <- if(month == "July"){
+    ymd("2020-08-01")
+  }
+    else if(month == "August"){
+      ymd("2020-09-01")
+    }
+    else if(month == "September"){
+      ymd("2020-10-01")
+    }
+    else if(month == "October"){
+      ymd("2020-11-01")}
+    else if(month == "June"){
+      ymd("2020-07-01")
+    }
+  #
+  p1 <- ggplot(data = analytic_df,
+               aes(x = vssc_month, y = {{outcome}}, group = sta5a)) +
+    geom_line(alpha = 0.3) +
+    geom_smooth(data = subset(analytic_df, vssc_month < ymd("2020-03-01")),
+                aes(x = vssc_month, y = {{outcome}}),
+                method = "lm", se = F,
+                inherit.aes = FALSE, color = "blue") +
+    geom_smooth(data = subset(analytic_df, vssc_month < period_date
+                              & vssc_month >= ymd("2020-03-01")),
+                aes(x = vssc_month, y = {{outcome}}),
+                method = "lm", se = F,
+                inherit.aes = FALSE, color = "red") +
+    geom_smooth(data = subset(analytic_df, vssc_month >= period_date),
+                aes(x = vssc_month, y = {{outcome}}),
+                method = "lm", se = F,
+                inherit.aes = FALSE, color = "forestgreen") +
+    scale_x_date(breaks = "6 months",
+                 date_labels = "%m-%Y") +
+    labs(y = "Days",
+         title = paste0("March 2020 through ", month, " 2020")) +
+    theme(axis.title.x = element_blank(),
+          axis.text.x = element_text(angle = 270,
+                                     vjust = 0.3))
+  #
+  return(p1)
+}
+#
+fxn_lm <- function(outcome, month){
+  period_date <- if(month == "July"){
+    ymd("2020-08-01")
+  }
+  else if(month == "August"){
+    ymd("2020-09-01")
+  }
+  else if(month == "September"){
+    ymd("2020-10-01")
+  }
+  else if(month == "October"){
+    ymd("2020-11-01")}
+  else if(month == "June"){
+    ymd("2020-07-01")
+  }
+  #--
+  lm_df <- analytic_df %>%
+    filter(vssc_month < period_date
+           & vssc_month >= ymd("2020-03-01")) %>%
+    select({{outcome}}, time) %>%
+    rename(value = {{outcome}})
+  #
+  lm_1 <- lm(value ~ time,
+             data = lm_df)
+  #--
+  return(lm_1)
+  # tab_model(lm_1,
+  #            dv.labels = month)
+}
+```
+
+# Established Patient Wait Time  
+
+## March through June  
+```{r}
+fxn_plot_months(est_pc_pt_wt, "June")
+#
+tab_model(fxn_lm(est_pc_pt_wt, "June"),
+          dv.labels = "June")
+```
+
+## March through July  
+```{r}
+fxn_plot_months(est_pc_pt_wt, "July")
+#
+tab_model(fxn_lm(est_pc_pt_wt, "July"),
+          dv.labels = "July")
+```
+
+## March through August  
+```{r}
+fxn_plot_months(est_pc_pt_wt, "August")
+#
+tab_model(fxn_lm(est_pc_pt_wt, "August"),
+          dv.labels = "August")
+```
+
+
+## March through September  
+```{r}
+fxn_plot_months(est_pc_pt_wt, "September")
+#
+tab_model(fxn_lm(est_pc_pt_wt, "September"),
+          dv.labels = "September")
+```
+
+## March through October  
+```{r}
+fxn_plot_months(est_pc_pt_wt, "October")
+#
+tab_model(fxn_lm(est_pc_pt_wt, "October"),
+          dv.labels = "October")
+```
+
+# New Patient Wait Time  
+
+## March through June  
+```{r}
+fxn_plot_months(new_pc_pt_wt, "June")
+#
+tab_model(fxn_lm(new_pc_pt_wt, "June"),
+          dv.labels = "June")
+```
+
+## March through July  
+```{r}
+fxn_plot_months(new_pc_pt_wt, "July")
+#
+tab_model(fxn_lm(new_pc_pt_wt, "July"),
+          dv.labels = "July")
+```
+
+## March through August  
+```{r}
+fxn_plot_months(new_pc_pt_wt, "August")
+#
+tab_model(fxn_lm(new_pc_pt_wt, "August"),
+          dv.labels = "August")
+```
+
+
+## March through September  
+```{r}
+fxn_plot_months(new_pc_pt_wt, "September")
+#
+tab_model(fxn_lm(new_pc_pt_wt, "September"),
+          dv.labels = "September")
+```
+
+## March through October  
+```{r}
+fxn_plot_months(new_pc_pt_wt, "October")
+#
+tab_model(fxn_lm(new_pc_pt_wt, "October"),
+          dv.labels = "October")
+```
+
+# Third Next Available    
+
+## March through June  
+```{r}
+fxn_plot_months(third_next_avail, "June")
+#
+tab_model(fxn_lm(third_next_avail, "June"),
+          dv.labels = "June")
+```
+
+## March through July  
+```{r}
+fxn_plot_months(third_next_avail, "July")
+#
+tab_model(fxn_lm(third_next_avail, "July"),
+          dv.labels = "July")
+```
+
+## March through August  
+```{r}
+fxn_plot_months(third_next_avail, "August")
+#
+tab_model(fxn_lm(third_next_avail, "August"),
+          dv.labels = "August")
+```
+
+
+## March through September  
+```{r}
+fxn_plot_months(third_next_avail, "September")
+#
+tab_model(fxn_lm(third_next_avail, "September"),
+          dv.labels = "September")
+```
+
+## March through October  
+```{r}
+fxn_plot_months(third_next_avail, "October")
+#
+tab_model(fxn_lm(third_next_avail, "October"),
+          dv.labels = "October")
+```

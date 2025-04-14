@@ -1,0 +1,339 @@
+---
+title: "CRH"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, echo = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+#
+#--
+source(here("Input", "Functions", "customFacetWrap.R"))
+source(here("Input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r}
+#===================
+hubs <- dbGetQuery(oabi_con,
+                   "select distinct hub_sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY20]
+                    UNION 
+                    select distinct Hub_Sta3n as hub_sta5a
+                    FROM [PACT_CC].[CRH].[CRH_sites_FY21_working]") %>%
+  pull
+#--
+spokes <- dbGetQuery(oabi_con,
+                     "select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy20_working
+                     UNION
+                     select spoke_sta5a from [PACT_CC].[CRH].CRH_sites_fy21_working")
+#
+spokes_v <- spokes %>% pull
+#
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#
+vast_spokes <- vast %>%
+  inner_join(., spokes, by = c("sta5a" = "spoke_sta5a"))
+#-----
+crh_encounters <- dbGetQuery(oabi_con,
+                             "select * from [PACT_CC].[CRH].[crh_full_utilization_final_fy20_21]") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  filter(fy %in% c(2020, 2021) & care_type == "Primary Care") %>%
+  left_join(., vast, by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  rename(sta5a = spoke_sta5a_combined_cdw)
+#====================================================================================
+crh_sta5a_qtr <- crh_encounters %>%
+  group_by(sta5a, fyqtr) %>%
+  summarise(pc_crh_encounters = n()) %>%
+  left_join(., vast %>% select(sta5a, short_name, s_abbr)) %>%
+  filter(is.na(s_abbr) == FALSE)
+# ======--------
+sta5a_qtr_summary <- crh_sta5a_qtr %>%
+  mutate(qtr_w_lt6 = if_else(pc_crh_encounters < 6, 1, 0),
+         qtr_w_gt5 = if_else(pc_crh_encounters > 5, 1, 0),
+         qtr_w_lt20 = if_else(pc_crh_encounters < 20, 1, 0),
+         qtr_w_gt19 = if_else(pc_crh_encounters > 19, 1, 0),
+         qtr_w_lt50 = if_else(pc_crh_encounters < 50, 1, 0),
+         qtr_w_gt49 = if_else(pc_crh_encounters > 49, 1, 0)) %>%
+  group_by(sta5a) %>%
+  summarise(lt6 = sum(qtr_w_lt6),
+            gt5 = sum(qtr_w_gt5),
+            both_lt6_and_gt5 = if_else(lt6 > 0 & gt5 > 0, TRUE, FALSE),
+            only_lt6 = if_else(lt6 > 0 & gt5 == 0, 1, 0),
+            only_gt5 = if_else(lt6 == 0 & gt5 > 0, 1, 0),
+            has_both = sum(both_lt6_and_gt5),
+            only_lt6 = sum(only_lt6),
+            only_gt5 = sum(only_gt5),
+            #
+            lt20 = sum(qtr_w_lt20),
+            gt19 = sum(qtr_w_gt19),
+            both_lt20_and_gt19 = if_else(lt20 > 0 & gt19 > 0, TRUE, FALSE),
+            only_lt20 = if_else(lt20 > 0 & gt19 == 0, 1, 0),
+            only_gt19 = if_else(lt20 == 0 & gt19 > 0, 1, 0),
+            has_both_19_20 = sum(both_lt20_and_gt19),
+            only_lt20 = sum(only_lt20),
+            only_gt19 = sum(only_gt19),
+            #
+            lt50 = sum(qtr_w_lt50),
+            gt49 = sum(qtr_w_gt49),
+            both_lt50_and_gt49 = if_else(lt50 > 0 & gt49 > 0, TRUE, FALSE),
+            only_lt50 = if_else(lt50 > 0 & gt49 == 0, 1, 0),
+            only_gt49 = if_else(lt50 == 0 & gt49 > 0, 1, 0),
+            has_both_49_50 = sum(both_lt50_and_gt49),
+            only_lt50 = sum(only_lt50),
+            only_gt49 = sum(only_gt49))
+#  
+crh_sta5a_qtr <- crh_sta5a_qtr %>%
+  left_join(., sta5a_qtr_summary)
+```
+
+# < 6, > 5 PC CRH Encounters  
+
+* There are a total of `r nrow(crh_sta5a_qtr)` sta5a-quarters with __> 0__ PC CRH encounters
+* `r crh_sta5a_qtr %>% filter(pc_crh_encounters < 6) %>% select(sta5a, fyqtr) %>% n_distinct` out of those `r nrow(crh_sta5a_qtr)` (`r round((crh_sta5a_qtr %>% filter(pc_crh_encounters < 6) %>% select(sta5a, fyqtr) %>% n_distinct) / nrow(crh_sta5a_qtr) * 100, 1)`%) have __< 6__ PC CRH encounters
+
+---
+
+* There are a total of `r nrow(sta5a_qtr_summary)` unique sta5as
+* Out of those:
+    + `r sum(sta5a_qtr_summary$has_both)` (`r round(sum(sta5a_qtr_summary$has_both) / nrow(sta5a_qtr_summary) * 100, 1)`%) have at least one quarter with __< 6__ and one quarter with __> 5__ PC CRH encounters
+    + `r sum(sta5a_qtr_summary$only_lt6)` (`r round(sum(sta5a_qtr_summary$only_lt6) / nrow(sta5a_qtr_summary) * 100, 1)`%) only have quarters with __< 6__ PC CRH encounters
+    + `r sum(sta5a_qtr_summary$only_gt5)` (`r round(sum(sta5a_qtr_summary$only_gt5) / nrow(sta5a_qtr_summary) * 100, 1)`%) only have quarters with __> 5__ PC CRH encounters
+    
+---
+
+## Distribution of PC CRH Encounters per Quarter  
+### All Together  
+
+```{r}
+ggplot(data = crh_sta5a_qtr,
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "red") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with both < 6 and > 5 quarters   
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, has_both == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "forestgreen") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with only < 6 quarters     
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_lt6 == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 5, color = "black", fill = "royalblue") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with only > 5 quarters      
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_gt5 == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "darkorchid3") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### No sta5a with only < 6 quarters      
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_lt6 == F),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "grey") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+---
+
+# < 20, > 19 PC CRH Encounters  
+
+* There are a total of `r nrow(crh_sta5a_qtr)` sta5a-quarters with __> 0__ PC CRH encounters
+* `r crh_sta5a_qtr %>% filter(pc_crh_encounters < 20) %>% select(sta5a, fyqtr) %>% n_distinct` out of those `r nrow(crh_sta5a_qtr)` (`r round((crh_sta5a_qtr %>% filter(pc_crh_encounters < 20) %>% select(sta5a, fyqtr) %>% n_distinct) / nrow(crh_sta5a_qtr) * 100, 1)`%) have __< 20__ PC CRH encounters
+
+---
+
+* There are a total of `r nrow(sta5a_qtr_summary)` unique sta5as
+* Out of those:
+    + `r sum(sta5a_qtr_summary$has_both_19_20)` (`r round(sum(sta5a_qtr_summary$has_both_19_20) / nrow(sta5a_qtr_summary) * 100, 1)`%) have at least one quarter with __< 20__ and one quarter with __> 19__ PC CRH encounters
+    + `r sum(sta5a_qtr_summary$only_lt20)` (`r round(sum(sta5a_qtr_summary$only_lt20) / nrow(sta5a_qtr_summary) * 100, 1)`%) only have quarters with __< 20__ PC CRH encounters
+    + `r sum(sta5a_qtr_summary$only_gt19)` (`r round(sum(sta5a_qtr_summary$only_gt19) / nrow(sta5a_qtr_summary) * 100, 1)`%) only have quarters with __> 19__ PC CRH encounters
+    
+---
+
+## Distribution of PC CRH Encounters per Quarter  
+### All Together  
+
+```{r}
+ggplot(data = crh_sta5a_qtr,
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "red") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with both < 20 and > 19 quarters   
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, has_both_19_20 == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "forestgreen") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with only < 20 quarters     
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_lt20 == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 19, color = "black", fill = "royalblue") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with only > 19 quarters      
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_gt19 == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "darkorchid3") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 1)) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 1)) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### No sta5a with only < 20 quarters      
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_lt20 == F),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "grey") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+---
+
+
+# < 50, > 49 PC CRH Encounters  
+
+* There are a total of `r nrow(crh_sta5a_qtr)` sta5a-quarters with __> 0__ PC CRH encounters
+* `r crh_sta5a_qtr %>% filter(pc_crh_encounters < 50) %>% select(sta5a, fyqtr) %>% n_distinct` out of those `r nrow(crh_sta5a_qtr)` (`r round((crh_sta5a_qtr %>% filter(pc_crh_encounters < 50) %>% select(sta5a, fyqtr) %>% n_distinct) / nrow(crh_sta5a_qtr) * 100, 1)`%) have __< 50__ PC CRH encounters
+
+---
+
+* There are a total of `r nrow(sta5a_qtr_summary)` unique sta5as
+* Out of those:
+    + `r sum(sta5a_qtr_summary$has_both_49_50)` (`r round(sum(sta5a_qtr_summary$has_both_49_50) / nrow(sta5a_qtr_summary) * 100, 1)`%) have at least one quarter with __< 50__ and one quarter with __> 49__ PC CRH encounters
+    + `r sum(sta5a_qtr_summary$only_lt50)` (`r round(sum(sta5a_qtr_summary$only_lt50) / nrow(sta5a_qtr_summary) * 100, 1)`%) only have quarters with __< 50__ PC CRH encounters
+    + `r sum(sta5a_qtr_summary$only_gt49)` (`r round(sum(sta5a_qtr_summary$only_gt49) / nrow(sta5a_qtr_summary) * 100, 1)`%) only have quarters with __> 49__ PC CRH encounters
+    
+---
+
+## Distribution of PC CRH Encounters per Quarter  
+### All Together  
+
+```{r}
+ggplot(data = crh_sta5a_qtr,
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "red") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with both < 50 and > 49 quarters   
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, has_both_49_50 == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "forestgreen") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with only < 50 quarters     
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_lt50 == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 49, color = "black", fill = "royalblue") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### Sta5a with only > 49 quarters      
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_gt49 == T),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "darkorchid3") +
+  scale_y_continuous(labels = scales::comma_format(accuracy = 1)) +
+  scale_x_continuous(labels = scales::comma_format(accuracy = 1)) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```
+
+### No sta5a with only < 50 quarters      
+```{r}
+ggplot(data = subset(crh_sta5a_qtr, only_lt50 == F),
+       aes(x = pc_crh_encounters)) +
+  geom_histogram(bins = 100, color = "black", fill = "grey") +
+  scale_y_continuous(labels = scales::comma_format()) +
+  labs(x = "PC CRH Encounters",
+       y = "Sta5a-Quarters")
+```

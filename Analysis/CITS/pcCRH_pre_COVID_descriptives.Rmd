@@ -1,0 +1,626 @@
+---
+title: "PC CRH Description: Pre-COVID"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(gt)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06")
+#propensity score matched sta5as
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_pre_covid.csv"))
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month),
+         tna_new_source = as.numeric(tna_new_source))
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2018-10-01"), ymd("2020-02-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(pc_crh_per_1k_total_pc, crh_encounter_count, pc_encounter_total,
+         avg_age_oct1_2022, sta5a, vssc_month, 
+         parent_visn, census_division,
+         nosos_risk_score, obs_exp_panel_ratio, team_pcp_ap_fte_total,
+         pcmm_count_fy_qtr,
+         adi_natRnk_avg, pct_male, pct_white, pct_rural, avg_driveTime,
+         shep_access_metric)
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+crh_sta5as <- ps_matched %>%
+  filter(at_least_10_pc_crh_flag == 1) %>%
+  select(sta5a) %>%
+  pull
+#=================
+#making the analytic dataset
+analytic_df <- covariates %>%# start with access metrics
+  filter(sta5a %in% crh_sta5as) %>%#restrict to our table from above
+  filter(vssc_month > ymd("2018-09-01")
+         & vssc_month < ymd("2020-03-01")) %>%#restrict to our timeframe
+  left_join(., dates) %>%
+  left_join(., scrssn_count) %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  left_join(., access_metrics)
+```
+
+```{r}
+unique_hubs <- dbGetQuery(oabi_con,
+                          "select distinct Hub_Location
+from [PACT_CC].[CRH].CRH_sites_FY20_working
+where SiteType = 'PC'
+UNION
+select distinct Hub_Location
+from [PACT_CC].[CRH].CRH_sites_FY21_working
+where SiteType = 'PC'
+UNION
+select distinct Hub_Location
+from [PACT_CC].[CRH].CRH_sites_FY22_working
+where SiteType = 'PC'")
+#
+unique_states <- vast %>%
+  filter(sta5a %in% crh_sta5as) %>%
+  select(state) %>%
+  distinct()
+```
+
+```{r}
+non_crh_sta5as <- ps_matched %>%
+  filter(at_least_10_pc_crh_flag == 0) %>%
+  select(sta5a) %>%
+  pull
+#--
+pc_encounters <- dbGetQuery(oabi_con,
+                                    "select sum(pc_encounter_total) as pc_encounter_total, sta6a
+from [OABI_MyVAAccess].[crh_eval].A1_pc_enc_scrssn_count
+where visitMonth > cast('2018-09-01' as date) AND visitMonth < cast('2020-03-01' as date)
+group by Sta6a")
+#--
+crh_sta5as_pc_encounters <- pc_encounters %>%
+  filter(sta6a %in% crh_sta5as) %>%
+  summarise(total = sum(pc_encounter_total, na.rm = T))
+#--
+noCrh_sta5as_pc_encounters <- pc_encounters %>%
+  filter(sta6a %in% non_crh_sta5as) %>%
+  summarise(total = sum(pc_encounter_total, na.rm = T))
+```
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a collection of tables describing the sta5as and patients engaged with PC CRH between October 2019 and February 2020
+
+## Decision Points  
+
+* Per our discussion on 6/29 regarding Steve Fihn's review of the paper, I have put these tables together to help describe how much Primary Care is being delivered by CRH
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a) %>% n_distinct()` of these met our criteria for PC CRH before March, 2020
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+* Description of _Propensity Score_ matching
+    + This report uses the pre-COVID PS matching model
+    + This model consists of: 
+        + Outcomes matched on their average values over FY19
+        + Exact match on site type (CBOC, VAMC/HCC, OOS) and VISN
+        + "Optimally" matched on FY18 Q4 average values of PCMM uniques, Obs:Exp panel size ratio, proportion rural, non-VA consults per 10,000 in PCMM
+
+# Mean PC CRH Encounters per 1,000 Total PC Encounters    
+```{r}
+analytic_df %>%
+  group_by(sta5a) %>%
+  summarise(pcCRH_rate_mean = mean(pc_crh_per_1k_total_pc, na.rm = T),
+            pcCRH_rate_sd = sd(pc_crh_per_1k_total_pc, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = reorder(sta5a, pcCRH_rate_mean))) +
+  geom_point(aes(y = pcCRH_rate_mean)) +
+  geom_errorbar(aes(ymin = pcCRH_rate_mean - pcCRH_rate_sd, 
+                    ymax = pcCRH_rate_mean + pcCRH_rate_sd),
+                alpha = 0.75) +
+  theme(axis.text.x = element_blank()) +
+  geom_hline(yintercept = 0) +
+  labs(y = "Average PC CRH per 1,000 (+/- SD)",
+       x = "Sta5a") +
+  scale_y_continuous(labels = comma_format(accuracy = 1))
+```
+
+
+### Just the top 20  
+```{r}
+top_20 <- analytic_df %>%
+  group_by(sta5a) %>%
+  summarise(pcCRH_rate_mean = mean(pc_crh_per_1k_total_pc, na.rm = T),
+            pcCRH_rate_sd = sd(pc_crh_per_1k_total_pc, na.rm = T)) %>%
+  slice_max(n = 20, order_by = pcCRH_rate_mean) %>%
+  select(sta5a) %>%
+  pull
+#
+analytic_df %>%
+  filter(sta5a %in% top_20) %>%
+  left_join(., vast %>% select(sta5a, short_name, city, state)) %>%
+  mutate(short_name2 = paste0("(", sta5a, ") ", short_name, " (", state, ")")) %>%
+  group_by(short_name2) %>%
+  summarise(pcCRH_rate_mean = mean(pc_crh_per_1k_total_pc, na.rm = T),
+            pcCRH_rate_sd = sd(pc_crh_per_1k_total_pc, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = reorder(short_name2, pcCRH_rate_mean))) +
+  geom_point(aes(y = pcCRH_rate_mean)) +
+  geom_errorbar(aes(ymin = pcCRH_rate_mean - pcCRH_rate_sd, 
+                    ymax = pcCRH_rate_mean + pcCRH_rate_sd),
+                alpha = 0.75) +
+  theme(axis.text.x = element_text(angle = 270,
+                                   hjust = 0, vjust = 0.3)) +
+  geom_hline(yintercept = 0) +
+  labs(y = "Average PC CRH per 1,000 (+/- SD)",
+       x = "Sta5a") +
+  scale_y_continuous(labels = comma_format(accuracy = 1))
+```
+
+### Just the top 10 VAMC  
+```{r}
+top_10_vamc <- analytic_df %>%
+  filter(s_abbr == "VAMC") %>%
+  group_by(sta5a) %>%
+  summarise(pcCRH_rate_mean = mean(pc_crh_per_1k_total_pc, na.rm = T),
+            pcCRH_rate_sd = sd(pc_crh_per_1k_total_pc, na.rm = T)) %>%
+  slice_max(n = 10, order_by = pcCRH_rate_mean) %>%
+  select(sta5a) %>%
+  pull
+#
+analytic_df %>%
+  filter(sta5a %in% top_10_vamc) %>%
+  left_join(., vast %>% select(sta5a, short_name, city, state)) %>%
+  mutate(short_name2 = paste0("(", sta5a, ") ", short_name, " (", state, ")")) %>%
+  group_by(short_name2) %>%
+  summarise(pcCRH_rate_mean = mean(pc_crh_per_1k_total_pc, na.rm = T),
+            pcCRH_rate_sd = sd(pc_crh_per_1k_total_pc, na.rm = T)) %>%
+  ggplot(data = .,
+         aes(x = reorder(short_name2, pcCRH_rate_mean))) +
+  geom_point(aes(y = pcCRH_rate_mean)) +
+  geom_errorbar(aes(ymin = pcCRH_rate_mean - pcCRH_rate_sd, 
+                    ymax = pcCRH_rate_mean + pcCRH_rate_sd),
+                alpha = 0.75) +
+  theme(axis.text.x = element_text(angle = 270,
+                                   hjust = 0, vjust = 0.3)) +
+  geom_hline(yintercept = 0) +
+  labs(y = "Average PC CRH per 1,000 (+/- SD)",
+       x = "Sta5a") +
+  scale_y_continuous(labels = comma_format(accuracy = 1))
+```
+
+## By Site Type  
+
+```{r}
+analytic_df %>%
+  group_by(sta5a) %>%
+  summarise(pcCRH_rate_mean = mean(pc_crh_per_1k_total_pc, na.rm = T),
+            pcCRH_rate_sd = sd(pc_crh_per_1k_total_pc, na.rm = T)) %>%
+  left_join(., vast) %>%
+  ggplot(data = .,
+         aes(x = reorder(sta5a, pcCRH_rate_mean))) +
+  geom_point(aes(y = pcCRH_rate_mean)) +
+  geom_errorbar(aes(ymin = pcCRH_rate_mean - pcCRH_rate_sd, 
+                    ymax = pcCRH_rate_mean + pcCRH_rate_sd),
+                alpha = 0.75) +
+  theme(axis.text.x = element_blank()) +
+  geom_hline(yintercept = 0) +
+  labs(y = "Average PC CRH per 1,000 (+/- SD)",
+       x = "Sta5a") +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  facet_wrap(~s_abbr)
+```
+
+
+## Assigning Color to Rurality  
+```{r}
+analytic_df %>%
+  group_by(sta5a) %>%
+  summarise(pcCRH_rate_mean = mean(pc_crh_per_1k_total_pc, na.rm = T),
+            pcCRH_rate_sd = sd(pc_crh_per_1k_total_pc, na.rm = T)) %>%
+  left_join(., vast) %>%
+  mutate(urh_vast2 = factor(if_else(urh_vast == "U", "Urban", "Rural"),
+                            ordered = TRUE,
+                            levels = c("Urban", "Rural"))) %>%
+  ggplot(data = .,
+         aes(x = reorder(sta5a, pcCRH_rate_mean))) +
+  geom_point(aes(y = pcCRH_rate_mean, color = urh_vast2),
+             size = 1.5) +
+  geom_errorbar(aes(ymin = pcCRH_rate_mean - pcCRH_rate_sd, 
+                    ymax = pcCRH_rate_mean + pcCRH_rate_sd),
+                alpha = 0.75) +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        legend.position = "none") +
+  geom_hline(yintercept = 0) +
+  labs(y = "Average PC CRH per 1,000 PC Encounters (+/- SD)",
+       x = "Sta5a") +
+  scale_y_continuous(labels = comma_format(accuracy = 1)) +
+  ggsci::scale_color_aaas() +
+  facet_wrap(~urh_vast2)
+```
+
+
+
+# Some tables  
+## CRH Encounters  
+```{r}
+analytic_df %>%
+  summarise(`CRH Encounters` = sum(crh_encounter_count, na.rm = T),
+            `PC Encounters` = sum(pc_encounter_total, na.rm = T)) %>%
+  mutate(`CRH per 1,000 PC` =`CRH Encounters` / `PC Encounters` * 1000,
+         foo = "foo") %>%
+  pivot_longer(-foo) %>%
+  select(-foo) %>%
+  mutate(value = if_else(str_detect(name, "1,000"), 
+                         comma(value, accuracy = 0.1),
+                         comma(value, accuracy = 1))) %>%
+  kbl(col.names = c("", ""),
+      align = c("l", "r")) %>%
+  kable_classic("striped", 
+                full_width = F)
+```
+
+
+
+## By Site Type  
+```{r}
+analytic_df %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  group_by(s_abbr) %>%
+  summarise(`CRH Encounters` = sum(crh_encounter_count, na.rm = T),
+            `PC Encounters` = sum(pc_encounter_total, na.rm = T)) %>%
+  mutate(`CRH per 1,000 PC` =`CRH Encounters` / `PC Encounters` * 1000) %>%
+  mutate_at(2:3, comma_format()) %>%
+  mutate_at(4, comma_format(accuracy = 0.1)) %>%
+  kbl(col.names = c("Type", "PC CRH Encounters", "PC Encounters", "CRH per 1,000 PC"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped", 
+                full_width = F) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## By Urban/Rural    
+```{r}
+analytic_df %>%
+  left_join(., vast %>% select(sta5a, urh_vast)) %>%
+  mutate(urh_vast2 = if_else(urh_vast == "U", "Urban", "Rural")) %>%
+  group_by(urh_vast2) %>%
+  summarise(`CRH Encounters` = sum(crh_encounter_count, na.rm = T),
+            `PC Encounters` = sum(pc_encounter_total, na.rm = T)) %>%
+  mutate(`CRH per 1,000 PC` =`CRH Encounters` / `PC Encounters` * 1000) %>%
+  mutate_at(2:3, comma_format()) %>%
+  mutate_at(4, comma_format(accuracy = 0.1)) %>%
+  kbl(col.names = c("", "PC CRH Encounters", "PC Encounters", "CRH per 1,000 PC"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped", 
+                full_width = F) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## By Uniques  
+```{r}
+analytic_df %>%
+  group_by(scrssn_count_cat) %>%
+  summarise(`CRH Encounters` = sum(crh_encounter_count, na.rm = T),
+            `PC Encounters` = sum(pc_encounter_total, na.rm = T)) %>%
+  mutate(`CRH per 1,000 PC` =`CRH Encounters` / `PC Encounters` * 1000) %>%
+  mutate_at(2:3, comma_format()) %>%
+  mutate_at(4, comma_format(accuracy = 0.1)) %>%
+  kbl(col.names = c("Unique ScrSSNs", "PC CRH Encounters", "PC Encounters", "CRH per 1,000 PC"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped", 
+                full_width = F) %>%
+  row_spec(0, bold = TRUE)
+```
+
+## Uniques  
+```{r}
+uniques_by_sta5a <- dbGetQuery(oabi_con,
+                               "with cte as(
+	select *
+		, datefromparts(year(visitDate), month(visitDate), '01') as visitMonth
+	from [PACT_CC].CRH.C_crh_utilization_final
+	where care_type = 'Primary care'
+		and visitdate < cast('2020-03-01' as date)
+		  AND visitdate > cast('2019-09-01' as date)
+	and spoke_sta5a_combined_cdw in(select sta5a from [OABI_MyVAAccess].[crh_eval].ps_matched)
+	)
+select count(distinct scrssn) as scrssn_count
+	, spoke_sta5a_combined_cdw as sta5a
+from cte
+group by spoke_sta5a_combined_cdw") %>%
+  filter(sta5a %in% crh_sta5as)
+#--
+tibble(`Uniques Served by CRH` = sum(uniques_by_sta5a$scrssn_count),
+       `CRH Encounters` = sum(analytic_df$crh_encounter_count, na.rm = T),
+       `CRH Encounters per Unique` = `CRH Encounters` / `Uniques Served by CRH`,
+       foo = "foo") %>%
+  pivot_longer(-foo) %>%
+  select(-foo) %>%
+  mutate(value = if_else(str_detect(name, "per"), 
+                         comma(value, accuracy = 0.01),
+                         comma(value, accuracy = 1))) %>%
+  kbl(col.names = c("", ""),
+      align = c("l", "r")) %>%
+  kable_classic("striped", 
+                full_width = F) %>%
+  row_spec(0, bold = TRUE)
+```
+
+### By Site Type  
+```{r}
+uniques_by_type <- uniques_by_sta5a %>%
+  left_join (., vast) %>%
+  group_by(s_abbr) %>%
+  summarise(`Uniques Served by CRH` = sum(scrssn_count))
+#
+analytic_df %>%
+  left_join(., vast %>% select(sta5a, s_abbr)) %>%
+  group_by(s_abbr) %>%
+  summarise(`CRH Encounters` = sum(crh_encounter_count, na.rm = T)) %>%
+  left_join(., uniques_by_type) %>%
+  mutate(`CRH per Unique` =`CRH Encounters` / `Uniques Served by CRH`) %>%
+  mutate_at(4, comma_format(accuracy = 0.1)) %>%
+  adorn_totals() %>%
+  mutate_at(2:3, comma_format(accuracy = 1)) %>%
+  kbl(col.names = c("Site Type", "CRH Encounters", "Uniques Served by CRH", "CRH per Unique"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(6, bold = TRUE)
+```
+
+### By Urban/Rural    
+```{r}
+uniques_by_urh <- uniques_by_sta5a %>%
+  left_join (., vast) %>%
+  mutate(urh_vast2 = if_else(urh_vast == "U", "Urban", "Rural")) %>%
+  group_by(urh_vast2) %>%
+  summarise(`Uniques Served by CRH` = sum(scrssn_count))
+#
+analytic_df %>%
+  left_join(., vast %>% select(sta5a, urh_vast)) %>%
+  mutate(urh_vast2 = if_else(urh_vast == "U", "Urban", "Rural")) %>%
+  group_by(urh_vast2) %>%
+  summarise(`CRH Encounters` = sum(crh_encounter_count, na.rm = T)) %>%
+  left_join(., uniques_by_urh) %>%
+  mutate(`CRH per Unique` =`CRH Encounters` / `Uniques Served by CRH`) %>%
+  mutate_at(4, comma_format(accuracy = 0.1)) %>%
+  adorn_totals() %>%
+  mutate_at(2:3, comma_format(accuracy = 1)) %>%
+  kbl(col.names = c("Site Type", "CRH Encounters", "Uniques Served by CRH", "CRH per Unique"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE) %>%
+  row_spec(3, bold = TRUE)
+```
+
+
+# Characteristics of Sta5as with PC CRH  
+
+```{r}
+covariates %>%
+  filter(sta5a %in% crh_sta5as
+         & vssc_month >= ymd("2019-10-01")
+         & vssc_month <= ymd("2020-02-01")) %>%
+  select(4, 5, 9:18) %>%
+  pivot_longer(-sta5a) %>%
+  group_by(name) %>%
+  summarise(
+    val_mean = case_when(
+      str_detect(name, "pct") == T ~ percent(mean(value / 100, na.rm = T), accuracy = 0.1),
+      str_detect(name, "shep") == T ~ percent(mean(value, na.rm = T), accuracy = 0.1),
+      TRUE ~ comma(mean(value, na.rm = T), accuracy = 0.1)),
+    val_sd = case_when(
+        str_detect(name, "pct") == T ~ percent(sd(value / 100, na.rm = T), accuracy = 0.1),
+        str_detect(name, "shep") == T ~ percent(sd(value, na.rm = T), accuracy = 0.1),
+        TRUE ~ comma(sd(value, na.rm = T), accuracy = 0.1)),
+    val_min = case_when(
+      str_detect(name, "pct") == T ~ percent(min(value / 100, na.rm = T), accuracy = 0.1),
+      str_detect(name, "shep") == T ~ percent(min(value, na.rm = T), accuracy = 0.1),
+      TRUE ~ comma(min(value, na.rm = T), accuracy = 0.1)),
+    val_max = case_when(
+      str_detect(name, "pct") == T ~ percent(max(value / 100, na.rm = T), accuracy = 0.1),
+      str_detect(name, "shep") == T ~ percent(max(value, na.rm = T), accuracy = 0.1),
+      TRUE ~ comma(max(value, na.rm = T), accuracy = 0.1)),
+    val_25th = case_when(
+      str_detect(name, "pct") == T ~ percent(quantile(value / 100, 0.25, na.rm = T), 
+                                             accuracy = 0.1),
+      str_detect(name, "shep") == T ~ percent(quantile(value, 0.25, na.rm = T), 
+                                              accuracy = 0.1),
+      TRUE ~ comma(quantile(value, 0.25, na.rm = T), accuracy = 0.1)),
+    val_75th = case_when(
+      str_detect(name, "pct") == T ~ percent(quantile(value / 100, 0.75, na.rm = T), 
+                                             accuracy = 0.1),
+      str_detect(name, "shep") == T ~ percent(quantile(value, 0.75, na.rm = T), 
+                                              accuracy = 0.1),
+      TRUE ~ comma(quantile(value, 0.75, na.rm = T), accuracy = 0.1))) %>%
+  mutate(name2 = case_when(
+    name == "adi_natRnk_avg" ~ "ADI",
+    name == "avg_age_oct1_2022" ~ "Age",
+    name == "avg_driveTime" ~ "Drive Time",
+    name == "nosos_risk_score" ~ "NOSOS",
+    name == "obs_exp_panel_ratio" ~ "Observed:Expected Panel Size",
+    name == "pcmm_count_fy_qtr" ~ "Uniques in PCMM",
+    name == "pct_male" ~ "Proportion Male",
+    name == "pct_rural" ~ "Proportion Rural",
+    name == "pct_white" ~ "Proportion White",
+    name == "shep_access_metric" ~ "SHEP Access Composite",
+    name == "team_pcp_ap_fte_total" ~ "Team PCP/AP FTE"
+  )
+  ) %>%
+  distinct %>%
+  ungroup %>%
+  mutate(val_mean_sd = paste0(val_mean, " (", val_sd, ")"),
+         val_min_max = paste0("[", val_min, ", ", val_max, "]"),
+         val_25_75 = paste0("(", val_25th, ", ", val_75th, ")")) %>%
+  select(name2, 8:11) %>%
+  kbl(col.names = c("", "Average (SD)", "[Min., Max.]", "(25th %ile, 75th %ile)")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+# Characteristics of Patients With PC CRH  
+
+```{r}
+patient_chars <- dbGetQuery(oabi_con,
+                            "with CTE as(
+            	select a.scrssn, a.age_oct1_2022
+            	, a.DOB, a.DRIVETIMEPC, a.GENDER, a.LAT, a.LON, a.Race, a.TRACT, a.URH
+            	, b.fips
+            		, c.adi_natrank
+            	from [OABI_MyVAAccess].[crh_eval].J_pat_chars as a
+            	left join [PCS_PCAT].Geo.PatientBlockGroup2021Q4 as b
+            		on a.scrssn = b.ScrSSN_char
+            	left join [PCS_PCAT].[PSSG].adi2015 as c
+            		on SUBSTRING(b.fips, 1, 12) = c.FIPS
+            	)
+            select *
+            from cte
+            UNION
+            select a.scrssn, a.age_oct1_2022
+            	, a.DOB, a.DRIVETIMEPC, a.GENDER, a.LAT, a.LON, a.Race, a.TRACT, a.URH
+            	, b.fips
+            	, c.ADI_NATRANK
+            from cte as a
+            left join [PCS_PCAT].Geo.PatientBlockGroup2021Q4 as b
+            	on a.scrssn = b.ScrSSN_char
+            left join [PCS_PCAT].[PSSG].adi2015 as c
+            	on SUBSTRING(b.fips, 1, 12) = c.FIPS
+            where scrssn IN(select distinct scrssn from cte where fips IS NULL)") %>%
+  filter(is.na(fips) == F)
+#
+paste0_fxn <- function(column){
+  paste0(round(mean({{column}}, na.rm = T), 2), " (", 
+                           round(sd({column}, na.rm = T), 2), ")")
+}
+#
+patient_chars %>%
+  summarise(`Age` = paste0_fxn(age_oct1_2022),
+            `Drivetime to PC` = paste0_fxn(DRIVETIMEPC),
+            `ADI` = paste0_fxn(as.numeric(adi_natrank)),
+            `Male` = percent(sum(patient_chars$GENDER == "M", na.rm = T) / nrow(patient_chars),
+                           accuracy = 0.1),
+            `Male Count` = comma(sum(patient_chars$GENDER == "M", na.rm = T)),
+            `Urban` = percent(sum(patient_chars$URH == "U", na.rm = T) / nrow(patient_chars),
+                           accuracy = 0.1),
+            `Urban count` = comma(sum(patient_chars$URH == "U", na.rm = T)),
+            `White` = percent(sum(patient_chars$Race == "WHITE", na.rm = T) / nrow(patient_chars),
+                           accuracy = 0.1),
+            `Black` = percent(sum(patient_chars$Race == "BLACK", na.rm = T) / nrow(patient_chars),
+                           accuracy = 0.1)) %>%
+  mutate(foo = "foo") %>%
+  pivot_longer(-foo) %>%
+  select(-foo) %>%
+  kbl(col.names = c("Measure", "Value"),
+      align = c("l", "r")) %>%
+  kable_classic("striped",
+      full_width = F)
+```
+
+
+
+# Wait Times at Baseline   
+```{r}
+analytic_df %>%
+  filter(vssc_month == ymd("2019-10-01")) %>%
+  select(sta5a, est_pc_pt_wt_pid, new_pc_pt_wt, third_next_avail) %>%
+  pivot_longer(-sta5a) %>%
+  group_by(name) %>%
+  summarise(avg_val = round(mean(value, na.rm = T),3),
+            sd_val = round(sd(value, na.rm = T),3),
+            qtl_25 = round(quantile(value, 0.25, na.rm = T),3),
+            qtl_75 = round(quantile(value, 0.75, na.rm = T),3)) %>%
+  kbl() %>%
+  kable_classic("striped")
+```

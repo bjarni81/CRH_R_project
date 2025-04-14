@@ -1,0 +1,94 @@
+---
+title: "PC CRH Counts - CMR Request"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    code_folding: hide
+    toc_float: true
+    toc: true
+    toc_depth: 3
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, cache = FALSE, fig.width = 14, fig.height = 14)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+#
+`%ni%` <- negate(`%in%`)
+```
+
+```{r}
+vast <- read_csv(here("Input", "Data","VAST_from_A06_11jan21.csv"))
+#===================
+# PC CRH Encounters
+pc_crh_encounters <- dbGetQuery(oabi_con,
+                             "select * from [PACT_CC].[CRH].[crh_full_utilization_final_fy20_21]") %>%
+  rename_all(tolower) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-")),
+         fy = if_else(month(crh_month) > 9, year(crh_month) + 1, year(crh_month)),
+         qtr = case_when(month(crh_month) %in% c(10, 11, 12) ~ 1,
+                         month(crh_month) %in% c(1, 2, 3) ~ 2,
+                         month(crh_month) %in% c(4, 5, 6) ~ 3,
+                         month(crh_month) %in% c(7, 8, 9) ~ 4),
+         fyqtr = str_c(fy, "-", qtr)) %>%
+  left_join(., vast, by = c("spoke_sta5a_combined_cdw" = "sta5a")) %>%
+  rename(sta5a = spoke_sta5a_combined_cdw) %>%
+  filter(fy %in% c(2020, 2021) 
+         & care_type == "Primary Care")
+```
+
+```{r}
+#Table of frequencies of types of visits across all hubs, by year
+
+#Table of frequencies of providers delivering care (MD, RN, PharmD, etc.) across all hubs by year
+
+#Primary care (Bjarni)
+	
+#Confirm that all hubs saw at least 1 patient by 10/1/21
+
+```
+
+# PC CRH Encounters by Hub and FY  
+
+```{r}
+pc_crh_encounters %>%
+  group_by(hub_location, fy) %>%
+  summarise(encounters = n()) %>%
+  pivot_wider(names_from = fy, values_from = encounters) %>%
+  kbl(col.names = c("Hub Location", "PC Encounters 2020", "PC Encounters 2021")) %>%
+  kable_classic("striped")
+```
+
+---
+
+# First Date of PC CRH Encounter  
+
+```{r}
+pc_crh_encounters %>%
+  group_by(hub_location) %>%
+  summarise(first_crh_date = min(visitdate)) %>%
+  kbl(col.names = c("Hub Location", "First PC CRH Date")) %>%
+  kable_classic("striped")
+```

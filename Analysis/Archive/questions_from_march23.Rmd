@@ -1,0 +1,348 @@
+---
+title: "Primary Care CRH: Answers to Questions on March 23rd"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE, echo=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, fig.width = 8, fig.height = 8)
+#
+knitr::knit_hooks$set(inline = function(x){
+  prettyNum(x, big.mark = ",")
+})
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(DT)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+##---------- Connection to PACT_CC
+pactcc_con <- dbConnect(odbc::odbc(),
+                        Driver = "SQL Server",
+                        Server = "vhacdwsql13.vha.med.va.gov",
+                        Database = "PACT_CC",
+                        Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 18),
+             strip.text = element_text(size = 20),
+             legend.text = element_text(size = 18),
+             legend.title = element_text(size = 20),
+             plot.caption = element_text(size = 12))
+```
+
+```{r reading-in}
+# VAST
+vast <- read_csv(here("Input", "Data", "vast_from_a06_17mar22.csv")) 
+#
+vast_to_include <- vast %>%
+  filter(is.na(s_abbr) == F)
+#==--
+# CRH Penetration rate
+pen_rate_month <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].crh_penRate_month") %>%
+  inner_join(., vast_to_include)
+#---------------
+all_months <- pen_rate_month %>%
+  select(crh_month) %>%
+  distinct
+#
+all_sta5a <- pen_rate_month %>%
+  select(sta5a) %>%
+  distinct
+#----
+# crh flags
+crh_flags <- dbGetQuery(oabi_con,
+                        "select * from [crh_eval].yoon_flag")
+#-----
+pc_crh_encounters <- dbGetQuery(pactcc_con,
+                                "select * from [CRH].C_crh_utilization_final
+                                where care_type = 'Primary Care' AND (fy in(2020, 2021) OR (fy = 2022 AND qtr = 1))") %>%
+  rename(sta5a = spoke_sta5a_combined_cdw) %>%
+  mutate(visitdate = ymd(visitdate),
+         crh_month = ymd(str_c(year(visitdate), month(visitdate), "01", sep = "-"))) %>%
+  inner_join(., vast_to_include) %>%
+  mutate(
+    pStopCodeName = case_when(
+      primarystopcode == 323 ~ "PRIMARY CARE/MEDICINE",
+      primarystopcode == 674 ~ "ADMIN PAT ACTIVTIES (MASNONCT)",
+      primarystopcode == 338 ~ "TELEPHONE PRIMARY CARE",
+      primarystopcode == 301 ~ "GENERAL INTERNAL MEDICINE",
+      primarystopcode == 178 ~ "TELEPHONE HBPC",
+      primarystopcode == 348 ~ "PRIMARY CARE SHARED APPT",
+      primarystopcode == 176 ~ "HBPC - CLINICAL PHARMACIST",
+      primarystopcode == 177 ~ "HBPC - OTHER",
+      primarystopcode == 322 ~ "COMP WOMEN'S HLTH",
+      primarystopcode == 156 ~ "HBPC - PSYCHOLOGIST"
+  ),
+    sStopCodeName = case_when(
+      secondarystopcode == 323 ~ "PRIMARY CARE/MEDICINE",
+      secondarystopcode == 690 ~ "RT CLIN VID TH PAT SITE",
+      secondarystopcode == 693 ~ "RT CLIN VD TH PRV SITE(DIFSTA)",
+      secondarystopcode == 185 ~ "NP/PA",
+      secondarystopcode == 179 ~ "RT CLIN VID CARE HOME",
+      secondarystopcode == 692 ~ "CVT PRV SITE SAME DIV/STA",
+      secondarystopcode == 117 ~ "NURSING (2ND ONLY)",
+      secondarystopcode == 186 ~ "PA",
+      secondarystopcode == 719 ~ "MHV SECURE MESSAGING",
+      secondarystopcode == 125 ~ "SOCIAL WORK SERVICE",
+      secondarystopcode == 130 ~ "EMERGENCY DEPT",
+      secondarystopcode == 184 ~ "CARE/CASE MANAGER",
+      secondarystopcode == 188 ~ "FELLOW/RESIDENT",
+      secondarystopcode == 205 ~ "PHYSICAL THERAPY",
+      secondarystopcode == 206 ~ "OCCUPATIONAL THERAPY",
+      secondarystopcode == 301 ~ "GENERAL INTERNAL MEDICINE",
+      secondarystopcode == 322 ~ "COMP WOMEN'S HLTH",
+      secondarystopcode == 510 ~ "PSYCHOLOGY",
+      secondarystopcode == 534 ~ "MH INTGRTD CARE IND",
+      secondarystopcode == 673 ~ "CLINICAL TEAM CONFERENCE",
+      secondarystopcode == 697 ~ "CHART CONSULT",
+      TRUE ~ "Missing"
+      
+    ))
+# CRH Penetration rate
+pen_rate_month <- dbGetQuery(oabi_con,
+                             "select * from [OABI_MyVAAccess].[crh_eval].crh_penRate_month") %>%
+  inner_join(., vast_to_include)
+```
+
+# 1. Can we get CRH modality from stop codes?  
+## 1a: All Combinations   
+
+```{r}
+pc_crh_encounters %>% group_by(primarystopcode, pStopCodeName, secondarystopcode, sStopCodeName) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(primarystopcode = as.character(primarystopcode),
+         secondarystopcode = as.character(secondarystopcode)) %>%
+  adorn_totals() %>%
+  mutate(prop = scales::percent(count / nrow(pc_crh_encounters), accuracy = 0.1),
+         count = comma(count, accuracy = 1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "PC CRH Encounters", "Proportion of total"),
+      align = c("c", "l", "c", "l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 1b: Primary SC = 323  
+```{r}
+pc_crh_encounters %>% 
+  filter(primarystopcode == 323) %>%
+  group_by(primarystopcode, pStopCodeName, secondarystopcode, sStopCodeName) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(primarystopcode = as.character(primarystopcode),
+         secondarystopcode = as.character(secondarystopcode)) %>%
+  adorn_totals() %>%
+  mutate(prop = scales::percent(count / nrow(pc_crh_encounters), accuracy = 0.1),
+         count = comma(count, accuracy = 1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "PC CRH Encounters", "Proportion of total"),
+      align = c("c", "l", "c", "l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+
+## 1c: Primary SC = 338  
+```{r}
+pc_crh_encounters %>% 
+  filter(primarystopcode == 338) %>%
+  group_by(primarystopcode, pStopCodeName, secondarystopcode, sStopCodeName) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(primarystopcode = as.character(primarystopcode),
+         secondarystopcode = as.character(secondarystopcode)) %>%
+  adorn_totals() %>%
+  mutate(prop = scales::percent(count / nrow(pc_crh_encounters), accuracy = 0.1),
+         count = comma(count, accuracy = 1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "PC CRH Encounters", "Proportion of total"),
+      align = c("c", "l", "c", "l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 1d: Primary SC = 674  
+```{r}
+pc_crh_encounters %>% 
+  filter(primarystopcode == 674) %>%
+  group_by(primarystopcode, pStopCodeName, secondarystopcode, sStopCodeName) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(primarystopcode = as.character(primarystopcode),
+         secondarystopcode = as.character(secondarystopcode)) %>%
+  adorn_totals() %>%
+  mutate(prop = scales::percent(count / nrow(pc_crh_encounters), accuracy = 0.1),
+         count = comma(count, accuracy = 1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "PC CRH Encounters", "Proportion of total"),
+      align = c("c", "l", "c", "l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 1e: Secondary SC IN(179, 690, 692, 693)  
+```{r}
+pc_crh_encounters %>% 
+  filter(secondarystopcode %in% c(179, 690, 692, 693)) %>%
+  group_by(primarystopcode, pStopCodeName, secondarystopcode, sStopCodeName) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(primarystopcode = as.character(primarystopcode),
+         secondarystopcode = as.character(secondarystopcode)) %>%
+  adorn_totals() %>%
+  mutate(prop = scales::percent(count / nrow(pc_crh_encounters), accuracy = 0.1),
+         count = comma(count, accuracy = 1)) %>%
+  kbl(col.names = c("Primary SC", "PSC Name", "Secondary SC", "SSC Name", "PC CRH Encounters", "Proportion of total"),
+      align = c("c", "l", "c", "l", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+# 2: How about using LocationName?  
+```{r}
+locationname_to_modality <- read_xlsx("H:/HSRD_General/Kaboli Access Team/CRH Evaluation/Bjarni/Documents/National CRH Naming Convention and Clinic Build Spreadsheet.xlsx",
+                 sheet = 2,
+                 skip = 1) %>%
+  filter(`CRH Group` == "Primary Care") %>%
+  select(locationname = `Clinic Name`,
+         clinic_type = `Clinic Type`) %>%
+  mutate(last_3 = str_trim(str_sub(locationname, start = -3))) %>%
+  select(-locationname) %>% distinct %>%
+  mutate(modality = case_when(last_3 == "ADM" ~ "Administrative",
+                              last_3 %in% c("PT", "PCP", "OUP", "VVC") ~ "Video",
+                              last_3 == "F2F" ~ "In-person",
+                              last_3 == "PH" ~ "Telephone",
+                              TRUE ~ "Other")) %>%
+  select(-clinic_type)
+#
+pc_crh_encounters %>%
+  group_by(locationname) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count)) %>%
+  mutate(last_3 = str_trim(str_sub(locationname, start = -3))) %>%
+  left_join(locationname_to_modality) %>%
+  distinct() %>%
+  mutate(modality = if_else(is.na(modality) == T, "Other", modality)) %>%
+  group_by(modality) %>%
+  summarise(count = sum(count)) %>%
+  arrange(desc(count)) %>%
+  mutate(prop = count / nrow(pc_crh_encounters)) %>%
+  adorn_totals() %>%
+  mutate(prop = percent(prop, accuracy = 0.1), 
+         count = comma(count, accuracy = 1)) %>%
+  kbl(col.names = c("Modality", "Encounters", "Proportion"),
+      align = c("l", "r", "r")) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = TRUE)
+```
+
+# 3: How often is the numerator larger than the denominator?  
+```{r}
+pen_rate_crh_only <- pen_rate_month %>%
+  filter(is.na(crh_encounter_count) == F) %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH")))
+```
+
+* Out of `r nrow(pen_rate_crh_only) %>% comma(accuracy = 1)` sta5a-months, only `r sum(pen_rate_crh_only$crh_encounter_count > pen_rate_crh_only$pc_encounter_noVax_total, na.rm = T)` (`r (sum(pen_rate_crh_only$crh_encounter_count > pen_rate_crh_only$pc_encounter_noVax_total, na.rm = T) / nrow(pen_rate_crh_only)) %>% percent(accuracy = 0.1)`) have more PC CRH Encounters than they do total PC Encounters (no vaccines)
+
+```{r}
+pen_rate_crh_only %>%
+  filter(crh_encounter_count > pc_encounter_noVax_total
+         & table_1_columns == "CRH") %>%
+  arrange(sta5a, crh_month) %>%
+  left_join(., vast %>% select(sta5a, short_name)) %>%
+  select(sta5a, short_name, crh_month, crh_encounter_count, pc_encounter_noVax_total) %>%
+  mutate(pc_crh_per_1k_pc = comma(crh_encounter_count / pc_encounter_noVax_total * 1000, accuracy = 0.1)) %>%
+  kbl(col.names = c("Sta5a", "Sta5a Name", "Month", "PC CRH Encounters", "Total PC Encounters", "PC CRH per 1,000 Total PC"),
+      align = c("l", "l", "l", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 3a: Can we fix it by adding Numerator + Denominator?  
+```{r}
+pen_rate_crh_only %>%
+  filter(crh_encounter_count > pc_encounter_noVax_total
+         & table_1_columns == "CRH") %>%
+  arrange(sta5a, crh_month) %>%
+  left_join(., vast %>% select(sta5a, short_name)) %>%
+  mutate(new_denom = pc_encounter_noVax_total + crh_encounter_count) %>%
+  select(sta5a, short_name, crh_month, crh_encounter_count, pc_encounter_noVax_total, new_denom) %>%
+  mutate(pc_crh_per_1k_pc = comma(crh_encounter_count / new_denom * 1000, accuracy = 0.1)) %>%
+  kbl(col.names = c("Sta5a", "Sta5a Name", "Month", "PC CRH Encounters", "Total PC Encounters", "\"New\" Denominator", "PC CRH per 1,000 Total PC"),
+      align = c("l", "l", "l", "r", "r", "r", "r")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```
+
+## 3b: What does the boxplot look like now?  
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  mutate(new_denom = pc_encounter_noVax_total + crh_encounter_count,
+         pc_crh_per_1k_pc_total = crh_encounter_count / new_denom * 1000) %>%
+  filter(pc_crh_per_1k_pc_total < 75000) %>%
+  ggplot(data = .,
+         aes(x = table_1_columns, y = pc_crh_per_1k_pc_total, fill = table_1_columns)) +
+  geom_boxplot() +
+  scale_y_continuous(labels = scales::comma_format()) +
+  theme(axis.title.x = element_blank(),
+        legend.position = "none") +
+  labs(y = "PC CRH per 1,000 Total PC (encounters)")
+```
+
+## 3c: And the top 25?     
+```{r}
+pen_rate_month %>%
+  left_join(., crh_flags) %>%
+  mutate(table_1_columns = factor(case_when(yoon_flag == 1 ~ "CRH",
+                                            crh_flag == 1 & yoon_flag == 0 ~ "Not Enough CRH",
+                                            is.na(crh_flag) == T ~ "No CRH",
+                                            TRUE ~ "Uh-oh"), 
+                                  ordered = TRUE,
+                                  levels = c("CRH", "Not Enough CRH", "No CRH"))) %>%
+  filter(table_1_columns == "CRH") %>%
+  mutate(new_denom = pc_encounter_noVax_total + crh_encounter_count,
+         pc_crh_per_1k_pc_total = round(crh_encounter_count / new_denom * 1000, 1)) %>%
+  ungroup() %>%
+  slice_max(., pc_crh_per_1k_pc_total, n = 25) %>%
+  left_join(., vast %>% select(sta5a, short_name, state)) %>%
+  mutate(lab_name = paste0("(", sta5a, ") ", short_name, " - ", state)) %>%
+  select(lab_name, crh_month, crh_encounter_count, pc_encounter_noVax_total, new_denom, pc_crh_per_1k_pc_total) %>%
+  kbl(col.names = c("Sta5a", "Month", "PC CRH Encounters", "Total PC Encounters", "\"New\" Denominator", "PC CRH / 1,000 Total PC")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = TRUE)
+```

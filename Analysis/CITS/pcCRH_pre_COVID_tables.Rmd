@@ -1,0 +1,888 @@
+---
+title: "PC CRH Description: Pre-COVID"
+date: "`r Sys.Date()`"
+author: "Bjarni Haraldsson"
+output: 
+  html_document:
+    toc_float: true
+    toc: true
+    toc_depth: 3
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, cache = FALSE, fig.width = 10, fig.height = 10)
+#
+# knitr::knit_hooks$set(inline = function(x){
+#   prettyNum(x, big.mark = ",")
+# })
+#
+options(scipen = 999, knitr.kable.NA = ' ')
+#
+library(tidyverse)
+library(lubridate)
+library(kableExtra)
+library(readxl)
+library(DBI)
+library(here)
+library(scales)
+library(janitor)
+library(MatchIt)
+library(lme4)
+library(sjPlot)
+#
+##---------- Connection to SQL13
+oabi_con <- dbConnect(odbc::odbc(),
+                      Driver = "SQL Server",
+                      Server = "vhacdwsql13.vha.med.va.gov",
+                      Database = "OABI_MyVAAccess",
+                      Trusted_Connection = "true")
+#
+`%ni%` <- negate(`%in%`)
+#---------
+theme_update(axis.title = element_text(size = 20),
+             axis.text = element_text(size = 16),
+             strip.text = element_text(size = 14),
+             legend.text = element_text(size = 18),
+             legend.title = element_blank(),
+             plot.caption = element_text(size = 12),
+             legend.position = "bottom")
+#===========
+source(here("input", "Functions", "multiplot_05jan21.R"))
+```
+
+```{r reading-in}
+#vast file for s_abbr and others
+vast <- dbGetQuery(oabi_con,
+                   "select * from [OABI_MyVAAccess].[crh_eval].C2_vast_from_a06") %>%
+  mutate(s_abbr2 = case_when(
+    s_abbr %in% c("PCCBOC", "MSCBOC") ~ "CBOC",
+    s_abbr %in% c("VAMC", "HCC") ~ "VAMC/HCC",
+    s_abbr == "OOS" ~ "OOS",
+    TRUE ~ "Uh-oh!"
+  ),
+  urh2 = if_else(urh_vast %in% c("R", "H"), "Rural", "Urban"))
+#-------
+sta5a_demog_no_missing <- read_csv(here("Input", "Data", "sta5a_demog_no_missing.csv"))
+#propensity score matched sta5as
+ps_matched <- read_csv(here("Input","Data", "ps_matched_sta5as_pre_covid.csv"))
+#pulling vssc access metrics
+access_metrics <- dbGetQuery(oabi_con,
+                             "select * from [crh_eval].E2_VSSC_access_metrics") %>%
+  mutate(vssc_month = ymd(vssc_month),
+         tna_new_source = as.numeric(tna_new_source))
+#--
+crh_flag <- dbGetQuery(oabi_con,
+                       "select * from [OABI_MyVAAccess].[crh_eval].C1_crh_flag")
+#making a time column
+dates <- tibble(
+  vssc_month = seq.Date(ymd("2018-10-01"), ymd("2020-02-01"), "1 month")) %>%
+  arrange(vssc_month) %>%
+  rowid_to_column(., var = "time")
+#counting average # of unique scrssns in FY2018 by sta5a and making a categorical variable
+  # that we use for exclusion
+scrssn_count <- dbGetQuery(oabi_con,
+                           "with CTE as(
+                            	select count(distinct ScrSSN_num) as scrssn_count
+                            		, sta5a, fy, qtr
+                            	from [PACT_CC].[econ].PatientPCP
+                            	where fy = 2018
+                            	group by Sta5a, fy, QTR
+                            	)
+                            select AVG(scrssn_count) as scrssn_count_avg_fy18, sta5a
+                            from CTE
+                            group by Sta5a") %>%
+  mutate(scrssn_count_cat = factor(case_when(
+    scrssn_count_avg_fy18 < 450 ~ "< 450",# exclusion criteria
+    scrssn_count_avg_fy18 >= 450 & scrssn_count_avg_fy18 < 2400 ~ "450 - 2,399",
+    scrssn_count_avg_fy18 >= 2400 & scrssn_count_avg_fy18 < 10000 ~ "2,400 - 9,999",
+    scrssn_count_avg_fy18 >= 10000 ~ "10,000+"
+  ), ordered = TRUE,
+  levels = c("< 450", "450 - 2,399", "2,400 - 9,999", "10,000+")))
+#---------------
+covariates <- dbGetQuery(oabi_con,
+                         "select * from [OABI_MyVAAccess].[crh_eval].Z_analytic_df") %>%
+  rename(sta5a = Sta6a, vssc_month = visitMonth) %>%
+  mutate(vssc_month = ymd(vssc_month)) %>%
+  mutate(pct_male = male_count / scrssn_count * 100,
+         pct_white = race_white_count / scrssn_count * 100,
+         pct_black = race_black_count / scrssn_count * 100,
+         pct_other = race_other_count / scrssn_count * 100,
+         pct_rural = urh_rural_count / scrssn_count * 100) %>%
+  select(-pc_encounter_total)
+#--------
+pc_encounters <- dbGetQuery(oabi_con,
+                            "select *
+                            from [OABI_MyVAAccess].[crh_eval].A1_pc_enc_scrssn_count") %>%
+  mutate(visitMonth = ymd(visitMonth))
+#-----
+pc_cons <- dbGetQuery(oabi_con,
+                      "with CTE as(
+select count(*) as total_cons, actyMonth, sum(non_va) as non_va_cons, sta6a, fy, qtr
+from [OABI_MyVAAccess].[crh_eval].G_communityCare_referrals
+where stopCode_group = 'Primary Care'
+group by Sta6a, actyMonth, fy, qtr),
+cte2 as(
+	select count(*) as pcmm_scrssn_count, sta5a, fy, qtr
+	from [PACT_CC].[econ].PatientPCP
+	where fy > 2016 AND fy < 2021
+	group by sta5a, fy, qtr
+)
+select a.sta6a, actyMonth, tot_cons = cast(total_cons as float), non_va_cons = cast(non_va_cons as float), 
+			non_va_cons_rate_per_10k_pcmm = (cast(non_va_cons as float) / cast(pcmm_scrssn_count as float)) * 10000
+from CTE as a
+left join cte2 as b
+	on a.Sta6a = b.Sta5a
+		and a.fy = b.FY
+		and a.qtr = b.QTR") %>%
+  mutate(actyMonth = ymd(actyMonth))
+#--------
+pen_rate <- dbGetQuery(oabi_con,
+                       "select *
+                       from [OABI_MyVAAccess].[crh_eval].B1_crh_penRate")
+#-------
+crh_counts <- dbGetQuery(oabi_con,
+                         "
+          with CTE as(
+          	select *
+          		, DATEFROMPARTS(year(visitdate), month(visitdate), '01') as crh_month
+          	from [PACT_CC].[CRH].C_crh_utilization_final
+          	where care_type = 'Primary Care'
+          )
+          select count(*) as pc_crh_enc_count
+          	, count(distinct scrssn) as pc_crh_scrssn_count
+          	, sta5a = spoke_sta5a_combined_cdw
+          from cte
+          where crh_month > cast('2018-09-01' as date)
+          	and crh_month < cast('2020-03-01' as date)
+          group by spoke_sta5a_combined_cdw")
+```
+
+```{r}
+# a vector of sta5as meeting our pc crh criteria
+matched_treated <- ps_matched %>%
+  filter(at_least_10_pc_crh_flag == 1) %>%
+  select(sta5a) %>%
+  pull
+#--
+matched_control <- ps_matched %>%
+  filter(at_least_10_pc_crh_flag == 0) %>%
+  select(sta5a) %>%
+  pull
+#--
+unMatched_treated <- sta5a_demog_no_missing %>%
+  filter(at_least_10_pc_crh_flag == T) %>%
+  select(sta5a) %>%
+  pull
+#--
+all_control <- sta5a_demog_no_missing %>%
+  filter(at_least_10_pc_crh_flag == F) %>%
+  select(sta5a) %>%
+  pull
+#--
+zeroCrh_control <- sta5a_demog_no_missing %>%
+  select(-not_enough_crh_before_march_20) %>%
+  left_join(., crh_flag) %>%
+  filter(at_least_10_pc_crh_flag == F
+         & not_enough_crh_before_march_20 == F) %>%
+  select(sta5a) %>%
+  pull
+```
+
+```{r}
+table1_df <- covariates %>%
+  select(-c(est_pc_pt_wt, new_pc_pt_wt, third_next_avail)) %>%
+  filter(vssc_month > ymd("2018-06-01")
+         & vssc_month < ymd("2020-03-01")) %>%#restrict to our timeframe
+  left_join(., dates) %>%
+  left_join(., scrssn_count) %>%
+  left_join(., access_metrics) %>%
+  left_join(., pc_cons, by = c("sta5a" = "sta6a", "vssc_month" = "actyMonth")) %>%
+  left_join(., pc_encounters, by = c("sta5a" = "Sta6a", "vssc_month" = "visitMonth")) %>%
+  mutate(unMatched_vs_allEligible = case_when(sta5a %in% unMatched_treated ~ "Treated",
+                                              sta5a %in% all_control ~ "Control"),
+         unMatched_vs_zeroControl = case_when(sta5a %in% unMatched_treated ~ "Treated",
+                                              sta5a %in% zeroCrh_control ~ "Control"),
+         matched_vs_allEligible = case_when(sta5a %in% matched_treated ~ "Treated",
+                                              sta5a %in% all_control ~ "Control"),
+         matched_vs_zeroControl = case_when(sta5a %in% matched_treated ~ "Treated",
+                                              sta5a %in% zeroCrh_control ~ "Control"),
+         matched = case_when(sta5a %in% matched_treated ~ "Treated",
+                                              sta5a %in% matched_control ~ "Control"),
+         non_va_cons_rate_per_10k_pcmm = replace_na(non_va_cons_rate_per_10k_pcmm, 0))
+```
+
+```{r}
+analytic_df <- covariates %>%
+  rename(scrssn_count_covars = scrssn_count) %>%
+  select(-c(est_pc_pt_wt, new_pc_pt_wt, third_next_avail)) %>%
+  filter(vssc_month > ymd("2019-09-01")
+         & vssc_month < ymd("2020-03-01")) %>%
+  left_join(., access_metrics) %>%
+  left_join(., pc_cons, by = c("sta5a" = "sta6a", "vssc_month" = "actyMonth")) %>%
+  left_join(., pc_encounters %>% select(-c(fy, qtr)), 
+            by = c("sta5a" = "Sta6a", "vssc_month" = "visitMonth")) %>%
+  mutate(unMatched_vs_allEligible = case_when(sta5a %in% unMatched_treated ~ "Treated",
+                                              sta5a %in% all_control ~ "Control"),
+         unMatched_vs_zeroControl = case_when(sta5a %in% unMatched_treated ~ "Treated",
+                                              sta5a %in% zeroCrh_control ~ "Control"),
+         matched_vs_allEligible = case_when(sta5a %in% matched_treated ~ "Treated",
+                                            sta5a %in% all_control ~ "Control"),
+         matched_vs_zeroControl = case_when(sta5a %in% matched_treated ~ "Treated",
+                                            sta5a %in% zeroCrh_control ~ "Control"),
+         matched = case_when(sta5a %in% matched_treated ~ "Treated",
+                             sta5a %in% matched_control ~ "Control"),
+         non_va_cons_rate_per_10k_pcmm = replace_na(non_va_cons_rate_per_10k_pcmm, 0))
+```
+
+
+# Front Matter  
+
+## Description of this report  
+
+* This is a collection of tables describing the sta5as and patients engaged with PC CRH 
+
+## Decision Points  
+
+* Per our discussion on August 23rd I am putting these tables together for the pre-COVID PC CRH manuscript
+    
+## Analytic details  
+
+
+* Description of the cohort (i.e., __analytic\_df__)
+    + The first observation in the data occurs on `r min(analytic_df$vssc_month)`
+    + The last observation in the data occurs on `r max(analytic_df$vssc_month)`
+    + There are `r nrow(analytic_df) %>% comma()` rows in the data
+    + These rows come from `r analytic_df %>% select(sta5a) %>% n_distinct()` sta5as
+      + `r analytic_df %>% select(sta5a) %>% n_distinct()` of these met our criteria for PC CRH before March, 2020
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "CBOC") == T))` of these are CBOCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "HCC|VAMC") == T))` of these are HCCs or VAMCs
+      + `r analytic_df %>% select(sta5a, s_abbr) %>% distinct() %>% summarise(tot = sum(str_detect(s_abbr, "OOS") == T))` of these are OOS
+    + Each row is a sta5a-month
+    
+* Description of _Propensity Score_ matching
+    + This report uses the pre-COVID PS matching model
+    + This model consists of: 
+        + Outcomes matched on their average values over FY19
+        + Exact match on site type (CBOC, VAMC/HCC, OOS) and VISN
+        + "Optimally" matched on FY18 Q4 average values of PCMM uniques, Obs:Exp panel size ratio, proportion rural, non-VA consults per 10,000 in PCMM
+
+
+# Table 1  
+
+```{r}
+table_fxn <- function(group_column, period){
+  table_df <- if(period == "clinic"){
+    table1_df %>% 
+      filter(vssc_month >= ymd("2018-07-01") & vssc_month <= ymd("2018-09-01")) %>%
+    select(sta5a, {{group_column}},
+           pc_encounter_total, 
+           pcmm_count_fy_qtr, 
+           obs_exp_panel_ratio,
+           team_pcp_ap_fte_total,
+           non_va_cons_rate_per_10k_pcmm,
+           nosos_risk_score,
+           adi_natRnk_avg,
+           pct_rural)
+  }
+  else if(period == "outcome"){
+    table1_df %>% 
+      filter(vssc_month >= ymd("2018-10-01") & vssc_month <= ymd("2019-09-01")) %>%
+    select(sta5a, {{group_column}},
+           est_pc_pt_wt_pid,
+           new_pc_pt_wt_create,
+           third_next_avail)
+  }
+  else {table1_df}
+  #
+  table_df %>%
+    filter(is.na({{group_column}}) == F) %>%
+    pivot_longer(-c(sta5a, {{group_column}})) %>%
+    group_by({{group_column}}, name) %>%
+    nest() %>%
+    pivot_wider(names_from = {{group_column}}, values_from = data) %>%
+    mutate(t_test = map2(`Control`, `Treated`, ~{t.test(.x$value, .y$value) %>% broom::tidy()}),
+           control_nrow = map(`Control`, ~{sum(!is.na(.x$value))}),
+           treated_nrow = map(`Treated`, ~{sum(!is.na(.x$value))}),
+           control_sd = map(`Control`, ~sd(.x$value, na.rm = T)),
+           treated_sd = map(`Treated`, ~sd(.x$value, na.rm = T))) %>%
+    unnest(cols = c(control_nrow, treated_nrow, t_test, control_sd, treated_sd)) %>%
+    ungroup() %>%
+    mutate(control_estimate = paste0(
+      comma(estimate1, accuracy = 0.01), " (", comma(control_sd, accuracy = 0.01), ")"
+    ),
+    treated_estimate = paste0(
+      comma(estimate2, accuracy = 0.01), " (", comma(treated_sd, accuracy = 0.01), ")"
+    ),
+    across(contains("nrow"), comma)) %>%
+    select(name, control_nrow, treated_nrow, treated_estimate, control_estimate, estimate, p.value) %>%
+    mutate(p.value = if_else(p.value < 0.001, "<0.001",
+                             comma(p.value, accuracy = 0.001)),
+           estimate = comma(estimate, accuracy = 0.01)) %>%
+    kbl(col.names = c("", "Control Obs.", "Treated Obs.", "Treated Mean (SD)", "Control Mean (SD)", 
+                      "Difference", "p-value for Difference"),
+        align = c("l", rep("r", 5))) %>%
+    kable_classic("striped") %>%
+    row_spec(0, bold = T)
+}
+#
+```
+
+## Un-Matched Treated Clinics vs. All Eligible Clinics  
+
+* There are `r analytic_df %>% filter(unMatched_vs_allEligible == "Control") %>% select(sta5a) %>% n_distinct()` "Control" sta5as
+* There are `r analytic_df %>% filter(unMatched_vs_allEligible == "Treated") %>% select(sta5a) %>% n_distinct()` "Treated" sta5as
+
+```{r}
+analytic_df %>%
+  filter(is.na(unMatched_vs_allEligible) == F) %>%
+  group_by(unMatched_vs_allEligible) %>%
+  summarise(total_pc_visits = comma(sum(pc_encounter_total, na.rm = T))) %>%
+  pivot_wider(names_from = unMatched_vs_allEligible, values_from = total_pc_visits) %>%
+  mutate(col1 = "Total PC Encounters") %>%
+  select(3, 1, 2) %>%
+  kbl(col.names = c("", "Control", "Un-Matched Treated"),
+      align = c("c", "r", "r")) %>%
+  kable_classic(full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+table_fxn(unMatched_vs_allEligible, "clinic")
+```
+
+```{r}
+table_fxn(unMatched_vs_allEligible, "outcome")
+```
+
+
+
+## Un-Matched Treated Clinics vs. Control Clinics With Zero PC CRH    
+
+* There are `r analytic_df %>% filter(unMatched_vs_zeroControl == "Control") %>% select(sta5a) %>% n_distinct()` "Control" sta5as
+* There are `r analytic_df %>% filter(unMatched_vs_zeroControl == "Treated") %>% select(sta5a) %>% n_distinct()` "Treated" sta5as
+
+```{r}
+analytic_df %>%
+  filter(is.na(unMatched_vs_zeroControl) == F) %>%
+  group_by(unMatched_vs_zeroControl) %>%
+  summarise(total_pc_visits = comma(sum(pc_encounter_total, na.rm = T))) %>%
+  pivot_wider(names_from = unMatched_vs_zeroControl, values_from = total_pc_visits) %>%
+  mutate(col1 = "Total PC Encounters") %>%
+  select(3, 1, 2) %>%
+  kbl(col.names = c("", "Control", "Un-Matched Treated"),
+      align = c("c", "r", "r")) %>%
+  kable_classic(full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+
+```{r}
+table_fxn(unMatched_vs_zeroControl, "clinic")
+```
+
+```{r}
+table_fxn(unMatched_vs_zeroControl, "outcome")
+```
+
+## Matched Clinics      
+
+* There are `r analytic_df %>% filter(matched == "Control") %>% select(sta5a) %>% n_distinct()` "Control" sta5as
+* There are `r analytic_df %>% filter(matched == "Treated") %>% select(sta5a) %>% n_distinct()` "Treated" sta5as
+
+```{r}
+analytic_df %>%
+  filter(is.na(matched) == F) %>%
+  group_by(matched) %>%
+  summarise(total_pc_visits = comma(sum(pc_encounter_total, na.rm = T))) %>%
+  pivot_wider(names_from = matched, values_from = total_pc_visits) %>%
+  mutate(col1 = "Total PC Encounters") %>%
+  select(3, 1, 2) %>%
+  kbl(col.names = c("", "Control", "Treated"),
+      align = c("c", "r", "r")) %>%
+  kable_classic(full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+
+```{r}
+table_fxn(matched, "clinic")
+```
+
+```{r}
+table_fxn(matched, "outcome")
+```
+
+# Table 2  
+
+```{r}
+table2_1_fxn <- function(group_var, is_crh){
+  if({{is_crh}} == T){
+    crh_counts %>% filter(sta5a %in% matched_treated) %>%
+      rename(pc_encounter_total = pc_crh_enc_count,
+             scrssn_count = pc_crh_scrssn_count) %>%
+      summarise(encounter_count = sum(pc_encounter_total),
+                scrssn_count = sum(scrssn_count)) %>%
+      mutate(pc_per_unique = encounter_count / scrssn_count,
+             foo = "foo") %>%
+      pivot_longer(-foo) %>%
+      select(-foo) %>%
+      mutate(value = comma(value, accuracy = 0.01)) %>%
+      rename("{{group_var}}_crh" := value)
+  }
+  else {
+    pc_encounters %>%
+      filter(visitMonth > ymd("2018-09-01") & visitMonth < ymd("2020-03-01")
+             & Sta6a %in% {{group_var}}) %>%
+      summarise(encounter_count = sum(pc_encounter_total),
+                scrssn_count = sum(scrssn_count)) %>%
+      mutate(pc_per_unique = encounter_count / scrssn_count,
+             foo = "foo") %>%
+      pivot_longer(-foo) %>%
+      select(-foo) %>%
+      mutate(value = comma(value, accuracy = 0.01)) %>%
+      rename({{group_var}} := value)
+  }
+}
+#
+table2_1_fxn(matched_treated, is_crh = TRUE) %>%
+  left_join(., table2_1_fxn(matched_treated, is_crh = FALSE)) %>%
+  left_join(., table2_1_fxn(all_control, is_crh = FALSE)) %>%
+  left_join(., table2_1_fxn(matched_control, is_crh = FALSE)) %>%
+  kbl(col.names = c("", "Treated & Matched, PC CRH Encounters",
+                    "Treated & Matched, PC Encounters",
+                    "Control, PC Encounters",
+                    "Control & Matched, PC Encounters"),
+      align = c("l", rep("r", 4))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+table2_2_fxn <- function(group_var) {
+  vast %>%
+  filter(sta5a %in% {{group_var}}) %>%
+  group_by(s_abbr2) %>%
+  summarise(count = n()) %>%
+  mutate(prop = count / length({{group_var}}),
+         value = paste0(count, " (", percent(prop, accuracy = 0.1), ")")) %>%
+    select(s_abbr2, value) %>%
+    rename({{group_var}} := value)
+}
+#--
+table2_2_fxn(matched_treated) %>%
+  left_join(., table2_2_fxn(all_control)) %>%
+  left_join(., table2_2_fxn(matched_control)) %>%
+  kbl(col.names = c("", "Matched, Treated", "All Eligible Control", "Matched Control"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped",
+                full_width = F) %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+#--
+table2_3_fxn <- function(group_var){
+  analytic_df %>%
+    filter(sta5a %in% {{group_var}}
+           & vssc_month == ymd("2019-10-01")) %>%
+    select(sta5a, pcmm_count_fy_qtr, pct_rural, avg_age_oct1_2022, avg_driveTime, adi_natRnk_avg,
+           pct_male, pct_white, pct_black, pct_other, new_pc_pt_wt_create, est_pc_pt_wt_pid, third_next_avail) %>%
+    pivot_longer(-sta5a) %>%
+    group_by(name) %>%
+    summarise(avg_val = mean(value, na.rm = T),
+              sd_val = sd(value, na.rm = T)) %>%
+    mutate(name = factor(name, ordered = T,
+                         levels = c("pcmm_count_fy_qtr", "pct_rural", "avg_age_oct1_2022",
+                                    "avg_driveTime",
+                                    "adi_natRnk_avg", "pct_male", "pct_white",
+                                    "pct_black", "pct_other", "new_pc_pt_wt_create",
+                                    "est_pc_pt_wt_pid", "third_next_avail")),
+           {{group_var}} := paste0(comma(avg_val, accuracy = 0.1), " (",
+                                   comma(sd_val, accuracy = 0.1), ")")) %>%
+    select(-c(avg_val, sd_val)) %>%
+    arrange(name)
+}
+#--
+pVal_matched_all_eligible <- analytic_df %>%
+  filter(vssc_month == ymd("2019-10-01")) %>%
+  summarise(across(c(pcmm_count_fy_qtr, pct_rural, avg_age_oct1_2022, avg_driveTime, adi_natRnk_avg,
+                     pct_male, pct_white, pct_black, pct_other, new_pc_pt_wt_create, est_pc_pt_wt_pid, third_next_avail),
+                   ~list(t.test(.x ~ matched_vs_allEligible)$p.value))) %>%
+  unlist() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "name")%>%
+  rename(value = ".") %>%
+  mutate(pval_disp1 = if_else(value < 0.001, "< 0.001", comma(value, accuracy = 0.001))) %>%
+  select(name, pval_disp1)
+#--
+pVal_matched_matched_control <- analytic_df %>%
+  filter(vssc_month == ymd("2019-10-01")) %>%
+  summarise(across(c(pcmm_count_fy_qtr, pct_rural, avg_age_oct1_2022, avg_driveTime, adi_natRnk_avg,
+                     pct_male, pct_white, pct_black, pct_other, new_pc_pt_wt_create, est_pc_pt_wt_pid, third_next_avail),
+                   ~list(t.test(.x ~ matched_vs_zeroControl)$p.value))) %>%
+  unlist() %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "name")%>%
+  rename(value = ".") %>%
+  mutate(pval_disp2 = if_else(value < 0.001, "< 0.001", comma(value, accuracy = 0.001))) %>%
+  select(name, pval_disp2)
+#
+table2_3_fxn(matched_treated) %>%
+  left_join(., table2_3_fxn(all_control)) %>%
+  left_join(., pVal_matched_all_eligible) %>%
+  left_join(., table2_3_fxn(matched_control)) %>%
+  left_join(., pVal_matched_matched_control) %>%
+  kbl(col.names = c("", "Matched, Treated", "All Eligible Control", "Matched-Treated vs. All Controls", "Matched Control",
+                    "Matched-Treated vs. Matched-Control"),
+      align = c("l", rep("r", 5))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+
+```{r}
+table2_4_fxn <- function(group_var, is_crh, group_var2){
+  if({{is_crh}} == T){
+    crh_counts %>% filter(sta5a %in% matched_treated) %>%
+      left_join(., vast) %>%
+      left_join(., scrssn_count) %>%
+      select(encounter_total = pc_crh_enc_count,
+             {{group_var2}}) %>%
+      pivot_longer(-{{group_var2}}) %>%
+      group_by({{group_var2}}, name) %>%
+      summarise("{{group_var}}_crh" := sum(value)) %>%
+      select(-name) %>%
+      adorn_percentages("col") %>%
+      adorn_pct_formatting() %>%
+      adorn_ns(position = "front")
+  }
+  else {
+    pc_encounters %>%
+      filter(visitMonth > ymd("2018-09-01") & visitMonth < ymd("2020-03-01")
+             & Sta6a %in% {{group_var}}) %>%
+      left_join(., vast, by = c("Sta6a" = "sta5a")) %>%
+      left_join(., scrssn_count, by = c("Sta6a" = "sta5a")) %>%
+      select(pc_encounter_total, {{group_var2}}) %>%
+      group_by({{group_var2}}) %>%
+      summarise({{group_var}} := sum(pc_encounter_total)) %>%
+      adorn_percentages("col") %>%
+      adorn_pct_formatting() %>%
+      adorn_ns("front")
+  }
+}
+```
+
+## Site Type  
+```{r}
+table2_4_fxn(matched_treated, TRUE, s_abbr2) %>%
+  left_join(., table2_4_fxn(matched_treated, FALSE, s_abbr2)) %>%
+  left_join(., table2_4_fxn(matched_control, FALSE, s_abbr2)) %>%
+  kbl(col.names = c("", "PC CRH Among Matched, Treated", "Matched, Treated", 
+                    "Matched Control"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+### Chi-Squared Test  
+```{r}
+chisq_fxn1 <- function(input_df, row_names){
+  obs_df <- data.frame(input_df$observed) %>%
+    mutate(join_col = row_names)
+  exp_df <- data.frame(input_df$expected) %>%
+    mutate(join_col = row_names)
+  #--
+  obs_df %>% 
+    left_join(exp_df, by = "join_col") %>%
+    select(join_col, col1.x, col2.x, col1.y, col2.y) %>%
+  kbl(col.names = c("", rep(c("PC CRH", "PC, Matched-Treated"), 2))) %>%
+  kable_classic("striped") %>%
+  add_header_above(c("", "Observed" = 2, "Expected" = 2),
+                   bold = T)
+}
+#
+chisq_fxn2 <- function(input_df, row_names){
+  obs_df <- data.frame(input_df$observed) %>%
+    mutate(join_col = row_names)
+  exp_df <- data.frame(input_df$expected) %>%
+    mutate(join_col = row_names)
+  #--
+  obs_df %>% 
+    left_join(exp_df, by = "join_col") %>%
+    select(join_col, col1.x, col2.x, col1.y, col2.y) %>%
+  kbl(col.names = c("", rep(c("PC, Matched-Treated", "PC, Matched-Control"), 2))) %>%
+  kable_classic("striped") %>%
+  add_header_above(c("", "Observed" = 2, "Expected" = 2),
+                   bold = T)
+}
+#--
+chisq_1 <- chisq.test(data.frame(col1 = c(76390, 7929, 30743),
+                      col2 = c(725212, 24808, 731027)))
+#---
+
+chisq_1
+chisq_fxn1(chisq_1,  c("CBOC", "OOS", "VAMC/HCC"))
+
+chisq_2 <- chisq.test(data.frame(col1 = c(725212, 24808, 731027),
+                      col2 = c(572077, 25215, 762259)))
+#--==
+chisq_2
+chisq_fxn2(chisq_2,  c("CBOC", "OOS", "VAMC/HCC"))
+```
+
+## Site Size    
+```{r}
+table2_4_fxn(matched_treated, TRUE, scrssn_count_cat) %>%
+  left_join(., table2_4_fxn(matched_treated, FALSE, scrssn_count_cat)) %>%
+  left_join(., table2_4_fxn(matched_control, FALSE, scrssn_count_cat)) %>%
+  kbl(col.names = c("", "PC CRH Among Matched, Treated", "Matched, Treated", 
+                    "Matched Control"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+#----
+chisq_3 <- chisq.test(data.frame(col1 = c(24600, 69941, 20521),
+                                 col2 = c(71101, 542315, 867631)))
+chisq_3
+chisq_fxn1(chisq_3, c("450-2,399", "2,400-9,999", "10,000+"))
+#--==
+chisq_4 <- chisq.test(data.frame(col1 = c(71101, 542315, 867631),
+                                 col2 = c(158385, 433467, 767699)))
+chisq_4
+chisq_fxn2(chisq_4, c("450-2,399", "2,400-9,999", "10,000+"))
+```
+
+## Site URH      
+```{r}
+table2_4_fxn(matched_treated, TRUE, urh2) %>%
+  left_join(., table2_4_fxn(matched_treated, FALSE, urh2)) %>%
+  left_join(., table2_4_fxn(matched_control, FALSE, urh2)) %>%
+  kbl(col.names = c("", "PC CRH Among Matched, Treated", "Matched, Treated", 
+                    "Matched Control"),
+      align = c("l", rep("r", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+#----
+chisq_5 <- chisq.test(data.frame(col1 = c(58506, 56556),
+                                 col2 = c(275015, 1206032)))
+chisq_5
+chisq_fxn1(chisq_5, c("Rural", "Urban"))
+#----
+chisq_6 <- chisq.test(data.frame(col1 = c(275015, 1206032),
+                                 col2 = c(202938, 1156613)))
+chisq_6
+chisq_fxn2(chisq_6, c("Rural", "Urban"))
+```
+
+# Table 3  
+
+```{r}
+new_boot <- read_csv(here("Input", "Bootstrap", "new_pc_pt_wt_boot.csv")) %>%
+  mutate(ctrl_post_minus_pre = ctrl_post_slope - ctrl_pre_slope,
+         trtd_post_minus_pre = trtd_post_slope - trtd_pre_slope,
+         trtd_minus_ctrl_pre_slope = trtd_pre_slope - ctrl_pre_slope,
+         trtd_minus_ctrl_post_slope = trtd_post_slope - ctrl_post_slope,
+         trtd_jump_minus_ctrl_jump = trtd_jump - ctrl_jump,
+         last_cell = trtd_minus_ctrl_post_slope - trtd_minus_ctrl_pre_slope,
+         foo = "foo") %>%
+  pivot_longer(-foo) %>%
+  group_by(name) %>%
+  summarise(mean_val = mean(value),
+            sd_val = sd(value),
+            n_val = 5000,
+            ci_low = quantile(value, probs = 0.025),
+            ci_high = quantile(value, probs = 0.975)) %>%
+  mutate(disp_val = 
+           paste0(
+             comma(mean_val, accuracy = 0.001), " (",
+             comma(ci_low, accuracy = 0.001), ", ",
+             comma(ci_high, accuracy = 0.001), ")")) %>%
+  select(name, disp_val) %>%
+  pivot_wider(names_from = name, values_from = disp_val)
+#
+est_boot <- read_csv(here("Input", "Bootstrap", "est_pc_pt_wt_boot.csv")) %>%
+  mutate(ctrl_post_minus_pre = ctrl_post_slope - ctrl_pre_slope,
+         trtd_post_minus_pre = trtd_post_slope - trtd_pre_slope,
+         trtd_minus_ctrl_pre_slope = trtd_pre_slope - ctrl_pre_slope,
+         trtd_minus_ctrl_post_slope = trtd_post_slope - ctrl_post_slope,
+         trtd_jump_minus_ctrl_jump = trtd_jump - ctrl_jump,
+         last_cell = trtd_minus_ctrl_post_slope - trtd_minus_ctrl_pre_slope,
+         foo = "foo") %>%
+  pivot_longer(-foo) %>%
+  group_by(name) %>%
+  summarise(mean_val = mean(value),
+            sd_val = sd(value),
+            n_val = 5000,
+            ci_low = quantile(value, probs = 0.025),
+            ci_high = quantile(value, probs = 0.975)) %>%
+  mutate(disp_val = 
+           paste0(
+             comma(mean_val, accuracy = 0.001), " (",
+             comma(ci_low, accuracy = 0.001), ", ",
+             comma(ci_high, accuracy = 0.001), ")")) %>%
+  select(name, disp_val) %>%
+  pivot_wider(names_from = name, values_from = disp_val)
+#
+tna_boot <- read_csv(here("Input", "Bootstrap", "third_next_avail_boot.csv")) %>%
+  mutate(ctrl_post_minus_pre = ctrl_post_slope - ctrl_pre_slope,
+         trtd_post_minus_pre = trtd_post_slope - trtd_pre_slope,
+         trtd_minus_ctrl_pre_slope = trtd_pre_slope - ctrl_pre_slope,
+         trtd_minus_ctrl_post_slope = trtd_post_slope - ctrl_post_slope,
+         trtd_jump_minus_ctrl_jump = trtd_jump - ctrl_jump,
+         last_cell = trtd_minus_ctrl_post_slope - trtd_minus_ctrl_pre_slope,
+         foo = "foo") %>%
+  pivot_longer(-foo) %>%
+  group_by(name) %>%
+  summarise(mean_val = mean(value),
+            sd_val = sd(value),
+            n_val = 5000,
+            ci_low = quantile(value, probs = 0.025),
+            ci_high = quantile(value, probs = 0.975)) %>%
+  mutate(disp_val = 
+           paste0(
+             comma(mean_val, accuracy = 0.001), " (",
+             comma(ci_low, accuracy = 0.001), ", ",
+             comma(ci_high, accuracy = 0.001), ")")) %>%
+  select(name, disp_val) %>%
+  pivot_wider(names_from = name, values_from = disp_val)
+```
+
+## New Patient Wait Time  
+### Slope  
+
+```{r}
+tibble(
+  col_1 = c("Control", "Treated", "Treated - Control"),
+  col_2 = c("$\\beta_{time}$", 
+            "$\\beta_{time} + \\beta_{treat}\\beta_{time}$", 
+            "$\\beta_{treat}\\beta_{time}$"),
+  col_3 = c("$\\beta_{time}+\\beta_{post}\\beta_{time}$",
+            "$\\beta_{time}+\\beta_{post}\\beta_{time} +$ \n  $\\beta_{post}\\beta_{time}\\beta_{treat}$",
+            "$\\beta_{post}\\beta_{time}\\beta_{treat}$"),
+  col_4 = c("$\\beta_{post}\\beta_{time}$",
+            "$\\beta_{post}\\beta_{time} +$ \n $\\beta_{post}\\beta_{time}\\beta_{treat} -$\n$\\beta_{treat}\\beta_{time}$",
+            "$\\beta_{post}\\beta_{time}\\beta_{treat}-\\beta_{treat}\\beta_{time}$")
+) %>%
+  kbl(escape = F,
+      col.names = c("", "Pre Slope", "Post Slope", "Post - Pre"),
+      align = c("l", rep("c", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+tibble(
+  col_1 = c("Control", "Treated", "Treated - Control"),
+  col_2 = c(new_boot$ctrl_pre_slope, 
+            new_boot$trtd_pre_slope,
+            new_boot$trtd_minus_ctrl_pre_slope),
+  col_3 = c(new_boot$ctrl_post_slope, 
+            new_boot$trtd_post_slope,
+            new_boot$trtd_minus_ctrl_post_slope),
+  col_4 = c(new_boot$ctrl_post_minus_pre, 
+            new_boot$trtd_post_minus_pre, 
+            new_boot$last_cell)
+) %>%
+  kbl(col.names = c("", "Pre Slope Mean (95% CI)", "Post Slope Mean (95% CI)", "Post - Pre Mean (95% CI)"),
+      align = c("l", rep("c", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+### DiD/"Jump"  
+
+```{r}
+tibble(
+  col_1 = c("Control", "Treated", "Treated - Control"),
+  col_2 = c("$\\beta_{post}$", "$\\beta_{post} + \\beta_{treat}\\beta_{post}$", "$\\beta_{treat}\\beta_{post}$")
+) %>%
+  kbl(escape = F,
+      col.names = c("", "Intervention \"Jump\""),
+      align = c("l", "c")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+```{r}
+tibble(
+  col_1 = c("Control", "Treated", "Treated - Control"),
+  col_2 = c(new_boot$ctrl_jump, new_boot$trtd_jump, new_boot$trtd_jump_minus_ctrl_jump)
+) %>%
+  kbl(col.names = c("", "Intervention \"Jump\""),
+      align = c("l", "c")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+## Established Patient Wait Time  
+### Slope  
+
+
+```{r}
+tibble(
+  col_1 = c("Control", "Treated", "Treated - Control"),
+  col_2 = c(est_boot$ctrl_pre_slope, 
+            est_boot$trtd_pre_slope,
+            est_boot$trtd_minus_ctrl_pre_slope),
+  col_3 = c(est_boot$ctrl_post_slope, 
+            est_boot$trtd_post_slope,
+            est_boot$trtd_minus_ctrl_post_slope),
+  col_4 = c(est_boot$ctrl_post_minus_pre, 
+            est_boot$trtd_post_minus_pre, 
+            est_boot$last_cell)
+) %>%
+  kbl(col.names = c("", "Pre Slope Mean (95% CI)", "Post Slope Mean (95% CI)", "Post - Pre Mean (95% CI)"),
+      align = c("l", rep("c", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+### DiD/"Jump"  
+
+```{r}
+tibble(
+  col_1 = c("Control", "Treated", "Treated - Control"),
+  col_2 = c(est_boot$ctrl_jump, est_boot$trtd_jump, est_boot$trtd_jump_minus_ctrl_jump)
+) %>%
+  kbl(col.names = c("", "Intervention \"Jump\""),
+      align = c("l", "c")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+## Third Next Available    
+### Slope  
+
+
+```{r}
+tibble(
+  col_1 = c("Control", "Treated", "Treated - Control"),
+  col_2 = c(tna_boot$ctrl_pre_slope, 
+            tna_boot$trtd_pre_slope,
+            tna_boot$trtd_minus_ctrl_pre_slope),
+  col_3 = c(tna_boot$ctrl_post_slope, 
+            tna_boot$trtd_post_slope,
+            tna_boot$trtd_minus_ctrl_post_slope),
+  col_4 = c(tna_boot$ctrl_post_minus_pre, 
+            tna_boot$trtd_post_minus_pre, 
+            tna_boot$last_cell)
+) %>%
+  kbl(col.names = c("", "Pre Slope Mean (95% CI)", "Post Slope Mean (95% CI)", "Post - Pre Mean (95% CI)"),
+      align = c("l", rep("c", 3))) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
+
+### DiD/"Jump"  
+
+```{r}
+tibble(
+  col_1 = c("Control", "Treated", "Treated - Control"),
+  col_2 = c(tna_boot$ctrl_jump, tna_boot$trtd_jump, tna_boot$trtd_jump_minus_ctrl_jump)
+) %>%
+  kbl(col.names = c("", "Intervention \"Jump\""),
+      align = c("l", "c")) %>%
+  kable_classic("striped") %>%
+  row_spec(0, bold = T)
+```
